@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """clayfs_tool - clayfsctl が使う本体。APFS のクローンでディレクトリのコミットを持つ。
 
-対象のディレクトリ DIR (ふつうはイメージをマウントした場所) の直下に DIR/.clayfs を置き、
-コミットのたびに DIR の中身を clonefile(2) で複製して残す。git の .git にあたる。
-クローンなので、コミットが使う容量は、その後に変更されたファイルの分だけ。
+作業ディレクトリ DIR と、コミットを置くストア STORE を、同じ APFS ボリューム (ふつうは同じイメージの中) に置く。
+コミットのたびに DIR の中身を clonefile(2) で STORE に複製して残す。クローンはボリュームをまたげないが、
+同じボリュームの中なら、コミットが使う容量は、その後に変更されたファイルの分だけで済む。
 読み書きの経路にファイルシステムの層は入らず、DIR もコミットも普通の APFS。
 ふだんは clayfsctl から呼ぶ (設定や排他、イメージの扱いは clayfsctl が受け持つ)。
 
-  clayfs_tool -s DIR/.clayfs fill SRC                  SRC の中身を DIR へコピーする (最初の取り込み。読めないものは飛ばす)
-  clayfs_tool -s DIR/.clayfs status [-s] [-q]          最後のコミットからの変更 (-q: 変更があれば終了コード 1)
-  clayfs_tool -s DIR/.clayfs diff [PATH...]            変更の中身 (最後のコミットとの差分)
-  clayfs_tool -s DIR/.clayfs commit [-m MSG]           現状をコミットする
-  clayfs_tool -s DIR/.clayfs log [-n N]                コミットの一覧
-  clayfs_tool -s DIR/.clayfs show [GEN]                そのコミットの変更一覧 (省略時は HEAD)
-  clayfs_tool -s DIR/.clayfs restore [--source GEN] PATH... | --all
-                                                       コミット時の内容に戻す (今のものは .clayfs/trash へ退避)
-  clayfs_tool -s DIR/.clayfs gc --keep N               新しい N 個を残して、古いコミットの中身を消す (一覧は残る)
+  clayfs_tool -s STORE -C DIR fill SRC               SRC の中身を DIR へコピーする (最初の取り込み。読めないものは飛ばす)
+  clayfs_tool -s STORE -C DIR status [-s] [-q]       最後のコミットからの変更 (-q: 変更があれば終了コード 1)
+  clayfs_tool -s STORE -C DIR diff [PATH...]         変更の中身 (最後のコミットとの差分)
+  clayfs_tool -s STORE -C DIR commit [-m MSG]        現状をコミットする
+  clayfs_tool -s STORE -C DIR log [-n N]             コミットの一覧
+  clayfs_tool -s STORE -C DIR show [GEN]             そのコミットの変更一覧 (省略時は HEAD)
+  clayfs_tool -s STORE -C DIR restore [--source GEN] PATH... | --all
+                                                     コミット時の内容に戻す (今のものは STORE/trash へ退避)
+  clayfs_tool -s STORE -C DIR gc --keep N            新しい N 個を残して、古いコミットの中身を消す (一覧は残る)
 コミットは HEAD、または名前の一部 (一意に決まる範囲) で指定できる。
-過去のコミットの中身は DIR/.clayfs/layers/コミット名/fs にあり、普通のフォルダとして開ける。
+過去のコミットの中身は STORE/layers/コミット名/fs にあり、普通のフォルダとして開ける。
+-C を省くと STORE の親を DIR とみなす (STORE を DIR/.clayfs に置く使い方。直下の .clayfs はコミットに含めない)。
 
-レイヤーを直接扱う (Docker 風の使い方。-s は任意の場所):
+レイヤーを直接扱う (Docker 風の使い方):
   import NAME DIR / prepare NAME PARENT / layer-commit NAME / layer-diff NAME [-o FILE]
   apply NAME PARENT TAR / path NAME / ls / rm NAME
 """
@@ -275,9 +276,14 @@ EXCLUDE = {STORE_NAME, '.fseventsd', '.Spotlight-V100', '.Trashes', '.TemporaryI
 LABEL = {'A': '追加', 'M': '変更', 'D': '削除'}
 
 
+WORK_DIR = None   # -C で指定された作業ディレクトリ
+
+
 def work_dir(st):
+    if WORK_DIR:
+        return WORK_DIR
     if os.path.basename(st.root) != STORE_NAME:
-        die(f'ストアは 対象のディレクトリ/{STORE_NAME} を指定してください: {st.root}')
+        die('作業ディレクトリを -C で指定してください')
     return os.path.dirname(st.root)
 
 
@@ -346,11 +352,15 @@ def snapshot(st, conf):
     bad = {os.path.join(d, p) for p in conf.get('noclone', [])}
     tmp = os.path.join(st.layers, f'.tmp.{os.getpid()}.{name}')
     started = time.time()
-    os.makedirs(os.path.join(tmp, 'fs'))
+    os.makedirs(tmp)
     try:
-        # ストアが対象の中にあるので、全体を 1 回では複製できない。直下の項目ごとに複製する
-        for n in top_entries(d):
-            clone_tree(os.path.join(d, n), os.path.join(tmp, 'fs', n), bad)
+        if os.path.commonpath([d, st.root]) == d:
+            # ストアが対象の中にあるので、全体を 1 回では複製できない。直下の項目ごとに複製する
+            os.mkdir(os.path.join(tmp, 'fs'))
+            for n in top_entries(d):
+                clone_tree(os.path.join(d, n), os.path.join(tmp, 'fs', n), bad)
+        else:
+            clone_tree(d, os.path.join(tmp, 'fs'), bad)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -599,7 +609,8 @@ def cmd_gc(st, a):
 
 def main():
     ap = argparse.ArgumentParser(prog='clayfs_tool', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('-s', '--store', default=os.environ.get('CLAYFS_STORE', '~/src/.clayfs'))
+    ap.add_argument('-s', '--store', default=os.environ.get('CLAYFS_STORE', '~/.src.clayfs/store'))
+    ap.add_argument('-C', '--dir', help='作業ディレクトリ (省略時は STORE の親)')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     p = sub.add_parser('import'); p.add_argument('name'); p.add_argument('dir'); p.set_defaults(fn=cmd_import)
@@ -623,6 +634,11 @@ def main():
     p = sub.add_parser('gc'); p.add_argument('--keep', type=int, required=True); p.set_defaults(fn=cmd_gc)
 
     a = ap.parse_args()
+    global WORK_DIR
+    if a.dir:
+        WORK_DIR = os.path.realpath(os.path.expanduser(a.dir))
+        if not os.path.isdir(WORK_DIR):
+            die(f'ディレクトリではありません: {WORK_DIR}')
     a.fn(Store(a.store), a)
 
 
