@@ -1,39 +1,38 @@
 #!/bin/sh
-# clayfsctl: 作業ディレクトリ (既定 ~/src) をそのままの場所で使いながら、ディスクイメージに世代つきで
-#            反映していくための管理コマンド (macOS)。使い方は git に合わせてある:
-#            作業ツリーが CLAYFS_DIR、コミットは手元の控え (クローン)、リモートがイメージ。
+# clayfsctl: 作業ディレクトリ (既定 ~/src) の実体をディスクイメージに入れ、その場所にマウントして使うための
+#            管理コマンド (macOS)。コミットはイメージの中 (CLAYFS_DIR/.clayfs) にクローンで残す。
+#            使い方は git に合わせてある: 作業ツリーが CLAYFS_DIR、.git にあたるのが .clayfs。
 #
-#   clayfsctl init [SIZE]     イメージを作り、CLAYFS_DIR の現状を最初のコミットとして取り込む (既定 30g。使った分だけ大きくなる)
-#   clayfsctl status [-s]     最後のコミットからの変更と、イメージより何コミット進んでいるか (-s: 1 行ずつ A/M/D)
+#   clayfsctl init [SIZE]     CLAYFS_DIR の中身を入れたイメージを作る (既定 30g。使った分だけ大きくなる)。
+#                             CLAYFS_DIR には触れない。切り替えは、その後の switch で行う
+#   clayfsctl switch          CLAYFS_DIR を CLAYFS_DIR.orig に改名し、空にした場所へイメージをマウントする
+#   clayfsctl up              イメージを CLAYFS_DIR にマウントする
+#   clayfsctl down [--force]  マウントを外す (--force: 使用中でも強制)
+#   clayfsctl status [-s]     最後のコミットからの変更 (-s: 1 行ずつ A/M/D)
 #   clayfsctl diff [PATH...]  変更の中身 (最後のコミットとの差分)
-#   clayfsctl commit [-m MSG] 現状をコミットする (手元の控えに取るだけで速い。イメージには触れない)
-#   clayfsctl push            まだ反映していないコミットを、イメージへ反映する
-#   clayfsctl log [-n N]      コミットの一覧 (HEAD と、イメージに反映済みの位置を示す)
-#   clayfsctl show [GEN]      そのコミットの変更一覧 (省略時は HEAD)
+#   clayfsctl commit [-m MSG] 現状をコミットする (イメージ内のクローンなので速く、容量は変更分だけ)
+#   clayfsctl log [-n N]      コミットの一覧
+#   clayfsctl show [GEN]      そのコミットの変更一覧と、中身の場所 (省略時は HEAD)
 #   clayfsctl restore [--source GEN] PATH...
 #                             コミット時の内容に戻す (--all で全体。今の内容は消さずに退避する)
-#   clayfsctl mount           イメージを読み込み専用で CLAYFS_MNT につなぐ (過去のコミットをフォルダとして見る)
-#   clayfsctl umount          それを外す
-#   clayfsctl compact         イメージの空き領域を回収する
+#   clayfsctl gc --keep N     新しい N 個を残して、古いコミットの中身を消す (一覧と変更内容は残る)
+#   clayfsctl compact         イメージの空き領域を回収する (down の状態で)
 #   clayfsctl info            設定と状態を表示する
-#   clayfsctl run             変更があれば commit し、push する (自動実行用)
-#   clayfsctl install-agent   CLAYFS_PUSH_INTERVAL 秒ごとに run を実行する (LaunchAgent)
+#   clayfsctl run             マウントし、変更があればコミットする (自動実行用)
+#   clayfsctl install-agent   ログイン時にマウントし、CLAYFS_COMMIT_INTERVAL 秒ごとに自動でコミットする (LaunchAgent)
 #   clayfsctl uninstall-agent 自動実行を外す
 #
 # コミットは HEAD、または名前の一部 (例: 003937) で指定できる。
+# 過去のコミットの中身は CLAYFS_DIR/.clayfs/layers/コミット名/fs にあり、普通のフォルダとして開ける。
 #
 # 設定は環境変数、または ~/.config/clayfs/config (シェル形式) で上書きできる:
-#   CLAYFS_DIR (~/src)  対象の作業ディレクトリ
-#   CLAYFS_IMAGE (~/<DIR の名前>.dmg.sparsebundle)  反映先のイメージ。拡張子で形式が決まる
-#              (.sparsebundle / .sparseimage / .dmg)
-#   CLAYFS_STORE (~/.clayfs)  手元の控え (クローン)。CLAYFS_DIR と同じボリュームに置くこと
-#   CLAYFS_MNT (~/clayfs-history)  mount でつなぐ場所
-#   CLAYFS_KEEP (3)  手元に残す控えの数 (イメージには全コミットが残る。未反映のコミットは消さない)
-#   CLAYFS_PUSH_INTERVAL (3600)  自動実行の間隔 (秒)
+#   CLAYFS_DIR (~/src)  マウントする場所 (= 作業ディレクトリ)
+#   CLAYFS_IMAGE (~/<DIR の名前>.dmg.sparsebundle)  イメージ (APFS のスパースバンドル)
+#   CLAYFS_COMMIT_INTERVAL (3600)  自動コミットの間隔 (秒)。0 にすると、自動実行はマウントだけを行う
 #   CLAYFS_LOG (~/Library/Logs/clayfs.log)
 #
-# イメージの中身: head/ が最新、history/コミット名/ が過去の各コミット、history/コミット名.changes が変更一覧。
-# コミットどうしはイメージ内のクローンなので、増える容量は変更されたファイルの分だけ。
+# 注意: .clayfs には過去のコミットが丸ごと入っている。grep -r や find を CLAYFS_DIR の直下で
+#       実行すると、その中まで探しに行く (.clayfs を除外するか、プロジェクトの中で実行する)。
 # 読めないファイル (開けない、壊れている) は、警告を出して飛ばす。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -43,15 +42,14 @@ set +a
 [ "$(uname -s)" = Darwin ] || { echo "エラー: macOS 専用です (APFS のクローンを使います)" >&2; exit 1; }
 CLAYFS_DIR="${CLAYFS_DIR:-$HOME/src}"
 CLAYFS_IMAGE="${CLAYFS_IMAGE:-$HOME/$(basename "$CLAYFS_DIR").dmg.sparsebundle}"
-CLAYFS_STORE="${CLAYFS_STORE:-$HOME/.clayfs}"
-CLAYFS_MNT="${CLAYFS_MNT:-$HOME/clayfs-history}"
-CLAYFS_KEEP="${CLAYFS_KEEP:-3}"
-CLAYFS_PUSH_INTERVAL="${CLAYFS_PUSH_INTERVAL:-3600}"
+CLAYFS_COMMIT_INTERVAL="${CLAYFS_COMMIT_INTERVAL:-3600}"
 CLAYFS_LOG="${CLAYFS_LOG:-$HOME/Library/Logs/clayfs.log}"
 CLAYFS_TOOL="${CLAYFS_TOOL:-$HERE/clayfs_tool}"
 LABEL="top.yashiki.clayfs"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOCK="$CLAYFS_STORE/lock"
+STORE="$CLAYFS_DIR/.clayfs"
+LOCK="$STORE/lock"
+ORIG="$CLAYFS_DIR.orig"
 
 die() { echo "エラー: $*" >&2; exit 1; }
 
@@ -62,23 +60,27 @@ quiet() {
   return $_q_rc
 }
 
-tool() { "$CLAYFS_TOOL" -s "$CLAYFS_STORE" "$@"; }
-
-tracked() { [ -f "$CLAYFS_STORE/work.json" ]; }
-need_tracked() { tracked || die "まだ取り込んでいません。先に clayfsctl init を実行してください"; }
+tool() { "$CLAYFS_TOOL" -s "$STORE" "$@"; }
 
 # DIR にボリュームがつながっているか (親とデバイスが違えばマウント点)。mount コマンドは、
 # 応答しないマウントが 1 つでもあると固まるので使わない。
 is_mounted() {
   [ -d "$1" ] && [ "$(stat -f %d "$1" 2>/dev/null)" != "$(stat -f %d "$1/.." 2>/dev/null)" ]
 }
+need_up() { is_mounted "$CLAYFS_DIR" || die "マウントされていません: $CLAYFS_DIR (clayfsctl up)"; }
 
-# 同時に 2 つ動くと、控えとイメージの世代がずれる。mkdir は原子的なので、これを鍵にする。
+is_empty_dir() { [ -d "$1" ] && [ -z "$(ls -A "$1" 2>/dev/null)" ]; }
+
+attach_at() {  # attach_at DIR: イメージを DIR にマウントする。所有者と権限をそのまま使う
+  quiet hdiutil attach -nobrowse -owners on -mountpoint "$1" "$CLAYFS_IMAGE"
+}
+
+# 同時に 2 つ動くと、コミットの記録がずれる。mkdir は原子的なので、これを鍵にする。
 lock() {
-  mkdir -p "$CLAYFS_STORE"
+  mkdir -p "$STORE"
   if ! mkdir "$LOCK" 2>/dev/null; then
     _pid="$(cat "$LOCK/pid" 2>/dev/null || true)"
-    [ "$_pid" = $$ ] && return 0   # run から push を呼ぶときなど、自分の鍵
+    [ "$_pid" = $$ ] && return 0   # run から commit を呼ぶときなど、自分の鍵
     if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
       die "ほかの clayfsctl が実行中です (PID $_pid)"
     fi
@@ -90,117 +92,121 @@ lock() {
   trap 'exit 130' INT TERM
 }
 
-# 反映や一覧は、イメージを一時的につなぎ直す。mount で見ている最中なら、いったん外して後で戻す。
-REMOUNT=0
-release_image() {
-  if is_mounted "$CLAYFS_MNT"; then
-    quiet hdiutil detach "$CLAYFS_MNT" || die "$CLAYFS_MNT が使用中で外せません (開いているファイルやターミナルを閉じてください)"
-    REMOUNT=1
-  fi
-}
-restore_image() {
-  [ $REMOUNT = 1 ] || return 0
-  quiet hdiutil attach -nobrowse -readonly -mountpoint "$CLAYFS_MNT" "$CLAYFS_IMAGE" || echo "警告: $CLAYFS_MNT をつなぎ直せませんでした (clayfsctl mount で戻せます)" >&2
-  REMOUNT=0
-}
-
-cmd_create() {
+cmd_init() {
   size="${1:-30g}"
-  tracked && die "すでに取り込んでいます: $CLAYFS_STORE (clayfsctl info で確認できます)"
-  [ -d "$CLAYFS_DIR" ] || die "ディレクトリがありません: $CLAYFS_DIR"
   [ -e "$CLAYFS_IMAGE" ] && die "すでにあります: $CLAYFS_IMAGE"
+  [ -d "$CLAYFS_DIR" ] || die "ディレクトリがありません: $CLAYFS_DIR"
+  is_mounted "$CLAYFS_DIR" && die "$CLAYFS_DIR はすでにマウント点です"
   mkdir -p "$(dirname "$CLAYFS_IMAGE")"
-  lock
-  echo "取り込みます: $CLAYFS_DIR -> $CLAYFS_IMAGE (初回は全体をコピーするので、数分かかります)"
-  tool track "$CLAYFS_DIR" "$CLAYFS_IMAGE" --size "$size" --keep "$CLAYFS_KEEP" || die "取り込みに失敗"
+  quiet hdiutil create -size "$size" -type SPARSEBUNDLE -fs APFS -volname "$(basename "$CLAYFS_DIR")" "$CLAYFS_IMAGE" || die "作成に失敗"
+  echo "作成しました: $CLAYFS_IMAGE (APFS、$size まで)"
+  # いったん別の場所につないで中身を入れる。CLAYFS_DIR は、この間ずっと元のまま使える。
+  tmp="$(mktemp -d "$HOME/.clayfs-init.XXXXXX")" || die "作業用の場所を作れません"
+  attach_at "$tmp" || { rmdir "$tmp"; die "つなげません: $CLAYFS_IMAGE"; }
+  echo "コピーします: $CLAYFS_DIR -> イメージ (数分かかります)"
+  STORE="$tmp/.clayfs"
+  tool fill "$CLAYFS_DIR" && tool commit -m "initial"; rc=$?
+  # Spotlight に、過去のコミットを 1 つずつ索引させない
+  [ -d "$tmp/.clayfs" ] && : >"$tmp/.clayfs/.metadata_never_index"
+  quiet hdiutil detach "$tmp" || echo "警告: 外せませんでした: $tmp" >&2
+  rmdir "$tmp" 2>/dev/null
+  [ $rc = 0 ] || die "取り込みに失敗"
+  echo "できました。切り替えるには: clayfsctl switch"
+  echo "  (init の後に $CLAYFS_DIR へ加えた変更はイメージに入らないので、続けて実行してください)"
 }
 
-cmd_status() { need_tracked; tool status "$@"; }
-cmd_diff() { need_tracked; tool diff "$@"; }
-cmd_log() { need_tracked; tool log "$@"; }
-
-cmd_commit() { need_tracked; lock; tool commit "$@"; }
-
-cmd_push() {
-  need_tracked
-  lock
-  release_image
-  tool push; rc=$?
-  restore_image
-  return $rc
+cmd_switch() {
+  [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE (clayfsctl init)"
+  is_mounted "$CLAYFS_DIR" && die "すでに切り替え済みです: $CLAYFS_DIR"
+  [ -e "$ORIG" ] && die "すでにあります: $ORIG (前回の退避が残っています)"
+  mv "$CLAYFS_DIR" "$ORIG" || die "改名できません: $CLAYFS_DIR"
+  mkdir "$CLAYFS_DIR" || { mv "$ORIG" "$CLAYFS_DIR"; die "作れません: $CLAYFS_DIR"; }
+  if ! attach_at "$CLAYFS_DIR"; then
+    # マウントできなければ、元に戻す
+    rmdir "$CLAYFS_DIR" && mv "$ORIG" "$CLAYFS_DIR"
+    die "マウントできませんでした。元に戻しました: $CLAYFS_DIR"
+  fi
+  echo "切り替えました: $CLAYFS_DIR はイメージです"
+  echo "  元の中身   $ORIG (中身を確かめたら、消して構いません)"
+  echo "  $CLAYFS_DIR の中のファイルを開いていたプログラムは、$ORIG の側を見続けます。起動し直してください"
 }
 
-cmd_show() {
-  # 古いコミットの変更一覧はイメージから読むことがあるので、つないであれば一時的に外す
-  need_tracked; lock; release_image; tool show "$@"; rc=$?; restore_image; return $rc
+cmd_up() {
+  is_mounted "$CLAYFS_DIR" && { echo "すでにマウントされています: $CLAYFS_DIR"; return 0; }
+  [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE (clayfsctl init)"
+  if [ -e "$CLAYFS_DIR" ]; then
+    is_empty_dir "$CLAYFS_DIR" || die "$CLAYFS_DIR が空ではありません。初めて切り替えるなら clayfsctl switch"
+  else
+    mkdir -p "$CLAYFS_DIR" || die "作れません: $CLAYFS_DIR"
+  fi
+  attach_at "$CLAYFS_DIR" || die "マウントできません: $CLAYFS_IMAGE"
+  echo "マウントしました: $CLAYFS_DIR"
 }
+
+cmd_down() {
+  is_mounted "$CLAYFS_DIR" || { echo "マウントされていません: $CLAYFS_DIR"; return 0; }
+  if [ "${1:-}" = --force ]; then
+    quiet hdiutil detach -force "$CLAYFS_DIR" || die "外せません: $CLAYFS_DIR"
+  else
+    quiet hdiutil detach "$CLAYFS_DIR" || die "使用中で外せません: $CLAYFS_DIR (開いているファイルやターミナルを閉じるか、--force)"
+  fi
+  echo "外しました: $CLAYFS_DIR"
+}
+
+cmd_status() { need_up; tool status "$@"; }
+cmd_diff() { need_up; tool diff "$@"; }
+cmd_log() { need_up; tool log "$@"; }
+cmd_show() { need_up; tool show "$@"; }
+cmd_commit() { need_up; lock; tool commit "$@"; }
+cmd_gc() { need_up; lock; tool gc "$@"; }
 
 cmd_restore() {
   [ $# -ge 1 ] || die "使い方: clayfsctl restore [--source コミット] PATH... (全体を戻すなら --all)"
-  need_tracked
+  need_up
   lock
   tool restore "$@"
 }
 
-cmd_mount() {
-  need_tracked
-  is_mounted "$CLAYFS_MNT" && { echo "すでにつながっています: $CLAYFS_MNT"; return 0; }
-  lock
-  mkdir -p "$CLAYFS_MNT"
-  quiet hdiutil attach -nobrowse -readonly -mountpoint "$CLAYFS_MNT" "$CLAYFS_IMAGE" || die "つなげません: $CLAYFS_IMAGE"
-  echo "つなぎました (読み込み専用): $CLAYFS_MNT"
-  echo "  最新      $CLAYFS_MNT/head"
-  echo "  過去       $CLAYFS_MNT/history/コミット名"
-}
-
-cmd_umount() {
-  is_mounted "$CLAYFS_MNT" || { echo "つながっていません: $CLAYFS_MNT"; return 0; }
-  quiet hdiutil detach "$CLAYFS_MNT" || die "使用中で外せません: $CLAYFS_MNT"
-  rmdir "$CLAYFS_MNT" 2>/dev/null
-  echo "外しました: $CLAYFS_MNT"
-}
-
 cmd_compact() {
   [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE"
-  case "$CLAYFS_IMAGE" in *.dmg) die "固定サイズのイメージ (.dmg) は回収できません" ;; esac
-  lock
-  release_image
+  is_mounted "$CLAYFS_DIR" && die "マウント中は回収できません。先に clayfsctl down"
   before="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
   quiet hdiutil compact "$CLAYFS_IMAGE" || echo "警告: 回収に失敗しました" >&2
   after="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
   echo "回収しました: $(( (before - after) / 1024 )) MB (現在 $(( after / 1024 )) MB)"
-  restore_image
 }
 
 cmd_info() {
-  echo "対象     $CLAYFS_DIR"
-  echo "イメージ $CLAYFS_IMAGE$([ -e "$CLAYFS_IMAGE" ] && echo " ($(du -sh "$CLAYFS_IMAGE" | cut -f1 | tr -d ' '))" || echo " (まだありません)")"
-  echo "控え     $CLAYFS_STORE (直近 $CLAYFS_KEEP コミット)"
-  if tracked; then
-    echo "HEAD     $(sed -n 's/.*"base": "\([^"]*\)".*/\1/p' "$CLAYFS_STORE/work.json")"
-  else
-    echo "HEAD     (まだ取り込んでいません。clayfsctl init)"
+  echo "対象     $CLAYFS_DIR $(is_mounted "$CLAYFS_DIR" && echo "(マウント中)" || echo "(マウントされていません)")"
+  echo "イメージ $CLAYFS_IMAGE$([ -e "$CLAYFS_IMAGE" ] && echo " ($(du -sh "$CLAYFS_IMAGE" | cut -f1 | tr -d ' '))" || echo " (まだありません。clayfsctl init)")"
+  if is_mounted "$CLAYFS_DIR" && [ -f "$STORE/work.json" ]; then
+    echo "HEAD     $(sed -n 's/.*"base": "\([^"]*\)".*/\1/p' "$STORE/work.json")"
+    echo "コミット $(wc -l <"$STORE/log.jsonl" | tr -d ' ') 個 ($STORE)"
   fi
-  is_mounted "$CLAYFS_MNT" && echo "履歴     $CLAYFS_MNT につないであります"
-  if [ -f "$PLIST" ]; then echo "自動実行 あり ($CLAYFS_PUSH_INTERVAL 秒ごと。ログ: $CLAYFS_LOG)"; else echo "自動実行 なし (clayfsctl install-agent)"; fi
+  [ -e "$ORIG" ] && echo "退避     $ORIG ($(du -sh "$ORIG" | cut -f1 | tr -d ' ')。確かめたら消せます)"
+  if [ -f "$PLIST" ]; then echo "自動実行 あり (ログ: $CLAYFS_LOG)"; else echo "自動実行 なし (clayfsctl install-agent)"; fi
 }
 
-cmd_run() {  # launchd 用: 変更があるときだけ反映する
-  tracked || { echo "$(date '+%F %T') まだ取り込んでいません"; return 0; }
+cmd_run() {  # launchd 用: マウントし、変更があればコミットする
+  is_mounted "$CLAYFS_DIR" || cmd_up || return 1
+  [ "$CLAYFS_COMMIT_INTERVAL" = 0 ] && return 0
+  [ -f "$STORE/work.json" ] || return 0
   if ! tool status -q; then
     echo "$(date '+%F %T') 変更があるのでコミットします"
-    cmd_commit -m "auto" || return 1
+    cmd_commit -m "auto"
   fi
-  # コミットだけして反映していない分 (手動の commit を含む) も、ここでまとめて反映する
-  cmd_push
 }
 
 xesc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 cmd_install_agent() {
-  need_tracked
-  case "$CLAYFS_PUSH_INTERVAL" in ''|*[!0-9]*) die "CLAYFS_PUSH_INTERVAL は秒数 (整数) で指定してください: $CLAYFS_PUSH_INTERVAL" ;; esac
-  [ "$CLAYFS_PUSH_INTERVAL" -ge 60 ] || die "CLAYFS_PUSH_INTERVAL は 60 以上にしてください: $CLAYFS_PUSH_INTERVAL"
+  [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE (clayfsctl init)"
+  case "$CLAYFS_COMMIT_INTERVAL" in ''|*[!0-9]*) die "CLAYFS_COMMIT_INTERVAL は秒数 (整数) で指定してください: $CLAYFS_COMMIT_INTERVAL" ;; esac
+  interval=""
+  if [ "$CLAYFS_COMMIT_INTERVAL" != 0 ]; then
+    [ "$CLAYFS_COMMIT_INTERVAL" -ge 60 ] || die "CLAYFS_COMMIT_INTERVAL は 60 以上 (または 0) にしてください: $CLAYFS_COMMIT_INTERVAL"
+    interval="  <key>StartInterval</key><integer>$CLAYFS_COMMIT_INTERVAL</integer>"
+  fi
   mkdir -p "$(dirname "$PLIST")" "$(dirname "$CLAYFS_LOG")"
   cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -211,19 +217,22 @@ cmd_install_agent() {
   <key>EnvironmentVariables</key><dict>
     <key>CLAYFS_DIR</key><string>$(xesc "$CLAYFS_DIR")</string>
     <key>CLAYFS_IMAGE</key><string>$(xesc "$CLAYFS_IMAGE")</string>
-    <key>CLAYFS_STORE</key><string>$(xesc "$CLAYFS_STORE")</string>
-    <key>CLAYFS_MNT</key><string>$(xesc "$CLAYFS_MNT")</string>
-    <key>CLAYFS_KEEP</key><string>$CLAYFS_KEEP</string>
+    <key>CLAYFS_COMMIT_INTERVAL</key><string>$CLAYFS_COMMIT_INTERVAL</string>
     <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
   </dict>
-  <key>StartInterval</key><integer>$CLAYFS_PUSH_INTERVAL</integer>
+  <key>RunAtLoad</key><true/>
+$interval
   <key>StandardOutPath</key><string>$(xesc "$CLAYFS_LOG")</string>
   <key>StandardErrorPath</key><string>$(xesc "$CLAYFS_LOG")</string>
 </dict></plist>
 EOF
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
   launchctl bootstrap "gui/$(id -u)" "$PLIST" || { rm -f "$PLIST"; die "LaunchAgent を読み込めません"; }
-  echo "入れました: $PLIST ($CLAYFS_PUSH_INTERVAL 秒ごとに、変更があれば反映します)"
+  if [ -n "$interval" ]; then
+    echo "入れました: $PLIST (ログイン時にマウントし、$CLAYFS_COMMIT_INTERVAL 秒ごとに、変更があればコミットします)"
+  else
+    echo "入れました: $PLIST (ログイン時にマウントします)"
+  fi
 }
 
 cmd_uninstall_agent() {
@@ -233,16 +242,17 @@ cmd_uninstall_agent() {
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
-  init|create) cmd_create "$@" ;;
+  init) cmd_init "$@" ;;
+  switch) cmd_switch ;;
+  up) cmd_up ;;
+  down) cmd_down "$@" ;;
   status) cmd_status "$@" ;;
   diff) cmd_diff "$@" ;;
   commit) cmd_commit "$@" ;;
-  push) cmd_push ;;
   log) cmd_log "$@" ;;
   show) cmd_show "$@" ;;
   restore) cmd_restore "$@" ;;
-  mount) cmd_mount ;;
-  umount) cmd_umount ;;
+  gc) cmd_gc "$@" ;;
   compact) cmd_compact ;;
   info) cmd_info ;;
   run) cmd_run ;;
