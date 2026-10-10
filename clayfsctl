@@ -1,20 +1,26 @@
 #!/bin/sh
 # clayfsctl: 作業ディレクトリ (既定 ~/src) をそのままの場所で使いながら、ディスクイメージに世代つきで
-#            反映していくための管理コマンド (macOS)。git でいうと、作業ツリーが CLAYFS_DIR、リモートがイメージ。
+#            反映していくための管理コマンド (macOS)。使い方は git に合わせてある:
+#            作業ツリーが CLAYFS_DIR、コミットは手元の控え (クローン)、リモートがイメージ。
 #
-#   clayfsctl create [SIZE]   イメージを作り、CLAYFS_DIR の現状を最初の世代として取り込む (既定 30g。使った分だけ大きくなる)
-#   clayfsctl status          前回の反映からの変更を一覧する (A 追加 / M 変更 / D 削除)
-#   clayfsctl push [-m MSG]   変更をイメージに反映し、世代を 1 つ足す
-#   clayfsctl log             イメージにある世代の一覧
-#   clayfsctl show GEN        その世代の変更一覧
-#   clayfsctl restore PATH... 前回の反映時の内容に戻す (--all で全体。今の内容は消さずに退避する)
-#   clayfsctl mount           イメージを読み込み専用で CLAYFS_MNT につなぐ (過去の世代をフォルダとして見る)
+#   clayfsctl init [SIZE]     イメージを作り、CLAYFS_DIR の現状を最初のコミットとして取り込む (既定 30g。使った分だけ大きくなる)
+#   clayfsctl status [-s]     最後のコミットからの変更と、イメージより何コミット進んでいるか (-s: 1 行ずつ A/M/D)
+#   clayfsctl diff [PATH...]  変更の中身 (最後のコミットとの差分)
+#   clayfsctl commit [-m MSG] 現状をコミットする (手元の控えに取るだけで速い。イメージには触れない)
+#   clayfsctl push            まだ反映していないコミットを、イメージへ反映する
+#   clayfsctl log [-n N]      コミットの一覧 (HEAD と、イメージに反映済みの位置を示す)
+#   clayfsctl show [GEN]      そのコミットの変更一覧 (省略時は HEAD)
+#   clayfsctl restore [--source GEN] PATH...
+#                             コミット時の内容に戻す (--all で全体。今の内容は消さずに退避する)
+#   clayfsctl mount           イメージを読み込み専用で CLAYFS_MNT につなぐ (過去のコミットをフォルダとして見る)
 #   clayfsctl umount          それを外す
 #   clayfsctl compact         イメージの空き領域を回収する
 #   clayfsctl info            設定と状態を表示する
-#   clayfsctl run             変更があれば push する (自動実行用。なければ何もしない)
+#   clayfsctl run             変更があれば commit し、push する (自動実行用)
 #   clayfsctl install-agent   CLAYFS_PUSH_INTERVAL 秒ごとに run を実行する (LaunchAgent)
 #   clayfsctl uninstall-agent 自動実行を外す
+#
+# コミットは HEAD、または名前の一部 (例: 003937) で指定できる。
 #
 # 設定は環境変数、または ~/.config/clayfs/config (シェル形式) で上書きできる:
 #   CLAYFS_DIR (~/src)  対象の作業ディレクトリ
@@ -22,12 +28,12 @@
 #              (.sparsebundle / .sparseimage / .dmg)
 #   CLAYFS_STORE (~/.clayfs)  手元の控え (クローン)。CLAYFS_DIR と同じボリュームに置くこと
 #   CLAYFS_MNT (~/clayfs-history)  mount でつなぐ場所
-#   CLAYFS_KEEP (3)  手元に残す控えの世代数 (イメージには全世代が残る)
+#   CLAYFS_KEEP (3)  手元に残す控えの数 (イメージには全コミットが残る。未反映のコミットは消さない)
 #   CLAYFS_PUSH_INTERVAL (3600)  自動実行の間隔 (秒)
 #   CLAYFS_LOG (~/Library/Logs/clayfs.log)
 #
-# イメージの中身: head/ が最新、history/世代名/ が過去の各世代、history/世代名.changes が変更一覧。
-# 世代どうしはイメージ内のクローンなので、増える容量は変更されたファイルの分だけ。
+# イメージの中身: head/ が最新、history/コミット名/ が過去の各コミット、history/コミット名.changes が変更一覧。
+# コミットどうしはイメージ内のクローンなので、増える容量は変更されたファイルの分だけ。
 # 読めないファイル (開けない、壊れている) は、警告を出して飛ばす。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -59,7 +65,7 @@ quiet() {
 tool() { "$CLAYFS_TOOL" -s "$CLAYFS_STORE" "$@"; }
 
 tracked() { [ -f "$CLAYFS_STORE/work.json" ]; }
-need_tracked() { tracked || die "まだ取り込んでいません。先に clayfsctl create を実行してください"; }
+need_tracked() { tracked || die "まだ取り込んでいません。先に clayfsctl init を実行してください"; }
 
 # DIR にボリュームがつながっているか (親とデバイスが違えばマウント点)。mount コマンドは、
 # 応答しないマウントが 1 つでもあると固まるので使わない。
@@ -109,26 +115,28 @@ cmd_create() {
   tool track "$CLAYFS_DIR" "$CLAYFS_IMAGE" --size "$size" --keep "$CLAYFS_KEEP" || die "取り込みに失敗"
 }
 
-cmd_status() { need_tracked; tool status; }
+cmd_status() { need_tracked; tool status "$@"; }
+cmd_diff() { need_tracked; tool diff "$@"; }
+cmd_log() { need_tracked; tool log "$@"; }
+
+cmd_commit() { need_tracked; lock; tool commit "$@"; }
 
 cmd_push() {
   need_tracked
   lock
   release_image
-  tool push "$@"; rc=$?
+  tool push; rc=$?
   restore_image
   return $rc
 }
 
-cmd_log() { need_tracked; lock; release_image; tool log; rc=$?; restore_image; return $rc; }
-
 cmd_show() {
-  [ $# = 1 ] || die "使い方: clayfsctl show 世代名 (世代名は clayfsctl log で見られます)"
-  need_tracked; lock; release_image; tool show "$1"; rc=$?; restore_image; return $rc
+  # 古いコミットの変更一覧はイメージから読むことがあるので、つないであれば一時的に外す
+  need_tracked; lock; release_image; tool show "$@"; rc=$?; restore_image; return $rc
 }
 
 cmd_restore() {
-  [ $# -ge 1 ] || die "使い方: clayfsctl restore PATH... (全体を戻すなら --all)"
+  [ $# -ge 1 ] || die "使い方: clayfsctl restore [--source コミット] PATH... (全体を戻すなら --all)"
   need_tracked
   lock
   tool restore "$@"
@@ -142,7 +150,7 @@ cmd_mount() {
   quiet hdiutil attach -nobrowse -readonly -mountpoint "$CLAYFS_MNT" "$CLAYFS_IMAGE" || die "つなげません: $CLAYFS_IMAGE"
   echo "つなぎました (読み込み専用): $CLAYFS_MNT"
   echo "  最新      $CLAYFS_MNT/head"
-  echo "  過去の世代 $CLAYFS_MNT/history/世代名"
+  echo "  過去       $CLAYFS_MNT/history/コミット名"
 }
 
 cmd_umount() {
@@ -167,11 +175,11 @@ cmd_compact() {
 cmd_info() {
   echo "対象     $CLAYFS_DIR"
   echo "イメージ $CLAYFS_IMAGE$([ -e "$CLAYFS_IMAGE" ] && echo " ($(du -sh "$CLAYFS_IMAGE" | cut -f1 | tr -d ' '))" || echo " (まだありません)")"
-  echo "控え     $CLAYFS_STORE (直近 $CLAYFS_KEEP 世代)"
+  echo "控え     $CLAYFS_STORE (直近 $CLAYFS_KEEP コミット)"
   if tracked; then
-    echo "最新世代 $(sed -n 's/.*"base": "\([^"]*\)".*/\1/p' "$CLAYFS_STORE/work.json")"
+    echo "HEAD     $(sed -n 's/.*"base": "\([^"]*\)".*/\1/p' "$CLAYFS_STORE/work.json")"
   else
-    echo "最新世代 (まだ取り込んでいません。clayfsctl create)"
+    echo "HEAD     (まだ取り込んでいません。clayfsctl init)"
   fi
   is_mounted "$CLAYFS_MNT" && echo "履歴     $CLAYFS_MNT につないであります"
   if [ -f "$PLIST" ]; then echo "自動実行 あり ($CLAYFS_PUSH_INTERVAL 秒ごと。ログ: $CLAYFS_LOG)"; else echo "自動実行 なし (clayfsctl install-agent)"; fi
@@ -179,9 +187,12 @@ cmd_info() {
 
 cmd_run() {  # launchd 用: 変更があるときだけ反映する
   tracked || { echo "$(date '+%F %T') まだ取り込んでいません"; return 0; }
-  if tool status -q; then return 0; fi
-  echo "$(date '+%F %T') 変更があるので反映します"
-  cmd_push -m "auto"
+  if ! tool status -q; then
+    echo "$(date '+%F %T') 変更があるのでコミットします"
+    cmd_commit -m "auto" || return 1
+  fi
+  # コミットだけして反映していない分 (手動の commit を含む) も、ここでまとめて反映する
+  cmd_push
 }
 
 xesc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
@@ -222,10 +233,12 @@ cmd_uninstall_agent() {
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
-  create) cmd_create "$@" ;;
-  status) cmd_status ;;
-  push) cmd_push "$@" ;;
-  log) cmd_log ;;
+  init|create) cmd_create "$@" ;;
+  status) cmd_status "$@" ;;
+  diff) cmd_diff "$@" ;;
+  commit) cmd_commit "$@" ;;
+  push) cmd_push ;;
+  log) cmd_log "$@" ;;
   show) cmd_show "$@" ;;
   restore) cmd_restore "$@" ;;
   mount) cmd_mount ;;

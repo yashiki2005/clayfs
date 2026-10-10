@@ -5,13 +5,17 @@
 読み書きの経路にファイルシステムの層は入らず、レイヤーの中身は普通の APFS。
 ふだんは clayfsctl から呼ぶ (設定や排他、イメージの扱いは clayfsctl が受け持つ)。
 
-作業ツリーの運用 (clayfsctl が使う):
-  clayfs_tool [-s STORE] track DIR IMAGE [--size 30g]  DIR の現状を最初の世代にし、IMAGE を作って入れる
-  clayfs_tool [-s STORE] status [-q]                   前回の反映からの変更 (-q: 変更があれば終了コード 1)
-  clayfs_tool [-s STORE] push [-m MSG]                 現状を IMAGE に反映し、世代を 1 つ足す
-  clayfs_tool [-s STORE] restore PATH... | --all       前回の反映時の内容に戻す (今のものは trash へ退避)
-  clayfs_tool [-s STORE] log                           IMAGE にある世代の一覧
-  clayfs_tool [-s STORE] show GEN                      その世代の変更一覧
+作業ツリーの運用 (clayfsctl が使う。git と同じ考え方で、コミットは手元、push でイメージへ):
+  clayfs_tool [-s STORE] track DIR IMAGE [--size 30g]  DIR の現状を最初のコミットにし、IMAGE を作って入れる
+  clayfs_tool [-s STORE] status [-s] [-q]              最後のコミットからの変更 (-q: 変更があれば終了コード 1)
+  clayfs_tool [-s STORE] diff [PATH...]                変更の中身 (最後のコミットとの差分)
+  clayfs_tool [-s STORE] commit [-m MSG]               現状を手元の控えにコミットする (イメージには触れない)
+  clayfs_tool [-s STORE] push                          まだ反映していないコミットを、古い順に IMAGE へ反映する
+  clayfs_tool [-s STORE] log [-n N]                    コミットの一覧
+  clayfs_tool [-s STORE] show [GEN]                    そのコミットの変更一覧 (省略時は HEAD)
+  clayfs_tool [-s STORE] restore [--source GEN] PATH... | --all
+                                                       コミット時の内容に戻す (今のものは trash へ退避)
+コミットは HEAD、または名前の一部 (一意に決まる範囲) で指定できる。
 
 IMAGE のボリュームの中身:
   head/                最新の世代のツリー
@@ -21,7 +25,7 @@ IMAGE のボリュームの中身:
 世代どうしはイメージ内のクローンなので、増える容量は変更されたファイルの分だけ。
 
 レイヤーを直接扱う (Docker 風の使い方):
-  import NAME DIR / prepare NAME PARENT / commit NAME / diff NAME [-o FILE]
+  import NAME DIR / prepare NAME PARENT / layer-commit NAME / layer-diff NAME [-o FILE]
   apply NAME PARENT TAR / path NAME / ls / rm NAME
 
 STORE は $CLAYFS_STORE、なければ ~/.clayfs。クローンはボリュームをまたげないので、
@@ -411,11 +415,13 @@ def cmd_track(st, a):
 
     conf = {'dir': d, 'image': image, 'keep': a.keep}
     conf['base'] = snapshot(st, conf, 'initial')
+    record(st, conf['base'], 'initial', [])
     run('hdiutil', 'create', '-size', a.size, '-fs', 'APFS', '-type', kind,
         '-volname', os.path.basename(d), image)
     sync_image(st, conf, conf['base'], None, 'initial', [])
+    conf['pushed'] = conf['base']
     save_work_conf(st, conf)
-    print(f'取り込みました: {d}\n  世代     {conf["base"]}\n  イメージ {image} ({a.size} まで)')
+    print(f'取り込みました: {d}\n  コミット {conf["base"]}\n  イメージ {image} ({a.size} まで)')
 
 
 def changes(old, new, rel='', since=None):
@@ -447,44 +453,170 @@ def work_changes(st, conf):
             if c[1] not in skipped)
 
 
+# ---- コミットの記録 ----
+# 控えのレイヤーは古いものから消すので、一覧と変更内容は別に持つ:
+#   log.jsonl            1 行 1 コミット (古い順)
+#   changes/GEN.changes  そのコミットの変更一覧 (イメージの history/ に置くものと同じ形式)
+
+def log_entries(st, conf):
+    path = os.path.join(st.root, 'log.jsonl')
+    if not os.path.exists(path):
+        # この記録を持つ前に作ったストア: 残っている控えから起こす
+        with open(path, 'w') as f:
+            for n in reversed(generations(st, conf)):
+                m = st.meta(n)
+                f.write(json.dumps({'name': n, 'message': m.get('message', ''), 'time': m.get('started', 0), 'changes': None}, ensure_ascii=False) + '\n')
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def changes_file(st, name):
+    return os.path.join(st.root, 'changes', name + '.changes')
+
+
+def record(st, name, msg, notes):
+    os.makedirs(os.path.join(st.root, 'changes'), exist_ok=True)
+    with open(changes_file(st, name), 'w') as f:
+        f.write(f'# {name} {msg or ""}\n' + ''.join(f'{k} {p}\n' for k, p in notes))
+    with open(os.path.join(st.root, 'log.jsonl'), 'a') as f:
+        f.write(json.dumps({'name': name, 'message': msg or '', 'time': time.time(), 'changes': len(notes)}, ensure_ascii=False) + '\n')
+
+
+def read_notes(st, name):
+    try:
+        with open(changes_file(st, name)) as f:
+            return [tuple(line.rstrip('\n').split(' ', 1)) for line in f if line[:1] != '#' and line.strip()]
+    except FileNotFoundError:
+        return None
+
+
+def pushed(conf):
+    # 'pushed' を持つ前のストアは、コミットと反映が一体だった
+    return conf.get('pushed', conf['base'])
+
+
+def unpushed(st, conf):
+    """Commits not yet in the image, oldest first."""
+    names = [e['name'] for e in log_entries(st, conf)]
+    return names[names.index(pushed(conf)) + 1:] if pushed(conf) in names else names
+
+
+def resolve_gen(st, conf, spec):
+    names = [e['name'] for e in log_entries(st, conf)]
+    if spec in (None, 'HEAD'):
+        return conf['base']
+    hits = [n for n in names if spec in n]
+    if spec in names:
+        return spec
+    if len(hits) != 1:
+        die(f'その名前のコミットは{"ありません" if not hits else "複数あります"}: {spec}')
+    return hits[0]
+
+
+LABEL = {'A': '追加', 'M': '変更', 'D': '削除'}
+
+
+def rel_to(d, p):
+    """Path of p relative to the tracked directory, with symlinked parents (/tmp) resolved."""
+    p = os.path.abspath(p)
+    return os.path.relpath(os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p)), d)
+
+
 def cmd_status(st, a):
     conf = work_conf(st)
-    n = 0
-    for kind, p in work_changes(st, conf):
-        if not a.quiet:
-            print(kind, p)
-        n += 1
-    for p in [] if a.quiet else conf.get('skipped', []):
-        print('! 読めないため対象外:', p)
+    notes = list(work_changes(st, conf))
     if a.quiet:
-        sys.exit(1 if n else 0)
-    print(f'{conf["base"]} から {n} 件の変更', file=sys.stderr)
+        sys.exit(1 if notes else 0)
+    if a.short:
+        for kind, p in notes:
+            print(kind, p)
+        return
+    ahead = len(unpushed(st, conf))
+    print(f'HEAD {conf["base"]}')
+    print(f'イメージより {ahead} コミット進んでいます (clayfsctl push で反映)' if ahead else 'イメージは最新です')
+    if notes:
+        print('\nコミットしていない変更:')
+        for kind, p in notes:
+            print(f'\t{LABEL[kind]}:   {p}')
+        print('\n(clayfsctl commit でコミット、clayfsctl restore PATH で取り消し)')
+    else:
+        print('\n変更はありません')
+    for p in conf.get('skipped', []):
+        print(f'読めないため対象外: {p}')
+
+
+def cmd_wdiff(st, a):
+    conf = work_conf(st)
+    base, d = st.fs(conf['base']), conf['dir']
+    want = [rel_to(d, p) for p in a.paths]
+    for kind, p in work_changes(st, conf):
+        rel = p.rstrip('/')
+        if want and not any(rel == w or rel.startswith(w + '/') or w == '.' for w in want):
+            continue
+        old, new = os.path.join(base, rel), os.path.join(d, rel)
+        if p.endswith('/') and kind == 'M':
+            continue
+        sys.stdout.flush()
+        if kind == 'D' or os.path.isdir(new) or os.path.isdir(old):
+            print(f'{LABEL[kind]}: {p}')
+            continue
+        subprocess.run(['diff', '-u', '-N', '--label', 'a/' + rel, '--label', 'b/' + rel,
+                        old if kind == 'M' else '/dev/null', new])
+
+
+def cmd_wcommit(st, a):
+    conf = work_conf(st)
+    log_entries(st, conf)
+    if not a.allow_empty and next(iter(work_changes(st, conf)), None) is None:
+        print('変更はありません (コミットしません)')
+        return
+    name = snapshot(st, conf, a.message)
+    # 控えを作った後で数える: その間に触られたファイルは余分に載るだけで、漏れない
+    notes = list(work_changes(st, conf))
+    record(st, name, a.message, notes)
+    conf['pushed'] = pushed(conf)
+    conf['base'] = name
+    save_work_conf(st, conf)
+    print(f'[{name}] {a.message or ""}\n {len(notes)} 件の変更')
+
+
+def prune(st, conf):
+    """Drop old local layers, but never one that still has to be pushed."""
+    keep = max(conf['keep'], len(unpushed(st, conf)) + 1)
+    for old in generations(st, conf)[keep:]:
+        shutil.rmtree(st.dir(old))
 
 
 def cmd_push(st, a):
     conf = work_conf(st)
-    name = snapshot(st, conf, a.message)
-    # listed after the snapshot: a file touched in between is copied once more, never missed
-    notes = list(work_changes(st, conf))
-    try:
-        n = sync_image(st, conf, name, conf['base'], a.message, notes)
-    except SystemExit:
-        # head may be half updated, but history and the old base still hold the last good push
-        shutil.rmtree(st.dir(name))
-        raise
-    conf['base'] = name
-    save_work_conf(st, conf)
-    for old in generations(st, conf)[conf['keep']:]:
-        shutil.rmtree(st.dir(old))
-    print(f'反映しました: {name} ({n} 件の変更) -> {conf["image"]}')
+    todo = unpushed(st, conf)
+    if not todo:
+        print('イメージは最新です (反映するコミットはありません)')
+        return
+    msgs = {e['name']: e['message'] for e in log_entries(st, conf)}
+    for name in todo:
+        notes = read_notes(st, name)
+        prev = st.meta(name)['parent']
+        if notes is None:
+            die(f'{name} の変更一覧がありません')
+        # head が途中まで書かれて失敗しても、pushed は進めないので、次の push が同じコミットからやり直す
+        sync_image(st, conf, name, prev, msgs.get(name), notes)
+        conf['pushed'] = name
+        save_work_conf(st, conf)
+        print(f'反映しました: {name} ({len(notes)} 件の変更)')
+    prune(st, conf)
+    print(f'-> {conf["image"]}')
 
 
 def cmd_restore(st, a):
     conf = work_conf(st)
-    base, d = st.fs(conf['base']), conf['dir']
+    gen = resolve_gen(st, conf, a.source)
+    if not os.path.isdir(st.dir(gen)):
+        die(f'{gen} の控えは手元にもうありません。clayfsctl mount でイメージの history/{gen} から取り出してください')
+    base, d = st.fs(gen), conf['dir']
     if a.all == bool(a.paths):
         die('戻すパスを指定してください (全体を戻すなら --all)')
-    rels = ['.'] if a.all else [os.path.relpath(os.path.abspath(p), d) for p in a.paths]
+    rels = ['.'] if a.all else [rel_to(d, p) for p in a.paths]
     trash = os.path.join(st.root, 'trash', time.strftime('%Y%m%d-%H%M%S'))
     for rel in rels:
         if rel.startswith('..') or (rel == '.' and not a.all):
@@ -498,32 +630,39 @@ def cmd_restore(st, a):
         if os.path.lexists(src):
             os.makedirs(os.path.dirname(cur), exist_ok=True)
             clone_tree(src, cur)
-            print(f'戻しました: {rel}')
+            print(f'戻しました: {rel} ({gen})')
         else:
-            # 前回の反映より前に消したものは、イメージの history/ にある (clayfsctl mount)
-            print(f'前回の反映時点にはありません: {rel}')
+            print(f'{gen} の時点にはありません: {rel}')
     if os.path.isdir(trash):
         print(f'戻す前の内容は、ここに退避してあります: {trash}')
 
 
 def cmd_log(st, a):
     conf = work_conf(st)
-    with mounted(st, conf, readonly=True) as mnt:
-        hist = os.path.join(mnt, 'history')
-        for f in sorted((f for f in os.listdir(hist) if f.endswith('.changes')), reverse=True):
-            with open(os.path.join(hist, f)) as h:
-                lines = h.read().splitlines()
-            print(f'{lines[0][2:]}  ({len(lines) - 1} 件)')
+    entries = list(reversed(log_entries(st, conf)))
+    for e in entries[:a.n] if a.n else entries:
+        marks = [m for m, on in (('HEAD', e['name'] == conf['base']), ('イメージ', e['name'] == pushed(conf))) if on]
+        when = time.strftime('%Y-%m-%d %H:%M', time.localtime(e['time'])) if e['time'] else '?'
+        n = '' if e['changes'] is None else f'  {e["changes"]} 件'
+        print(f'{e["name"]}{" (" + ", ".join(marks) + ")" if marks else ""}  {when}{n}  {e["message"]}')
 
 
 def cmd_show(st, a):
     conf = work_conf(st)
+    gen = resolve_gen(st, conf, a.gen)
+    try:
+        with open(changes_file(st, gen)) as h:
+            sys.stdout.write(h.read())
+        return
+    except FileNotFoundError:
+        pass
+    # 記録を手元に持つ前のコミットは、イメージにある
     with mounted(st, conf, readonly=True) as mnt:
         try:
-            with open(os.path.join(mnt, 'history', a.gen + '.changes')) as h:
+            with open(os.path.join(mnt, 'history', gen + '.changes')) as h:
                 sys.stdout.write(h.read())
         except FileNotFoundError:
-            die(f'その世代はありません: {a.gen}')
+            die(f'そのコミットの変更一覧はありません: {gen}')
 
 
 def main():
@@ -533,8 +672,8 @@ def main():
 
     p = sub.add_parser('import'); p.add_argument('name'); p.add_argument('dir'); p.set_defaults(fn=cmd_import)
     p = sub.add_parser('prepare'); p.add_argument('name'); p.add_argument('parent'); p.set_defaults(fn=cmd_prepare)
-    p = sub.add_parser('commit'); p.add_argument('name'); p.set_defaults(fn=cmd_commit)
-    p = sub.add_parser('diff'); p.add_argument('name'); p.add_argument('-o', '--output'); p.set_defaults(fn=cmd_diff)
+    p = sub.add_parser('layer-commit'); p.add_argument('name'); p.set_defaults(fn=cmd_commit)
+    p = sub.add_parser('layer-diff'); p.add_argument('name'); p.add_argument('-o', '--output'); p.set_defaults(fn=cmd_diff)
     p = sub.add_parser('apply'); p.add_argument('name'); p.add_argument('parent'); p.add_argument('tar'); p.set_defaults(fn=cmd_apply)
     p = sub.add_parser('path'); p.add_argument('name'); p.set_defaults(fn=cmd_path)
     p = sub.add_parser('ls'); p.set_defaults(fn=cmd_ls)
@@ -543,11 +682,15 @@ def main():
     p = sub.add_parser('track'); p.add_argument('dir'); p.add_argument('image')
     p.add_argument('--size', default='30g', help='maximum image size (sparse images only use what is written)')
     p.add_argument('--keep', type=int, default=3, help='base generations to keep locally (the image keeps all)'); p.set_defaults(fn=cmd_track)
-    p = sub.add_parser('status'); p.add_argument('-q', '--quiet', action='store_true'); p.set_defaults(fn=cmd_status)
-    p = sub.add_parser('push'); p.add_argument('-m', '--message'); p.set_defaults(fn=cmd_push)
-    p = sub.add_parser('restore'); p.add_argument('paths', nargs='*'); p.add_argument('--all', action='store_true'); p.set_defaults(fn=cmd_restore)
-    p = sub.add_parser('log'); p.set_defaults(fn=cmd_log)
-    p = sub.add_parser('show'); p.add_argument('gen'); p.set_defaults(fn=cmd_show)
+    p = sub.add_parser('status'); p.add_argument('-q', '--quiet', action='store_true')
+    p.add_argument('-s', '--short', action='store_true'); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser('diff'); p.add_argument('paths', nargs='*'); p.set_defaults(fn=cmd_wdiff)
+    p = sub.add_parser('commit'); p.add_argument('-m', '--message'); p.add_argument('--allow-empty', action='store_true'); p.set_defaults(fn=cmd_wcommit)
+    p = sub.add_parser('push'); p.set_defaults(fn=cmd_push)
+    p = sub.add_parser('restore'); p.add_argument('paths', nargs='*'); p.add_argument('--all', action='store_true')
+    p.add_argument('--source'); p.set_defaults(fn=cmd_restore)
+    p = sub.add_parser('log'); p.add_argument('-n', type=int); p.set_defaults(fn=cmd_log)
+    p = sub.add_parser('show'); p.add_argument('gen', nargs='?'); p.set_defaults(fn=cmd_show)
 
     a = ap.parse_args()
     a.fn(Store(a.store), a)
