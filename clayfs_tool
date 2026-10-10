@@ -522,9 +522,14 @@ def rel_to(d, p):
     return os.path.relpath(os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p)), d)
 
 
+def visible(notes):
+    """Drop directory-only entries: a directory's times change whenever something inside does."""
+    return [(k, p) for k, p in notes if not (k == 'M' and p.endswith('/'))]
+
+
 def cmd_status(st, a):
     conf = work_conf(st)
-    notes = list(work_changes(st, conf))
+    notes = visible(work_changes(st, conf))
     if a.quiet:
         sys.exit(1 if notes else 0)
     if a.short:
@@ -567,7 +572,7 @@ def cmd_wdiff(st, a):
 def cmd_wcommit(st, a):
     conf = work_conf(st)
     log_entries(st, conf)
-    if not a.allow_empty and next(iter(work_changes(st, conf)), None) is None:
+    if not a.allow_empty and not visible(work_changes(st, conf)):
         print('変更はありません (コミットしません)')
         return
     name = snapshot(st, conf, a.message)
@@ -577,7 +582,7 @@ def cmd_wcommit(st, a):
     conf['pushed'] = pushed(conf)
     conf['base'] = name
     save_work_conf(st, conf)
-    print(f'[{name}] {a.message or ""}\n {len(notes)} 件の変更')
+    print(f'[{name}] {a.message or ""}\n {len(visible(notes))} 件の変更')
 
 
 def prune(st, conf):
