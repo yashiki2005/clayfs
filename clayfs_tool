@@ -631,6 +631,7 @@ def index_db(st):
     db = sqlite3.connect(os.path.join(st.root, 'index.sqlite'))
     db.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER,'
                ' ino INTEGER, sha256 TEXT, shared_with INTEGER)')
+    db.execute('CREATE INDEX IF NOT EXISTS files_content ON files (sha256, size)')
     return db
 
 
@@ -805,11 +806,14 @@ def cmd_dedup(st, a):
     free_before = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
 
     groups = files = est = skipped = in_layers = 0
-    cur = db.execute('SELECT sha256, size FROM files WHERE size > 0 GROUP BY sha256, size HAVING COUNT(*) > 1'
-                     ' ORDER BY size DESC').fetchall()
-    for sha, size in cur:
-        rows = db.execute('SELECT path, mtime_ns, ino, shared_with FROM files WHERE sha256 = ? AND size = ?'
-                          ' ORDER BY path', (sha, size)).fetchall()
+    # 1 回の問い合わせで、同じ中身の組を大きい順に取り出す (組ごとに引き直すと、件数の 2 乗の時間がかかる)
+    import itertools
+    cur = db.execute('SELECT sha256, size, path, mtime_ns, ino, shared_with FROM files WHERE size > 0'
+                     ' AND (sha256, size) IN (SELECT sha256, size FROM files WHERE size > 0'
+                     '                        GROUP BY sha256, size HAVING COUNT(*) > 1)'
+                     ' ORDER BY size DESC, sha256, path').fetchall()
+    for (sha, size), members in itertools.groupby(cur, key=lambda r: (r[0], r[1])):
+        rows = [m[2:] for m in members]
         # 記録の後で変わったもの、ハードリンク、変更禁止のものは触らない
         live = []
         for rel, mtime_ns, ino, shared in rows:
