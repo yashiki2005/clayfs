@@ -1,0 +1,239 @@
+#!/bin/sh
+# clayfsctl: 作業ディレクトリ (既定 ~/src) をそのままの場所で使いながら、ディスクイメージに世代つきで
+#            反映していくための管理コマンド (macOS)。git でいうと、作業ツリーが CLAYFS_DIR、リモートがイメージ。
+#
+#   clayfsctl create [SIZE]   イメージを作り、CLAYFS_DIR の現状を最初の世代として取り込む (既定 30g。使った分だけ大きくなる)
+#   clayfsctl status          前回の反映からの変更を一覧する (A 追加 / M 変更 / D 削除)
+#   clayfsctl push [-m MSG]   変更をイメージに反映し、世代を 1 つ足す
+#   clayfsctl log             イメージにある世代の一覧
+#   clayfsctl show GEN        その世代の変更一覧
+#   clayfsctl restore PATH... 前回の反映時の内容に戻す (--all で全体。今の内容は消さずに退避する)
+#   clayfsctl mount           イメージを読み込み専用で CLAYFS_MNT につなぐ (過去の世代をフォルダとして見る)
+#   clayfsctl umount          それを外す
+#   clayfsctl compact         イメージの空き領域を回収する
+#   clayfsctl info            設定と状態を表示する
+#   clayfsctl run             変更があれば push する (自動実行用。なければ何もしない)
+#   clayfsctl install-agent   CLAYFS_PUSH_INTERVAL 秒ごとに run を実行する (LaunchAgent)
+#   clayfsctl uninstall-agent 自動実行を外す
+#
+# 設定は環境変数、または ~/.config/clayfs/config (シェル形式) で上書きできる:
+#   CLAYFS_DIR (~/src)  対象の作業ディレクトリ
+#   CLAYFS_IMAGE (~/<DIR の名前>.dmg.sparsebundle)  反映先のイメージ。拡張子で形式が決まる
+#              (.sparsebundle / .sparseimage / .dmg)
+#   CLAYFS_STORE (~/.clayfs)  手元の控え (クローン)。CLAYFS_DIR と同じボリュームに置くこと
+#   CLAYFS_MNT (~/clayfs-history)  mount でつなぐ場所
+#   CLAYFS_KEEP (3)  手元に残す控えの世代数 (イメージには全世代が残る)
+#   CLAYFS_PUSH_INTERVAL (3600)  自動実行の間隔 (秒)
+#   CLAYFS_LOG (~/Library/Logs/clayfs.log)
+#
+# イメージの中身: head/ が最新、history/世代名/ が過去の各世代、history/世代名.changes が変更一覧。
+# 世代どうしはイメージ内のクローンなので、増える容量は変更されたファイルの分だけ。
+# 読めないファイル (開けない、壊れている) は、警告を出して飛ばす。
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+set -a
+[ -f "$HOME/.config/clayfs/config" ] && . "$HOME/.config/clayfs/config"
+set +a
+[ "$(uname -s)" = Darwin ] || { echo "エラー: macOS 専用です (APFS のクローンを使います)" >&2; exit 1; }
+CLAYFS_DIR="${CLAYFS_DIR:-$HOME/src}"
+CLAYFS_IMAGE="${CLAYFS_IMAGE:-$HOME/$(basename "$CLAYFS_DIR").dmg.sparsebundle}"
+CLAYFS_STORE="${CLAYFS_STORE:-$HOME/.clayfs}"
+CLAYFS_MNT="${CLAYFS_MNT:-$HOME/clayfs-history}"
+CLAYFS_KEEP="${CLAYFS_KEEP:-3}"
+CLAYFS_PUSH_INTERVAL="${CLAYFS_PUSH_INTERVAL:-3600}"
+CLAYFS_LOG="${CLAYFS_LOG:-$HOME/Library/Logs/clayfs.log}"
+CLAYFS_TOOL="${CLAYFS_TOOL:-$HERE/clayfs_tool}"
+LABEL="top.yashiki.clayfs"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOCK="$CLAYFS_STORE/lock"
+
+die() { echo "エラー: $*" >&2; exit 1; }
+
+# コマンドを実行し、標準出力を捨て、hdiutil の「非推奨」の警告だけ除いて stderr に出す (終了コードは保つ)
+quiet() {
+  _q_err="$("$@" 2>&1 >/dev/null)"; _q_rc=$?
+  [ -n "$_q_err" ] && printf '%s\n' "$_q_err" | grep -v "is deprecated" >&2
+  return $_q_rc
+}
+
+tool() { "$CLAYFS_TOOL" -s "$CLAYFS_STORE" "$@"; }
+
+tracked() { [ -f "$CLAYFS_STORE/work.json" ]; }
+need_tracked() { tracked || die "まだ取り込んでいません。先に clayfsctl create を実行してください"; }
+
+# DIR にボリュームがつながっているか (親とデバイスが違えばマウント点)。mount コマンドは、
+# 応答しないマウントが 1 つでもあると固まるので使わない。
+is_mounted() {
+  [ -d "$1" ] && [ "$(stat -f %d "$1" 2>/dev/null)" != "$(stat -f %d "$1/.." 2>/dev/null)" ]
+}
+
+# 同時に 2 つ動くと、控えとイメージの世代がずれる。mkdir は原子的なので、これを鍵にする。
+lock() {
+  mkdir -p "$CLAYFS_STORE"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    _pid="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    [ "$_pid" = $$ ] && return 0   # run から push を呼ぶときなど、自分の鍵
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+      die "ほかの clayfsctl が実行中です (PID $_pid)"
+    fi
+    # 持ち主がもういない鍵 (異常終了の残り) は引き取る
+    rm -rf "$LOCK"; mkdir "$LOCK" || die "鍵を取れません: $LOCK"
+  fi
+  echo $$ >"$LOCK/pid"
+  trap 'rm -rf "$LOCK"' EXIT
+  trap 'exit 130' INT TERM
+}
+
+# 反映や一覧は、イメージを一時的につなぎ直す。mount で見ている最中なら、いったん外して後で戻す。
+REMOUNT=0
+release_image() {
+  if is_mounted "$CLAYFS_MNT"; then
+    quiet hdiutil detach "$CLAYFS_MNT" || die "$CLAYFS_MNT が使用中で外せません (開いているファイルやターミナルを閉じてください)"
+    REMOUNT=1
+  fi
+}
+restore_image() {
+  [ $REMOUNT = 1 ] || return 0
+  quiet hdiutil attach -nobrowse -readonly -mountpoint "$CLAYFS_MNT" "$CLAYFS_IMAGE" || echo "警告: $CLAYFS_MNT をつなぎ直せませんでした (clayfsctl mount で戻せます)" >&2
+  REMOUNT=0
+}
+
+cmd_create() {
+  size="${1:-30g}"
+  tracked && die "すでに取り込んでいます: $CLAYFS_STORE (clayfsctl info で確認できます)"
+  [ -d "$CLAYFS_DIR" ] || die "ディレクトリがありません: $CLAYFS_DIR"
+  [ -e "$CLAYFS_IMAGE" ] && die "すでにあります: $CLAYFS_IMAGE"
+  mkdir -p "$(dirname "$CLAYFS_IMAGE")"
+  lock
+  echo "取り込みます: $CLAYFS_DIR -> $CLAYFS_IMAGE (初回は全体をコピーするので、数分かかります)"
+  tool track "$CLAYFS_DIR" "$CLAYFS_IMAGE" --size "$size" --keep "$CLAYFS_KEEP" || die "取り込みに失敗"
+}
+
+cmd_status() { need_tracked; tool status; }
+
+cmd_push() {
+  need_tracked
+  lock
+  release_image
+  tool push "$@"; rc=$?
+  restore_image
+  return $rc
+}
+
+cmd_log() { need_tracked; lock; release_image; tool log; rc=$?; restore_image; return $rc; }
+
+cmd_show() {
+  [ $# = 1 ] || die "使い方: clayfsctl show 世代名 (世代名は clayfsctl log で見られます)"
+  need_tracked; lock; release_image; tool show "$1"; rc=$?; restore_image; return $rc
+}
+
+cmd_restore() {
+  [ $# -ge 1 ] || die "使い方: clayfsctl restore PATH... (全体を戻すなら --all)"
+  need_tracked
+  lock
+  tool restore "$@"
+}
+
+cmd_mount() {
+  need_tracked
+  is_mounted "$CLAYFS_MNT" && { echo "すでにつながっています: $CLAYFS_MNT"; return 0; }
+  lock
+  mkdir -p "$CLAYFS_MNT"
+  quiet hdiutil attach -nobrowse -readonly -mountpoint "$CLAYFS_MNT" "$CLAYFS_IMAGE" || die "つなげません: $CLAYFS_IMAGE"
+  echo "つなぎました (読み込み専用): $CLAYFS_MNT"
+  echo "  最新      $CLAYFS_MNT/head"
+  echo "  過去の世代 $CLAYFS_MNT/history/世代名"
+}
+
+cmd_umount() {
+  is_mounted "$CLAYFS_MNT" || { echo "つながっていません: $CLAYFS_MNT"; return 0; }
+  quiet hdiutil detach "$CLAYFS_MNT" || die "使用中で外せません: $CLAYFS_MNT"
+  rmdir "$CLAYFS_MNT" 2>/dev/null
+  echo "外しました: $CLAYFS_MNT"
+}
+
+cmd_compact() {
+  [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE"
+  case "$CLAYFS_IMAGE" in *.dmg) die "固定サイズのイメージ (.dmg) は回収できません" ;; esac
+  lock
+  release_image
+  before="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
+  quiet hdiutil compact "$CLAYFS_IMAGE" || echo "警告: 回収に失敗しました" >&2
+  after="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
+  echo "回収しました: $(( (before - after) / 1024 )) MB (現在 $(( after / 1024 )) MB)"
+  restore_image
+}
+
+cmd_info() {
+  echo "対象     $CLAYFS_DIR"
+  echo "イメージ $CLAYFS_IMAGE$([ -e "$CLAYFS_IMAGE" ] && echo " ($(du -sh "$CLAYFS_IMAGE" | cut -f1 | tr -d ' '))" || echo " (まだありません)")"
+  echo "控え     $CLAYFS_STORE (直近 $CLAYFS_KEEP 世代)"
+  if tracked; then
+    echo "最新世代 $(sed -n 's/.*"base": "\([^"]*\)".*/\1/p' "$CLAYFS_STORE/work.json")"
+  else
+    echo "最新世代 (まだ取り込んでいません。clayfsctl create)"
+  fi
+  is_mounted "$CLAYFS_MNT" && echo "履歴     $CLAYFS_MNT につないであります"
+  if [ -f "$PLIST" ]; then echo "自動実行 あり ($CLAYFS_PUSH_INTERVAL 秒ごと。ログ: $CLAYFS_LOG)"; else echo "自動実行 なし (clayfsctl install-agent)"; fi
+}
+
+cmd_run() {  # launchd 用: 変更があるときだけ反映する
+  tracked || { echo "$(date '+%F %T') まだ取り込んでいません"; return 0; }
+  if tool status -q; then return 0; fi
+  echo "$(date '+%F %T') 変更があるので反映します"
+  cmd_push -m "auto"
+}
+
+xesc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+cmd_install_agent() {
+  need_tracked
+  case "$CLAYFS_PUSH_INTERVAL" in ''|*[!0-9]*) die "CLAYFS_PUSH_INTERVAL は秒数 (整数) で指定してください: $CLAYFS_PUSH_INTERVAL" ;; esac
+  [ "$CLAYFS_PUSH_INTERVAL" -ge 60 ] || die "CLAYFS_PUSH_INTERVAL は 60 以上にしてください: $CLAYFS_PUSH_INTERVAL"
+  mkdir -p "$(dirname "$PLIST")" "$(dirname "$CLAYFS_LOG")"
+  cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$(xesc "$HERE")/clayfsctl</string><string>run</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>CLAYFS_DIR</key><string>$(xesc "$CLAYFS_DIR")</string>
+    <key>CLAYFS_IMAGE</key><string>$(xesc "$CLAYFS_IMAGE")</string>
+    <key>CLAYFS_STORE</key><string>$(xesc "$CLAYFS_STORE")</string>
+    <key>CLAYFS_MNT</key><string>$(xesc "$CLAYFS_MNT")</string>
+    <key>CLAYFS_KEEP</key><string>$CLAYFS_KEEP</string>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+  </dict>
+  <key>StartInterval</key><integer>$CLAYFS_PUSH_INTERVAL</integer>
+  <key>StandardOutPath</key><string>$(xesc "$CLAYFS_LOG")</string>
+  <key>StandardErrorPath</key><string>$(xesc "$CLAYFS_LOG")</string>
+</dict></plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" || { rm -f "$PLIST"; die "LaunchAgent を読み込めません"; }
+  echo "入れました: $PLIST ($CLAYFS_PUSH_INTERVAL 秒ごとに、変更があれば反映します)"
+}
+
+cmd_uninstall_agent() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  if [ -f "$PLIST" ]; then rm -f "$PLIST"; echo "外しました: $PLIST"; else echo "入っていません"; fi
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  create) cmd_create "$@" ;;
+  status) cmd_status ;;
+  push) cmd_push "$@" ;;
+  log) cmd_log ;;
+  show) cmd_show "$@" ;;
+  restore) cmd_restore "$@" ;;
+  mount) cmd_mount ;;
+  umount) cmd_umount ;;
+  compact) cmd_compact ;;
+  info) cmd_info ;;
+  run) cmd_run ;;
+  install-agent) cmd_install_agent ;;
+  uninstall-agent) cmd_uninstall_agent ;;
+  *) sed -n '2,/^set -u/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 1 ;;
+esac

@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""clayfs_tool - clayfsctl が使う本体。APFS のクローンでディレクトリの世代を持つ。
+
+各レイヤーは完全なディレクトリツリーで、子は親を clonefile(2) で複製して作る。
+読み書きの経路にファイルシステムの層は入らず、レイヤーの中身は普通の APFS。
+ふだんは clayfsctl から呼ぶ (設定や排他、イメージの扱いは clayfsctl が受け持つ)。
+
+作業ツリーの運用 (clayfsctl が使う):
+  clayfs_tool [-s STORE] track DIR IMAGE [--size 30g]  DIR の現状を最初の世代にし、IMAGE を作って入れる
+  clayfs_tool [-s STORE] status [-q]                   前回の反映からの変更 (-q: 変更があれば終了コード 1)
+  clayfs_tool [-s STORE] push [-m MSG]                 現状を IMAGE に反映し、世代を 1 つ足す
+  clayfs_tool [-s STORE] restore PATH... | --all       前回の反映時の内容に戻す (今のものは trash へ退避)
+  clayfs_tool [-s STORE] log                           IMAGE にある世代の一覧
+  clayfs_tool [-s STORE] show GEN                      その世代の変更一覧
+
+IMAGE のボリュームの中身:
+  head/                最新の世代のツリー
+  history/GEN/         それ以前の各世代の完全なツリー
+  history/GEN.changes  その世代のメッセージと変更一覧
+  CURRENT              最新の世代名
+世代どうしはイメージ内のクローンなので、増える容量は変更されたファイルの分だけ。
+
+レイヤーを直接扱う (Docker 風の使い方):
+  import NAME DIR / prepare NAME PARENT / commit NAME / diff NAME [-o FILE]
+  apply NAME PARENT TAR / path NAME / ls / rm NAME
+
+STORE は $CLAYFS_STORE、なければ ~/.clayfs。クローンはボリュームをまたげないので、
+対象のディレクトリと同じ APFS ボリュームに置くこと。
+"""
+import argparse
+import ctypes
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+
+WH = '.wh.'
+OPQ = '.wh..wh..opq'
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_libc.clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+
+
+def die(msg):
+    sys.exit(f'エラー: {msg}')
+
+
+_libc.copyfile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32]
+COPYFILE_ALL = 0xf          # ACL | STAT | XATTR | DATA
+COPYFILE_METADATA = 0x7     # ACL | STAT | XATTR
+COPYFILE_NOFOLLOW = 0xc0000
+COPYFILE_RECURSIVE = 1 << 15
+
+
+def copy(src, dst, flags):
+    """copyfile(3): keeps xattrs, resource forks, ACLs, BSD flags and all timestamps."""
+    if _libc.copyfile(os.fsencode(src), os.fsencode(dst), None, flags | COPYFILE_NOFOLLOW):
+        die(f'cannot copy {src} to {dst}: {os.strerror(ctypes.get_errno())}')
+
+
+def _clone(src, dst):
+    return _libc.clonefile(os.fsencode(src), os.fsencode(dst), 0) == 0
+
+
+def clone_tree(src, dst, bad=None):
+    """Clone a directory hierarchy, one syscall per subtree where the kernel allows it.
+
+    Some files cannot be cloned (seen: a database held open by a running
+    service). Those are copied for real, and their paths are added to `bad`
+    so the next call does not waste a whole-tree attempt on them.
+    """
+    bad = set() if bad is None else bad
+    doomed = any(b == src or b.startswith(src + '/') for b in bad)
+    if not doomed and _clone(src, dst):
+        return
+    err = ctypes.get_errno()
+    if os.path.isdir(dst) and not os.path.islink(dst):
+        shutil.rmtree(dst)
+
+    if os.path.isdir(src) and not os.path.islink(src):
+        os.mkdir(dst)
+        with os.scandir(src) as it:
+            for e in it:
+                clone_tree(e.path, os.path.join(dst, e.name), bad)
+        _libc.copyfile(os.fsencode(src), os.fsencode(dst), None, COPYFILE_METADATA | COPYFILE_NOFOLLOW)
+        return
+    bad.add(src)
+    if _libc.copyfile(os.fsencode(src), os.fsencode(dst), None, COPYFILE_ALL | COPYFILE_NOFOLLOW):
+        # not even readable: leave it out rather than fail the whole snapshot
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        print(f'警告: 読めないため飛ばしました: {src} ({os.strerror(ctypes.get_errno())})', file=sys.stderr)
+
+
+class Store:
+    def __init__(self, root):
+        self.root = os.path.abspath(os.path.expanduser(root))
+        self.layers = os.path.join(self.root, 'layers')
+        os.makedirs(self.layers, exist_ok=True)
+
+    def dir(self, name):
+        if not name or '/' in name or name.startswith('.'):
+            die(f'bad layer name: {name!r}')
+        return os.path.join(self.layers, name)
+
+    def fs(self, name):
+        return os.path.join(self.dir(name), 'fs')
+
+    def meta(self, name):
+        try:
+            with open(os.path.join(self.dir(name), 'meta.json')) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            die(f'no such layer: {name}')
+
+    def write_meta(self, name, meta):
+        with open(os.path.join(self.dir(name), 'meta.json'), 'w') as f:
+            json.dump(meta, f)
+
+    def names(self):
+        return sorted(n for n in os.listdir(self.layers) if not n.startswith('.'))
+
+    def create(self, name, src, parent, bad=None):
+        """New layer whose tree is a clone of src."""
+        d = self.dir(name)
+        if os.path.exists(d):
+            die(f'layer exists: {name}')
+        # build under a hidden name so a failed clone never looks like a layer
+        tmp = os.path.join(self.layers, f'.tmp.{os.getpid()}.{name}')
+        started = time.time()
+        os.mkdir(tmp)
+        try:
+            clone_tree(src, os.path.join(tmp, 'fs'), bad)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        os.rename(tmp, d)
+        self.write_meta(name, {'parent': parent, 'committed': False, 'started': started, 'created': time.time()})
+
+
+def cmd_import(st, a):
+    if not os.path.isdir(a.dir):
+        die(f'not a directory: {a.dir}')
+    st.create(a.name, a.dir, None)
+    m = st.meta(a.name)
+    m['committed'] = True
+    st.write_meta(a.name, m)
+
+
+def cmd_prepare(st, a):
+    if not st.meta(a.parent)['committed']:
+        die(f'parent is not committed: {a.parent}')
+    st.create(a.name, st.fs(a.parent), a.parent)
+    print(st.fs(a.name))
+
+
+def cmd_commit(st, a):
+    m = st.meta(a.name)
+    m['committed'] = True
+    st.write_meta(a.name, m)
+
+
+def cmd_path(st, a):
+    st.meta(a.name)
+    print(st.fs(a.name))
+
+
+def cmd_ls(st, a):
+    for n in st.names():
+        m = st.meta(n)
+        print(f"{n}\t{m['parent'] or '-'}\t{'committed' if m['committed'] else 'active'}")
+
+
+def cmd_rm(st, a):
+    st.meta(a.name)
+    kids = [n for n in st.names() if st.meta(n)['parent'] == a.name]
+    if kids and not a.force:
+        die(f'{a.name} is the parent of: {" ".join(kids)} (use -f; children keep working, they hold their own clones)')
+    shutil.rmtree(st.dir(a.name))
+
+
+def same(a, b):
+    """True if two lstat results describe an unchanged clone of the same entry."""
+    if stat.S_IFMT(a.st_mode) != stat.S_IFMT(b.st_mode):
+        return False
+    if (a.st_mode, a.st_uid, a.st_gid) != (b.st_mode, b.st_uid, b.st_gid):
+        return False
+    if stat.S_ISDIR(a.st_mode):
+        return True
+    return a.st_size == b.st_size and a.st_mtime_ns == b.st_mtime_ns
+
+
+def scan(d):
+    try:
+        with os.scandir(d) as it:
+            return {e.name: e.stat(follow_symlinks=False) for e in it}
+    except FileNotFoundError:
+        return {}
+
+
+def diff_tree(tar, old, new, rel=''):
+    """Write what turns old into new, with OCI whiteouts for removals."""
+    o, n = scan(os.path.join(old, rel)), scan(os.path.join(new, rel))
+    for name in sorted(o.keys() - n.keys()):
+        ti = tarfile.TarInfo(os.path.join(rel, WH + name))
+        tar.addfile(ti)
+    for name in sorted(n):
+        p = os.path.join(rel, name)
+        full = os.path.join(new, p)
+        os_, ns = o.get(name), n[name]
+        isdir = stat.S_ISDIR(ns.st_mode)
+        if os_ is None or not same(os_, ns):
+            tar.add(full, arcname=p, recursive=False)
+            if isdir and os_ is not None and not stat.S_ISDIR(os_.st_mode):
+                os_ = None
+        if isdir:
+            if os_ is None:
+                # brand new directory: everything below is new as well
+                for sub in sorted(os.listdir(full)):
+                    tar.add(os.path.join(full, sub), arcname=os.path.join(p, sub))
+            else:
+                diff_tree(tar, old, new, p)
+
+
+def cmd_diff(st, a):
+    m = st.meta(a.name)
+    if not m['parent']:
+        die(f'{a.name} has no parent')
+    st.meta(m['parent'])
+    out = open(a.output, 'wb') if a.output else sys.stdout.buffer
+    with tarfile.open(fileobj=out, mode='w|', format=tarfile.PAX_FORMAT) as tar:
+        diff_tree(tar, st.fs(m['parent']), st.fs(a.name))
+    if a.output:
+        out.close()
+
+
+def remove(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
+def apply_tar(root, tarpath):
+    with tarfile.open(tarpath) as tar:
+        for m in tar:
+            name = os.path.normpath(m.name)
+            if name.startswith(('/', '..')):
+                die(f'unsafe path in layer: {m.name}')
+            d, base = os.path.split(name)
+            if base == OPQ:
+                for e in os.listdir(os.path.join(root, d)):
+                    remove(os.path.join(root, d, e))
+                continue
+            if base.startswith(WH):
+                remove(os.path.join(root, d, base[len(WH):]))
+                continue
+            dst = os.path.join(root, name)
+            if os.path.lexists(dst) and not (m.isdir() and os.path.isdir(dst) and not os.path.islink(dst)):
+                remove(dst)
+            tar.extract(m, root, filter='tar')
+
+
+def cmd_apply(st, a):
+    cmd_prepare(st, a)
+    apply_tar(st.fs(a.name), a.tar)
+    cmd_commit(st, a)
+
+
+# ---------- working-tree mode ----------
+
+IMAGE_TYPES = {'.sparsebundle': 'SPARSEBUNDLE', '.sparseimage': 'SPARSE', '.dmg': 'UDIF'}
+
+
+def run(*cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        die(f'{cmd[0]} failed: {(r.stderr or r.stdout).strip()}')
+    return r.stdout
+
+
+def work_conf(st):
+    try:
+        with open(os.path.join(st.root, 'work.json')) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        die('まだ取り込んでいません。先に clayfsctl create を実行してください')
+
+
+def save_work_conf(st, conf):
+    with open(os.path.join(st.root, 'work.json'), 'w') as f:
+        json.dump(conf, f, indent=1)
+
+
+def snapshot(st, conf, msg=None):
+    """Freeze the tracked directory as a new base generation."""
+    name = time.strftime('base-%Y%m%d-%H%M%S')
+    bad = set(conf.get('noclone', []))
+    st.create(name, conf['dir'], conf.get('base'), bad)
+    conf['noclone'] = sorted(p for p in bad if os.path.lexists(p))
+    # paths the snapshot could not take; status and push leave them alone
+    conf['skipped'] = sorted(os.path.relpath(p, conf['dir']) for p in conf['noclone']
+                             if not os.path.lexists(os.path.join(st.fs(name), os.path.relpath(p, conf['dir']))))
+    m = st.meta(name)
+    m['committed'] = True
+    if msg:
+        m['message'] = msg
+    st.write_meta(name, m)
+    return name
+
+
+class mounted:
+    """Attach the image for the duration of a with block."""
+    def __init__(self, st, conf, readonly=False):
+        self.mnt = os.path.join(st.root, 'mnt')
+        self.args = ['-readonly'] if readonly else ['-owners', 'on']
+        self.image = conf['image']
+
+    def __enter__(self):
+        if not os.path.exists(self.image):
+            die(f'イメージがありません: {self.image}')
+        os.makedirs(self.mnt, exist_ok=True)
+        run('hdiutil', 'attach', '-nobrowse', *self.args, '-mountpoint', self.mnt, self.image)
+        return self.mnt
+
+    def __exit__(self, *exc):
+        subprocess.run(['hdiutil', 'detach', self.mnt], capture_output=True)
+
+
+def sync_image(st, conf, name, prev, msg, notes):
+    """Record layer `name` in the image as the new head, keeping the old head as history.
+
+    `notes` lists what may differ from `prev`. It may name too much, never too
+    little: what is done to each path is decided by what layer `name` holds.
+    """
+    src = st.fs(name)
+    with mounted(st, conf) as mnt:
+        head, hist = os.path.join(mnt, 'head'), os.path.join(mnt, 'history')
+        cur = os.path.join(mnt, 'CURRENT')
+        os.makedirs(hist, exist_ok=True)
+        try:
+            with open(cur) as f:
+                in_image = f.read().strip()
+        except FileNotFoundError:
+            in_image = None
+
+        old = os.path.join(hist, in_image) if in_image else None
+        if old and os.path.isdir(head) and not os.path.exists(old):
+            # a clone inside the image, so the old generation costs no space
+            clone_tree(head, old)
+
+        if in_image and in_image == prev and os.path.isdir(head):
+            # head is exactly `prev`: replay only what changed since then
+            parents = set()
+            for kind, p in notes:
+                rel = p.rstrip('/')
+                dst = os.path.join(head, rel)
+                parents.add(os.path.dirname(rel))
+                new = os.path.join(src, rel)
+                if kind == 'M' and p.endswith('/') and os.path.isdir(new) and os.path.isdir(dst):
+                    copy(new, dst, COPYFILE_METADATA)
+                    continue
+                remove(dst)
+                if os.path.lexists(new):
+                    copy(new, dst, COPYFILE_ALL | COPYFILE_RECURSIVE)
+            # writing into a directory touched its times; put them back, deepest first
+            for d in sorted(parents, key=len, reverse=True):
+                if os.path.isdir(os.path.join(src, d)):
+                    copy(os.path.join(src, d), os.path.join(head, d), COPYFILE_METADATA)
+        else:
+            # first push, or the image is not where we left it: rebuild head
+            if os.path.lexists(head):
+                remove(head)
+            copy(src, head, COPYFILE_ALL | COPYFILE_RECURSIVE)
+
+        with open(os.path.join(hist, name + '.changes'), 'w') as f:
+            f.write(f'# {name} {msg or ""}\n' + ''.join(f'{k} {p}\n' for k, p in notes))
+        with open(cur, 'w') as f:
+            f.write(name + '\n')
+    return len(notes)
+
+
+def generations(st, conf):
+    out, n = [], conf.get('base')
+    while n and os.path.isdir(st.dir(n)):
+        out.append(n)
+        n = st.meta(n)['parent']
+    return out
+
+
+def cmd_track(st, a):
+    if os.path.exists(os.path.join(st.root, 'work.json')):
+        die(f'このストアは、すでに {work_conf(st)["dir"]} を取り込んでいます')
+    d = os.path.realpath(os.path.expanduser(a.dir))
+    image = os.path.abspath(os.path.expanduser(a.image))
+    if not os.path.isdir(d):
+        die(f'ディレクトリではありません: {d}')
+    if os.path.commonpath([d, st.root]) == d:
+        die('ストアを、対象のディレクトリの中に置くことはできません')
+    if os.stat(d).st_dev != os.stat(st.root).st_dev:
+        die('ストアと対象のディレクトリは、同じボリュームに置いてください (クローンはボリュームをまたげません)')
+    kind = IMAGE_TYPES.get(os.path.splitext(image)[1])
+    if not kind:
+        die(f'イメージの拡張子は次のどれかにしてください: {" ".join(IMAGE_TYPES)}')
+    if os.path.exists(image):
+        die(f'すでにあります: {image}')
+
+    conf = {'dir': d, 'image': image, 'keep': a.keep}
+    conf['base'] = snapshot(st, conf, 'initial')
+    run('hdiutil', 'create', '-size', a.size, '-fs', 'APFS', '-type', kind,
+        '-volname', os.path.basename(d), image)
+    sync_image(st, conf, conf['base'], None, 'initial', [])
+    save_work_conf(st, conf)
+    print(f'取り込みました: {d}\n  世代     {conf["base"]}\n  イメージ {image} ({a.size} まで)')
+
+
+def changes(old, new, rel='', since=None):
+    """Yield (kind, path) for added, modified and deleted entries.
+
+    `since` is when `old` was cloned from `new`: anything whose ctime is later
+    was touched, which also catches xattr-only changes such as code signing.
+    """
+    o, n = scan(os.path.join(old, rel)), scan(os.path.join(new, rel))
+    for name in sorted(o.keys() | n.keys()):
+        p = os.path.join(rel, name)
+        a, b = o.get(name), n.get(name)
+        if b is None:
+            yield 'D', p
+        elif a is None:
+            yield 'A', p + ('/' if stat.S_ISDIR(b.st_mode) else '')
+        elif stat.S_ISDIR(a.st_mode) and stat.S_ISDIR(b.st_mode):
+            if not same(a, b) or (since and b.st_ctime > since):
+                yield 'M', p + '/'
+            yield from changes(old, new, p, since)
+        elif not same(a, b) or (since and b.st_ctime > since):
+            yield 'M', p
+
+
+def work_changes(st, conf):
+    base = conf['base']
+    skipped = set(conf.get('skipped', []))
+    return (c for c in changes(st.fs(base), conf['dir'], since=st.meta(base).get('started'))
+            if c[1] not in skipped)
+
+
+def cmd_status(st, a):
+    conf = work_conf(st)
+    n = 0
+    for kind, p in work_changes(st, conf):
+        if not a.quiet:
+            print(kind, p)
+        n += 1
+    for p in [] if a.quiet else conf.get('skipped', []):
+        print('! 読めないため対象外:', p)
+    if a.quiet:
+        sys.exit(1 if n else 0)
+    print(f'{conf["base"]} から {n} 件の変更', file=sys.stderr)
+
+
+def cmd_push(st, a):
+    conf = work_conf(st)
+    name = snapshot(st, conf, a.message)
+    # listed after the snapshot: a file touched in between is copied once more, never missed
+    notes = list(work_changes(st, conf))
+    try:
+        n = sync_image(st, conf, name, conf['base'], a.message, notes)
+    except SystemExit:
+        # head may be half updated, but history and the old base still hold the last good push
+        shutil.rmtree(st.dir(name))
+        raise
+    conf['base'] = name
+    save_work_conf(st, conf)
+    for old in generations(st, conf)[conf['keep']:]:
+        shutil.rmtree(st.dir(old))
+    print(f'反映しました: {name} ({n} 件の変更) -> {conf["image"]}')
+
+
+def cmd_restore(st, a):
+    conf = work_conf(st)
+    base, d = st.fs(conf['base']), conf['dir']
+    if a.all == bool(a.paths):
+        die('戻すパスを指定してください (全体を戻すなら --all)')
+    rels = ['.'] if a.all else [os.path.relpath(os.path.abspath(p), d) for p in a.paths]
+    trash = os.path.join(st.root, 'trash', time.strftime('%Y%m%d-%H%M%S'))
+    for rel in rels:
+        if rel.startswith('..') or (rel == '.' and not a.all):
+            die(f'{d} の中ではありません: {rel}')
+        cur, src = os.path.normpath(os.path.join(d, rel)), os.path.normpath(os.path.join(base, rel))
+        if os.path.lexists(cur):
+            # never delete work: the current version is moved aside
+            keep = os.path.normpath(os.path.join(trash, rel if rel != '.' else 'ALL'))
+            os.makedirs(os.path.dirname(keep), exist_ok=True)
+            os.rename(cur, keep)
+        if os.path.lexists(src):
+            os.makedirs(os.path.dirname(cur), exist_ok=True)
+            clone_tree(src, cur)
+            print(f'戻しました: {rel}')
+        else:
+            # 前回の反映より前に消したものは、イメージの history/ にある (clayfsctl mount)
+            print(f'前回の反映時点にはありません: {rel}')
+    if os.path.isdir(trash):
+        print(f'戻す前の内容は、ここに退避してあります: {trash}')
+
+
+def cmd_log(st, a):
+    conf = work_conf(st)
+    with mounted(st, conf, readonly=True) as mnt:
+        hist = os.path.join(mnt, 'history')
+        for f in sorted((f for f in os.listdir(hist) if f.endswith('.changes')), reverse=True):
+            with open(os.path.join(hist, f)) as h:
+                lines = h.read().splitlines()
+            print(f'{lines[0][2:]}  ({len(lines) - 1} 件)')
+
+
+def cmd_show(st, a):
+    conf = work_conf(st)
+    with mounted(st, conf, readonly=True) as mnt:
+        try:
+            with open(os.path.join(mnt, 'history', a.gen + '.changes')) as h:
+                sys.stdout.write(h.read())
+        except FileNotFoundError:
+            die(f'その世代はありません: {a.gen}')
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='clayfs_tool', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('-s', '--store', default=os.environ.get('CLAYFS_STORE', '~/.clayfs'))
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    p = sub.add_parser('import'); p.add_argument('name'); p.add_argument('dir'); p.set_defaults(fn=cmd_import)
+    p = sub.add_parser('prepare'); p.add_argument('name'); p.add_argument('parent'); p.set_defaults(fn=cmd_prepare)
+    p = sub.add_parser('commit'); p.add_argument('name'); p.set_defaults(fn=cmd_commit)
+    p = sub.add_parser('diff'); p.add_argument('name'); p.add_argument('-o', '--output'); p.set_defaults(fn=cmd_diff)
+    p = sub.add_parser('apply'); p.add_argument('name'); p.add_argument('parent'); p.add_argument('tar'); p.set_defaults(fn=cmd_apply)
+    p = sub.add_parser('path'); p.add_argument('name'); p.set_defaults(fn=cmd_path)
+    p = sub.add_parser('ls'); p.set_defaults(fn=cmd_ls)
+    p = sub.add_parser('rm'); p.add_argument('name'); p.add_argument('-f', '--force', action='store_true'); p.set_defaults(fn=cmd_rm)
+
+    p = sub.add_parser('track'); p.add_argument('dir'); p.add_argument('image')
+    p.add_argument('--size', default='30g', help='maximum image size (sparse images only use what is written)')
+    p.add_argument('--keep', type=int, default=3, help='base generations to keep locally (the image keeps all)'); p.set_defaults(fn=cmd_track)
+    p = sub.add_parser('status'); p.add_argument('-q', '--quiet', action='store_true'); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser('push'); p.add_argument('-m', '--message'); p.set_defaults(fn=cmd_push)
+    p = sub.add_parser('restore'); p.add_argument('paths', nargs='*'); p.add_argument('--all', action='store_true'); p.set_defaults(fn=cmd_restore)
+    p = sub.add_parser('log'); p.set_defaults(fn=cmd_log)
+    p = sub.add_parser('show'); p.add_argument('gen'); p.set_defaults(fn=cmd_show)
+
+    a = ap.parse_args()
+    a.fn(Store(a.store), a)
+
+
+if __name__ == '__main__':
+    main()
