@@ -16,6 +16,8 @@
   clayfs_tool -s STORE -C DIR restore [--source GEN] PATH... | --all
                                                      コミット時の内容に戻す (今のものは STORE/trash へ退避)
   clayfs_tool -s STORE -C DIR gc --keep N            新しい N 個を残して、古いコミットの中身を消す (一覧は残る)
+  clayfs_tool -s STORE -C DIR dedup [--dry-run]      中身が同じファイルをクローンにまとめる
+  clayfs_tool -s STORE -C DIR scrub                  記録したハッシュと中身を照合する (壊れていれば終了コード 1)
 コミットは HEAD、または名前の一部 (一意に決まる範囲) で指定できる。
 過去のコミットの中身は STORE/layers/コミット名/fs にあり、普通のフォルダとして開ける。
 -C を省くと STORE の親を DIR とみなす (STORE を DIR/.clayfs に置く使い方。直下の .clayfs はコミットに含めない)。
@@ -26,9 +28,11 @@
 """
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -533,10 +537,14 @@ def cmd_wcommit(st, a):
         return
     name = snapshot(st, conf)
     # 複製した後で数える: その間に触られたファイルは余分に載るだけで、漏れない
-    notes = [] if first else visible(work_changes(st, conf))
+    work_changes_all = [] if first else list(work_changes(st, conf))
+    notes = visible(work_changes_all)
     record(st, name, a.message, notes)
     conf['base'] = name
     save_work_conf(st, conf)
+    # 変わったファイルのハッシュを記録する (dedup と scrub が使う)
+    if os.path.exists(os.path.join(st.root, 'index.sqlite')):
+        index_changes(st, work_changes_all)
     print(f'[{name}] {a.message or ""}\n {len(notes)} 件の変更')
 
 
@@ -607,6 +615,279 @@ def cmd_gc(st, a):
             print(f'消しました: {old}')
 
 
+# ---------- ハッシュの索引、重複排除、検査 ----------
+# STORE/index.sqlite に、作業ツリーの各ファイルの SHA-256 を持つ。
+# (サイズ, 更新時刻, inode) が記録と同じなら中身も同じとみなし、ハッシュを取り直さない。
+
+UF_COMPRESSED = 0x20
+IMMUTABLE = 0x2 | 0x20000          # UF_IMMUTABLE | SF_IMMUTABLE
+_libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+_libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+# 透過圧縮の実体。圧縮の有無が違うファイルの間で写すと、読めないファイルができる
+COMPRESSION_XATTRS = (b'com.apple.decmpfs', b'com.apple.ResourceFork')
+
+
+def index_db(st):
+    db = sqlite3.connect(os.path.join(st.root, 'index.sqlite'))
+    db.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER,'
+               ' ino INTEGER, sha256 TEXT, shared_with INTEGER)')
+    return db
+
+
+def _hash(path):
+    """(path, size, mtime_ns, ino, sha256)。読めなければ size=-1 で、sha256 の位置に理由が入る。"""
+    try:
+        before = os.lstat(path)
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            while True:
+                b = f.read(1 << 20)
+                if not b:
+                    break
+                h.update(b)
+        after = os.lstat(path)
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            return path, -1, 0, 0, '読んでいる間に書き換えられた'
+        return path, after.st_size, after.st_mtime_ns, after.st_ino, h.hexdigest()
+    except OSError as e:
+        return path, -1, 0, 0, e.strerror or str(e)
+
+
+def hash_many(paths):
+    from multiprocessing import Pool
+    if len(paths) < 64:
+        return [_hash(p) for p in paths]
+    with Pool(min(8, os.cpu_count() or 2)) as pool:
+        return pool.map(_hash, paths, chunksize=256)
+
+
+def walk_files(d, sub=''):
+    """作業ツリーの通常ファイルを (相対パス, lstat) で返す。リンクと、直下の管理用フォルダは除く。"""
+    stack = [sub]
+    while stack:
+        rel = stack.pop()
+        try:
+            it = os.scandir(os.path.join(d, rel))
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                if not rel and e.name in EXCLUDE:
+                    continue
+                r = os.path.join(rel, e.name)
+                if e.is_symlink():
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(r)
+                elif e.is_file(follow_symlinks=False):
+                    yield r, e.stat(follow_symlinks=False)
+
+
+def store_hashes(db, d, rows):
+    bad = []
+    for path, size, mtime_ns, ino, sha in rows:
+        rel = os.path.relpath(path, d)
+        if size < 0:
+            bad.append((rel, sha))
+            db.execute('DELETE FROM files WHERE path = ?', (rel,))
+        else:
+            db.execute('INSERT INTO files (path, size, mtime_ns, ino, sha256, shared_with) VALUES (?,?,?,?,?,NULL)'
+                       ' ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,'
+                       ' ino=excluded.ino, sha256=excluded.sha256, shared_with=NULL', (rel, size, mtime_ns, ino, sha))
+    db.commit()
+    return bad
+
+
+def refresh_index(st, db):
+    """索引を作業ツリーの現状に合わせる。返り値: (ハッシュを取った数, 消した数, 読めなかったもの)。"""
+    d = work_dir(st)
+    known = {r[0]: r[1:] for r in db.execute('SELECT path, size, mtime_ns, ino FROM files')}
+    seen, todo = set(), []
+    for rel, s in walk_files(d):
+        seen.add(rel)
+        if known.get(rel) != (s.st_size, s.st_mtime_ns, s.st_ino):
+            todo.append(os.path.join(d, rel))
+    bad = store_hashes(db, d, hash_many(todo))
+    gone = [p for p in known if p not in seen]
+    db.executemany('DELETE FROM files WHERE path = ?', [(p,) for p in gone])
+    db.commit()
+    return len(todo), len(gone), bad
+
+
+def index_changes(st, notes):
+    """コミットで変わった分だけ、索引を更新する。"""
+    d = work_dir(st)
+    db = index_db(st)
+    todo = []
+    for kind, p in notes:
+        rel = p.rstrip('/')
+        if kind == 'D':
+            db.execute('DELETE FROM files WHERE path = ? OR path LIKE ?', (rel, rel.replace('%', r'\%') + '/%'))
+        elif p.endswith('/'):
+            if kind == 'A':
+                todo += [os.path.join(d, r) for r, _ in walk_files(d, rel)]
+        elif os.path.isfile(os.path.join(d, rel)) and not os.path.islink(os.path.join(d, rel)):
+            todo.append(os.path.join(d, rel))
+    store_hashes(db, d, hash_many(todo))
+    db.close()
+
+
+def copy_identity(src_stat, src, dst):
+    """dst (src と同じ中身のクローン) に、src の属性を移す。中身と圧縮の状態は dst のものを保つ。"""
+    for name in list(xattrs(dst) or {}):
+        if name not in COMPRESSION_XATTRS:
+            _libc.removexattr(os.fsencode(dst), name, XATTR_NOFOLLOW)
+    for name, value in (xattrs(src) or {}).items():
+        if name not in COMPRESSION_XATTRS:
+            _libc.setxattr(os.fsencode(dst), name, value, len(value), 0, XATTR_NOFOLLOW)
+    _libc.copyfile(os.fsencode(src), os.fsencode(dst), None, 0x1 | COPYFILE_NOFOLLOW)    # ACL だけ
+    os.chmod(dst, stat.S_IMODE(src_stat.st_mode))
+    keep = os.lstat(dst).st_flags & UF_COMPRESSED
+    want = (src_stat.st_flags & ~UF_COMPRESSED) | keep
+    if want != os.lstat(dst).st_flags:
+        os.chflags(dst, want)
+    os.utime(dst, ns=(src_stat.st_atime_ns, src_stat.st_mtime_ns))
+
+
+_seq = 0
+
+
+def relink(canon, target):
+    """target を、同じ中身の canon のクローンに置き換える (属性は target のものを保つ)。"""
+    global _seq
+    _seq += 1
+    s = os.lstat(target)
+    tmp = os.path.join(os.path.dirname(target), f'.clayfs-dedup.{os.getpid()}.{_seq}')
+    try:
+        if not _clone(canon, tmp):
+            raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+        copy_identity(s, target, tmp)
+        if os.lstat(tmp).st_size != s.st_size:
+            raise OSError(0, 'クローンのサイズが違う')
+        os.rename(tmp, target)
+    except OSError:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def relink_in_layers(st, canon, rel, size, mtime_ns):
+    """コミットの中の同じファイルも付け替える。
+
+    コミットは作業ツリーのクローンなので、付け替える前の実体を掴み続ける。
+    そのままでは、作業ツリーでまとめても容量が空かない。
+    サイズと更新時刻が同じなら、コミットした時点から中身は変わっていない。
+    """
+    n = 0
+    for layer in st.names():
+        f = os.path.join(st.fs(layer), rel)
+        try:
+            ls = os.lstat(f)
+        except OSError:
+            continue
+        if not stat.S_ISREG(ls.st_mode) or (ls.st_size, ls.st_mtime_ns) != (size, mtime_ns) or ls.st_nlink > 1:
+            continue
+        try:
+            relink(canon, f)
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def cmd_dedup(st, a):
+    d = work_dir(st)
+    db = index_db(st)
+    hashed, gone, bad = refresh_index(st, db)
+    print(f'索引を更新: ハッシュを取ったファイル {hashed}、消えたファイル {gone}、読めないファイル {len(bad)}')
+    for rel, why in bad[:20]:
+        print(f'  読めない: {rel} ({why})')
+    free_before = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
+
+    groups = files = est = skipped = in_layers = 0
+    cur = db.execute('SELECT sha256, size FROM files WHERE size > 0 GROUP BY sha256, size HAVING COUNT(*) > 1'
+                     ' ORDER BY size DESC').fetchall()
+    for sha, size in cur:
+        rows = db.execute('SELECT path, mtime_ns, ino, shared_with FROM files WHERE sha256 = ? AND size = ?'
+                          ' ORDER BY path', (sha, size)).fetchall()
+        # 記録の後で変わったもの、ハードリンク、変更禁止のものは触らない
+        live = []
+        for rel, mtime_ns, ino, shared in rows:
+            try:
+                s = os.lstat(os.path.join(d, rel))
+            except OSError:
+                continue
+            if (s.st_size, s.st_mtime_ns, s.st_ino) != (size, mtime_ns, ino) or s.st_nlink > 1 or s.st_flags & IMMUTABLE:
+                skipped += 1
+                continue
+            live.append((rel, s, shared))
+        if len(live) < 2:
+            continue
+        # 圧縮済みのものがあれば、それを元にする (クローンも圧縮されたまま共有される)
+        live.sort(key=lambda x: (not x[1].st_flags & UF_COMPRESSED, x[0]))
+        canon_rel, canon_stat, _ = live[0]
+        canon = os.path.join(d, canon_rel)
+        did = False
+        for rel, s, shared in live[1:]:
+            if shared == canon_stat.st_ino:
+                continue                      # 前回すでにこの元へまとめた
+            did = True
+            files += 1
+            est += s.st_blocks * 512
+            if a.dry_run:
+                continue
+            target = os.path.join(d, rel)
+            try:
+                relink(canon, target)
+            except OSError as e:
+                files -= 1
+                est -= s.st_blocks * 512
+                skipped += 1
+                print(f'  飛ばした: {rel} ({e.strerror or e})', file=sys.stderr)
+                continue
+            in_layers += relink_in_layers(st, canon, rel, size, s.st_mtime_ns)
+            n = os.lstat(target)
+            db.execute('UPDATE files SET ino = ?, mtime_ns = ?, shared_with = ? WHERE path = ?',
+                       (n.st_ino, n.st_mtime_ns, canon_stat.st_ino, rel))
+        if did:
+            groups += 1
+        db.commit()
+    free_after = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
+    verb = 'まとめられる' if a.dry_run else 'まとめた'
+    print(f'{verb}: {groups} 組、{files} ファイル、見積もり {est / (1 << 20):.0f} MB (飛ばした {skipped})')
+    if not a.dry_run:
+        print(f'コミットの中で付け替えたファイル: {in_layers}')
+        print(f'空き容量の増加: {(free_after - free_before) / (1 << 20):.0f} MB')
+    db.close()
+
+
+def cmd_scrub(st, a):
+    d = work_dir(st)
+    db = index_db(st)
+    hashed, gone, bad = refresh_index(st, db)
+    rows = {r[0]: r[1:] for r in db.execute('SELECT path, size, mtime_ns, sha256 FROM files')}
+    results = hash_many([os.path.join(d, rel) for rel in rows])
+    ok = changed = 0
+    broken = list(bad)
+    for path, size, mtime_ns, ino, sha in results:
+        rel = os.path.relpath(path, d)
+        want = rows[rel]
+        if size < 0:
+            broken.append((rel, sha))
+        elif (size, mtime_ns) != want[:2]:
+            changed += 1                     # 検査の間に書き換えられた (壊れたのではない)
+        elif sha != want[2]:
+            broken.append((rel, '中身が記録したハッシュと違う'))
+        else:
+            ok += 1
+    print(f'検査: 一致 {ok}、検査中に更新 {changed}、新しく記録 {hashed}、問題 {len(broken)}')
+    for rel, why in broken[:50]:
+        print(f'  問題: {rel} ({why})')
+    db.close()
+    if broken:
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser(prog='clayfs_tool', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('-s', '--store', default=os.environ.get('CLAYFS_STORE', '~/.src.clayfs/store'))
@@ -631,6 +912,8 @@ def main():
     p.add_argument('--source'); p.set_defaults(fn=cmd_restore)
     p = sub.add_parser('log'); p.add_argument('-n', type=int); p.set_defaults(fn=cmd_log)
     p = sub.add_parser('show'); p.add_argument('gen', nargs='?'); p.set_defaults(fn=cmd_show)
+    p = sub.add_parser('dedup'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_dedup)
+    p = sub.add_parser('scrub'); p.set_defaults(fn=cmd_scrub)
     p = sub.add_parser('gc'); p.add_argument('--keep', type=int, required=True); p.set_defaults(fn=cmd_gc)
 
     a = ap.parse_args()

@@ -22,6 +22,9 @@
 #   clayfsctl restore [--source GEN] PATH...
 #                             コミット時の内容に戻す (--all で全体。今の内容は消さずに退避する)
 #   clayfsctl gc --keep N     新しい N 個を残して、古いコミットの中身を消す (一覧と変更内容は残る)
+#   clayfsctl dedup [--dry-run]
+#                             中身が同じファイルをクローンにまとめる (--dry-run: 数えるだけ)
+#   clayfsctl scrub           記録したハッシュと中身を照合し、壊れたファイルを報告する
 #   clayfsctl compact         イメージの空き領域を回収する (down の状態で)
 #   clayfsctl info            設定と状態を表示する
 #   clayfsctl run             マウントし、変更があればコミットする (自動実行用)
@@ -192,6 +195,8 @@ cmd_log() { need_up; tool log "$@"; }
 cmd_show() { need_up; tool show "$@"; }
 cmd_commit() { need_up; lock; tool commit "$@"; }
 cmd_gc() { need_up; lock; tool gc "$@"; }
+cmd_dedup() { need_up; lock; tool dedup "$@"; }
+cmd_scrub() { need_up; lock; tool scrub; }
 
 cmd_restore() {
   [ $# -ge 1 ] || die "使い方: clayfsctl restore [--source コミット] PATH... (全体を戻すなら --all)"
@@ -289,6 +294,8 @@ case "$cmd" in
   show) cmd_show "$@" ;;
   restore) cmd_restore "$@" ;;
   gc) cmd_gc "$@" ;;
+  dedup) cmd_dedup "$@" ;;
+  scrub) cmd_scrub ;;
   compact) cmd_compact ;;
   info) cmd_info ;;
   run) cmd_run ;;
