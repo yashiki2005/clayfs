@@ -34,6 +34,7 @@
 """
 import argparse
 import ctypes
+import fcntl
 import hashlib
 import json
 import os
@@ -643,6 +644,9 @@ def cmd_gc(st, a):
 
 def index_db(st):
     db = sqlite3.connect(os.path.join(st.root, 'index.sqlite'))
+    # WAL にすると、コミットごとの書き換えが減る。耐久性は FULL のまま (電源断で確定済みの行を失わない)
+    db.execute('PRAGMA journal_mode = WAL')
+    db.execute('PRAGMA synchronous = FULL')
     db.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER,'
                ' ino INTEGER, sha256 TEXT, shared_with INTEGER)')
     db.execute('CREATE INDEX IF NOT EXISTS files_content ON files (sha256, size)')
@@ -737,7 +741,8 @@ def index_changes(st, notes):
     for kind, p in notes:
         rel = p.rstrip('/')
         if kind == 'D':
-            db.execute('DELETE FROM files WHERE path = ? OR path LIKE ?', (rel, rel.replace('%', r'\%') + '/%'))
+            # LIKE は % や _ を任意の文字として扱うので使わない。接頭辞の比較で、下の項目だけを消す
+            db.execute('DELETE FROM files WHERE path = ? OR substr(path, 1, ?) = ?', (rel, len(rel) + 1, rel + '/'))
         elif p.endswith('/'):
             if kind == 'A':
                 todo += [os.path.join(d, r) for r, _ in walk_files(d, rel)]
@@ -764,15 +769,98 @@ def copy_identity(src_stat, src, dst):
     os.utime(dst, ns=(src_stat.st_atime_ns, src_stat.st_mtime_ns))
 
 
+def scratch_dir(st):
+    """作業ツリーの外の一時置き場。ストアの中にあるので、コミットにも作業ツリーの走査にも入らない。"""
+    p = os.path.join(st.root, 'scratch')
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def prepare_scratch(st, d):
+    """一時置き場を用意し、前回の途中終了で残った一時ファイルを消す。
+    clayfsctl のロックの下で動くので、ほかに使っているものはない。作業ツリーと同じボリュームでなければ、差し替えられない。"""
+    p = scratch_dir(st)
+    if os.stat(p).st_dev != os.stat(d).st_dev:
+        die(f'一時置き場 {p} が作業ツリーと別のボリュームにあります')
+    for n in os.listdir(p):
+        q = os.path.join(p, n)
+        try:
+            if os.path.isdir(q) and not os.path.islink(q):
+                shutil.rmtree(q)
+            else:
+                os.unlink(q)
+        except OSError as e:
+            print(f'警告: 一時ファイルを消せません: {q} ({e.strerror})', file=sys.stderr)
+    return p
+
+
+def flush_file(p):
+    """ファイルを媒体まで書き出す。macOS の fsync は媒体まで届かないので F_FULLFSYNC を使う。"""
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+        except (AttributeError, OSError):
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def file_digest(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for buf in iter(lambda: f.read(1 << 20), b''):
+            h.update(buf)
+    return h.hexdigest()
+
+
+_bak_seq = 0
+
+
+def replace_checked(path, tmp, s, scratch):
+    """tmp で path を差し替える。差し替えの間に path へ書き込みがあったら取り消して False を返す。
+
+    差し替える前に、元の実体へ名前を 1 つ足しておく (中身は複製しない)。差し替えの後で
+    元の実体の更新時刻とサイズを見て、変わっていれば元の実体を path に戻す。書き込みを失わないため。
+    書き込んだ相手が差し替え後に開いた場合、その書き込みは戻した元の実体で失われうる。
+    """
+    global _bak_seq
+    _bak_seq += 1
+    bak = os.path.join(scratch, f'old.{os.getpid()}.{_bak_seq}')
+    os.link(path, bak)
+    try:
+        os.rename(tmp, path)
+    except OSError:
+        os.unlink(bak)
+        raise
+    now = os.lstat(bak)
+    if (now.st_size, now.st_mtime_ns) != (s.st_size, s.st_mtime_ns):
+        os.rename(bak, path)
+        return False
+    os.unlink(bak)
+    return True
+
+
+def project_name(d, arg):
+    """引数を、作業ツリー直下のプロジェクト名にする。作業ツリーの外や、作業ツリー自身は受け付けない。"""
+    base = os.path.realpath(d)
+    full = os.path.realpath(arg if os.path.isabs(arg) else os.path.join(base, arg))
+    rel = os.path.relpath(full, base)
+    if rel == os.curdir or rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        die(f'作業ツリーの中のプロジェクトを指定してください: {arg}')
+    return rel.split(os.sep)[0]
+
+
 _seq = 0
 
 
-def relink(canon, target):
-    """target を、同じ中身の canon のクローンに置き換える (属性は target のものを保つ)。"""
+def relink(canon, target, scratch):
+    """target を、同じ中身の canon のクローンに置き換える (属性は target のものを保つ)。
+    一時ファイルは scratch に作る。作業ツリーに置くと、途中で止まったときにコミットへ入ってしまう。"""
     global _seq
     _seq += 1
     s = os.lstat(target)
-    tmp = os.path.join(os.path.dirname(target), f'.clayfs-dedup.{os.getpid()}.{_seq}')
+    tmp = os.path.join(scratch, f'dedup.{os.getpid()}.{_seq}')
     try:
         if not _clone(canon, tmp):
             raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
@@ -794,6 +882,7 @@ def relink_in_layers(st, canon, rel, size, mtime_ns):
     サイズと更新時刻が同じなら、コミットした時点から中身は変わっていない。
     """
     n = 0
+    scratch = scratch_dir(st)
     for layer in st.names():
         f = os.path.join(st.fs(layer), rel)
         try:
@@ -803,7 +892,7 @@ def relink_in_layers(st, canon, rel, size, mtime_ns):
         if not stat.S_ISREG(ls.st_mode) or (ls.st_size, ls.st_mtime_ns) != (size, mtime_ns) or ls.st_nlink > 1:
             continue
         try:
-            relink(canon, f)
+            relink(canon, f, scratch)
             n += 1
         except OSError:
             pass
@@ -812,6 +901,7 @@ def relink_in_layers(st, canon, rel, size, mtime_ns):
 
 def cmd_dedup(st, a):
     d = work_dir(st)
+    scratch = prepare_scratch(st, d)
     db = index_db(st)
     hashed, gone, bad = refresh_index(st, db)
     print(f'索引を更新: ハッシュを取ったファイル {hashed}、消えたファイル {gone}、読めないファイル {len(bad)}')
@@ -856,7 +946,7 @@ def cmd_dedup(st, a):
                 continue
             target = os.path.join(d, rel)
             try:
-                relink(canon, target)
+                relink(canon, target, scratch)
             except OSError as e:
                 files -= 1
                 est -= s.st_blocks * 512
@@ -978,7 +1068,7 @@ def save_parked(st, parked_set):
 _comp_seq = 0
 
 
-def compress_file(st, path, rel, s):
+def compress_file(st, path, rel, s, scratch):
     """path を透過圧縮で置き換える。
     返り値: (成功したか, 削減ブロック数, コミット付け替え数)
     """
@@ -987,19 +1077,12 @@ def compress_file(st, path, rel, s):
 
     # 1. 圧縮前の SHA-256 を計算
     try:
-        h0 = hashlib.sha256()
-        with open(path, 'rb') as f:
-            while True:
-                buf = f.read(1 << 20)
-                if not buf:
-                    break
-                h0.update(buf)
-        orig_sha = h0.hexdigest()
+        orig_sha = file_digest(path)
     except OSError:
         return False, 0, 0
 
-    # 2. 一時ファイルへ ditto --hfsCompression --noclone で圧縮
-    tmp = os.path.join(os.path.dirname(path), f'.clayfs-comp.{os.getpid()}.{_comp_seq}')
+    # 2. 一時置き場へ ditto --hfsCompression --noclone で圧縮
+    tmp = os.path.join(scratch, f'comp.{os.getpid()}.{_comp_seq}')
     try:
         r = subprocess.run(['ditto', '--hfsCompression', '--noclone', path, tmp], capture_output=True)
         if r.returncode != 0:
@@ -1010,15 +1093,9 @@ def compress_file(st, path, rel, s):
         if not (st_tmp.st_flags & UF_COMPRESSED) or st_tmp.st_blocks >= s.st_blocks:
             return False, 0, 0
 
-        # 3. 読み戻してハッシュが一致することを確かめる
-        h1 = hashlib.sha256()
-        with open(tmp, 'rb') as f:
-            while True:
-                buf = f.read(1 << 20)
-                if not buf:
-                    break
-                h1.update(buf)
-        if h1.hexdigest() != orig_sha:
+        # 3. 媒体まで書き出してから、読み戻してハッシュが一致することを確かめる
+        flush_file(tmp)
+        if file_digest(tmp) != orig_sha:
             print(f'警告: 圧縮後のハッシュが一致しません: {rel}', file=sys.stderr)
             return False, 0, 0
 
@@ -1030,8 +1107,10 @@ def compress_file(st, path, rel, s):
         # 5. 属性を元ファイルから tmp へ移す (copy_identity は UF_COMPRESSED を保持する)
         copy_identity(s, path, tmp)
 
-        # 6. 元のファイルと原子的に差し替える
-        os.rename(tmp, path)
+        # 6. 元のファイルと差し替える。途中で書き込まれていたら取り消す
+        if not replace_checked(path, tmp, s, scratch):
+            print(f'飛ばした (圧縮中に書き換えられた): {rel}', file=sys.stderr)
+            return False, 0, 0
     except OSError:
         return False, 0, 0
     finally:
@@ -1050,22 +1129,31 @@ def compress_file(st, path, rel, s):
 _uncomp_seq = 0
 
 
-def uncompress_file(path, rel, s):
-    """圧縮された path を非圧縮に戻す。"""
+def uncompress_file(path, rel, s, scratch):
+    """圧縮された path を非圧縮に戻す。compress と同じく、媒体まで書いてから中身を照合する。"""
     global _uncomp_seq
     _uncomp_seq += 1
 
     if not (s.st_flags & UF_COMPRESSED):
         return False
 
-    tmp = os.path.join(os.path.dirname(path), f'.clayfs-uncomp.{os.getpid()}.{_uncomp_seq}')
+    tmp = os.path.join(scratch, f'uncomp.{os.getpid()}.{_uncomp_seq}')
     try:
+        h0 = hashlib.sha256()
         with open(path, 'rb') as f_in, open(tmp, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
+            for buf in iter(lambda: f_in.read(1 << 20), b''):
+                h0.update(buf)
+                f_out.write(buf)
+        flush_file(tmp)
+        if file_digest(tmp) != h0.hexdigest():
+            print(f'警告: 非圧縮に戻したあとのハッシュが一致しません: {rel}', file=sys.stderr)
+            return False
 
         # 属性を写すが UF_COMPRESSED は除外する (copy_identity は dst が UF_COMPRESSED でなければ落とす)
         copy_identity(s, path, tmp)
-        os.rename(tmp, path)
+        if not replace_checked(path, tmp, s, scratch):
+            print(f'飛ばした (書き換えられた): {rel}', file=sys.stderr)
+            return False
         return True
     except OSError:
         return False
@@ -1079,12 +1167,17 @@ def uncompress_file(path, rel, s):
 
 def cmd_compress(st, a):
     d = work_dir(st)
+    dry_run = getattr(a, 'dry_run', False)
     db = index_db(st)
-    hashed, gone, bad = refresh_index(st, db)
+    # 空実行は作業ツリーも索引も書き換えない。対象の決定には索引が要らない
+    if not dry_run:
+        scratch = prepare_scratch(st, d)
+        refresh_index(st, db)
     now = time.time()
     seven_days_ago = now - 7 * 86400
     parked = load_parked(st)
     open_files = open_files_on_volume(st)
+    last_open = time.time()
 
     free_before = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
 
@@ -1117,9 +1210,12 @@ def cmd_compress(st, a):
     saved_bytes = 0
     in_layers_total = 0
     skipped = 0
-    dry_run = getattr(a, 'dry_run', False)
 
     for rel, s in candidates:
+        # 開かれているファイルの一覧は、実行の途中でも新しくする。長い実行の間に開かれたものを見落とさないため
+        if time.time() - last_open > 60:
+            open_files = open_files_on_volume(st)
+            last_open = time.time()
         # 既に圧縮済み
         if s.st_flags & UF_COMPRESSED:
             continue
@@ -1159,7 +1255,7 @@ def cmd_compress(st, a):
             count += 1
             continue
 
-        ok, saved_blocks, in_layers = compress_file(st, path, rel, s)
+        ok, saved_blocks, in_layers = compress_file(st, path, rel, s, scratch)
         if ok:
             count += 1
             saved_bytes += saved_blocks * 512
@@ -1195,30 +1291,29 @@ def cmd_park(st, a):
             print(f'畳まれているプロジェクト: {", ".join(sorted(parked))}')
         return
 
+    names = []
     for proj in projects_arg:
-        proj_name = os.path.normpath(proj).strip(os.sep)
-        if os.sep in proj_name:
-            proj_name = proj_name.split(os.sep)[0]
+        proj_name = project_name(d, proj)
         proj_dir = os.path.join(d, proj_name)
         if not os.path.isdir(proj_dir):
             die(f'プロジェクトのディレクトリがありません: {proj_name}')
         parked.add(proj_name)
+        names.append(proj_name)
         print(f'プロジェクト『{proj_name}』を畳みました (圧縮を実行します)')
     save_parked(st, parked)
 
     # 畳んだプロジェクトの圧縮を直ちに実行
-    cmd_compress(st, argparse.Namespace(paths=[os.path.join(d, p) for p in projects_arg], dry_run=False))
+    cmd_compress(st, argparse.Namespace(paths=[os.path.join(d, n) for n in names], dry_run=False))
 
 
 def cmd_unpark(st, a):
     d = work_dir(st)
     parked = load_parked(st)
     db = index_db(st)
+    scratch = prepare_scratch(st, d)
 
     for proj in a.projects:
-        proj_name = os.path.normpath(proj).strip(os.sep)
-        if os.sep in proj_name:
-            proj_name = proj_name.split(os.sep)[0]
+        proj_name = project_name(d, proj)
         if proj_name in parked:
             parked.remove(proj_name)
             print(f'プロジェクト『{proj_name}』の印を外しました (非圧縮に戻します)')
@@ -1233,7 +1328,7 @@ def cmd_unpark(st, a):
         for rel, s in walk_files(d, sub=proj_name):
             if s.st_flags & UF_COMPRESSED:
                 path = os.path.join(d, rel)
-                if uncompress_file(path, rel, s):
+                if uncompress_file(path, rel, s, scratch):
                     uncomp_count += 1
                     new_s = os.lstat(path)
                     db.execute('UPDATE files SET ino = ?, mtime_ns = ? WHERE path = ?',
