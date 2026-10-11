@@ -1,13 +1,14 @@
 #!/bin/sh
 # clayfs (btrfs) を Linux に入れる。root が要る (/usr/local/bin、/etc、systemd のため)。
 # 使い方: sudo ./install.sh MNT [KEEP]
-#   MNT   btrfs のマウント先 (init 済みであること。例 /srv/clayfs)
+#   MNT   btrfs のマウント先 (絶対パス。init 済みであること。例 /srv/clayfs、/home/yy/.src.clayfs)
 #   KEEP  残す世代の数 (既定 168)
 # --dry-run を付けると、実行するコマンドを表示するだけで、何も変えない (root は要らない)。
 set -eu
 DRY=0
 if [ "${1:-}" = "--dry-run" ]; then DRY=1; shift; fi
 MNT="${1:?使い方: sudo ./install.sh MNT [KEEP]}"
+case "$MNT" in /*) ;; *) echo "MNT は絶対パスで指定してください: $MNT" >&2; exit 1 ;; esac
 KEEP="${2:-168}"
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 TOOL="$HERE/clayfs_btrfs"

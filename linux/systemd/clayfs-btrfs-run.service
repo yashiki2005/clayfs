@@ -5,4 +5,4 @@ Description=clayfs (btrfs): 変更があればコミット
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/clayfs-btrfs.env
-ExecStart=/usr/local/bin/clayfs_btrfs ${CLAYFS_MNT} run
+ExecStart=/usr/local/bin/clayfs_btrfs "${CLAYFS_MNT}" run

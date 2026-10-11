@@ -181,6 +181,16 @@ mkdir -p $CR; echo x > $CR/junk
 out=$($T create 1G --image $CRI --mnt $CR 2>&1); chk "空でないマウント先は使わない" 'echo "$out" | grep -q "空ではありません" && [ ! -e $CRI ]'
 rm -rf $CR
 
+echo "[任意の場所: 隠しフォルダや空白を含むパスでも動く]"
+AM="/mnt/any dir/.clayfs-x"; AI="/tmp/any dir/x.img"; AL="/tmp/home dir/.src/src"
+rm -rf "/mnt/any dir" "/tmp/any dir" "/tmp/home dir"
+$T create 1G --image "$AI" --mnt "$AM" --link "$AL" >/dev/null 2>&1
+chk "空白と隠しフォルダを含むマウント先に作れる" 'mountpoint -q "$AM" && btrfs subvolume show "$AM/work" >/dev/null 2>&1'
+chk "空白を含むリンク先 (書く場所) が work/ を指す" '[ -L "$AL" ] && [ "$(readlink "$AL")" = "$AM/work" ]'
+chk "リンク越しに書ける" 'echo ok > "$AL/a b.txt" && [ "$(cat "$AM/work/a b.txt")" = ok ]'
+$T "$AM" commit -m spaces >/dev/null 2>&1; chk "空白を含むマウント先でコミットできる" '$T "$AM" log | grep -q spaces'
+umount "$AM"; rm -rf "/mnt/any dir" "/tmp/any dir" "/tmp/home dir"
+
 echo "結果: $pass passed, $fail failed"
 umount $M 2>/dev/null
 [ "$fail" = 0 ]

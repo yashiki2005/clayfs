@@ -5,6 +5,6 @@ Description=clayfs (btrfs): データの検査
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/clayfs-btrfs.env
-ExecStart=/usr/local/bin/clayfs_btrfs ${CLAYFS_MNT} scrub
+ExecStart=/usr/local/bin/clayfs_btrfs "${CLAYFS_MNT}" scrub
 Nice=15
 IOSchedulingClass=idle
