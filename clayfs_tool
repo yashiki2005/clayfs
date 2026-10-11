@@ -409,7 +409,8 @@ def touched(a, b, old, new, since):
     """
     if not since or b.st_ctime <= since:
         return False
-    return a.st_flags != b.st_flags or xattrs(old) != xattrs(new)
+    # UF_TRACKED (0x40) は OS が付け外しする印で、名前の差し替えで新しいファイルへ移る。変更とはみなさない
+    return (a.st_flags & ~0x40) != (b.st_flags & ~0x40) or xattrs(old) != xattrs(new)
 
 
 def changes(old, new, rel='', since=None):
