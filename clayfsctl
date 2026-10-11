@@ -71,6 +71,7 @@ WORK="$CLAYFS_MNT/work"
 STORE="$CLAYFS_MNT/store"
 LOCK="$STORE/lock"
 UPLOCK="$CLAYFS_MNT.uplock"
+OFFLINE="$CLAYFS_MNT.offline"   # オフライン作業 (shrink など) の印。イメージの外にあるので、外している間も見える
 ORIG="$CLAYFS_DIR.orig"
 
 die() { echo "エラー: $*" >&2; exit 1; }
@@ -97,22 +98,80 @@ attach_at() {  # attach_at DIR: イメージを DIR にマウントする。所�
   quiet hdiutil attach -nobrowse -owners on -mountpoint "$1" "$CLAYFS_IMAGE"
 }
 
-# 同時に 2 つ動くと、コミットの記録がずれる。mkdir は原子的なので、これを鍵にする。
+# 鍵 (STORE/lock) は、持ち主を「PID 開始時刻」で書いたシンボリックリンク。ln -s は原子的で、作ると同時に持ち主が分かる
+# (以前の mkdir のあとで pid を書く方式は、その間に来た別の clayfsctl が「持ち主なし」とみなして鍵を奪えた)。
+# 開始時刻も見るので、PID が別のプロセスに再利用されていても、持ち主が生きているとは誤認しない。
+proc_id() { printf '%s %s' "$1" "$(ps -o lstart= -p "$1" 2>/dev/null | tr ' ' '_')"; }
+id_alive() {  # id_alive "PID 開始時刻": その持ち主がまだ動いているか
+  _ia_pid="${1%% *}"
+  [ -n "$_ia_pid" ] && [ "$(proc_id "$_ia_pid")" = "$1" ]
+}
+lock_owner() {
+  if [ -L "$LOCK" ]; then readlink "$LOCK"
+  elif [ -d "$LOCK" ]; then echo "$(cat "$LOCK/pid" 2>/dev/null) legacy"   # 古い版の鍵 (ディレクトリ)
+  fi
+}
+lock_owner_alive() {
+  _lo="$(lock_owner)"
+  case "$_lo" in
+    *" legacy") _lp="${_lo%% *}"; [ -n "$_lp" ] && kill -0 "$_lp" 2>/dev/null ;;
+    *) id_alive "$_lo" ;;
+  esac
+}
+unlock() {
+  [ "$(lock_owner)" = "$(proc_id $$)" ] && rm -f "$LOCK"
+}
 lock() {
   mkdir -p "$STORE"
-  if ! mkdir "$LOCK" 2>/dev/null; then
-    _pid="$(cat "$LOCK/pid" 2>/dev/null || true)"
-    [ "$_pid" = $$ ] && return 0   # run から commit を呼ぶときなど、自分の鍵
-    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
-      die "ほかの clayfsctl が実行中です (PID $_pid)"
+  _me="$(proc_id $$)"
+  _n=0
+  while ! ln -s "$_me" "$LOCK" 2>/dev/null; do
+    [ "$(lock_owner)" = "$_me" ] && return 0     # run から commit を呼ぶときなど、自分の鍵
+    if lock_owner_alive; then
+      die "ほかの clayfsctl が実行中です (PID $(lock_owner | cut -d' ' -f1))"
     fi
-    # 持ち主がもういない鍵 (異常終了の残り) は引き取る
-    rm -rf "$LOCK"; mkdir "$LOCK" || die "鍵を取れません: $LOCK"
-  fi
-  echo $$ >"$LOCK/pid"
-  trap 'rm -rf "$LOCK"' EXIT
+    # 持ち主がもういない鍵 (異常終了の残り)。引き取れるのは 1 つだけにする: 引き取りの鍵を mkdir で取った者が、
+    # 取り直しの中でもう一度持ち主を確かめてから消す (2 つが同時に消して、片方が相手の新しい鍵を消すのを防ぐ)
+    if mkdir "$LOCK.takeover" 2>/dev/null; then
+      lock_owner_alive || rm -rf "$LOCK"
+      rmdir "$LOCK.takeover" 2>/dev/null
+    else
+      sleep 1; _n=$((_n + 1))
+      [ $_n -gt 10 ] && rmdir "$LOCK.takeover" 2>/dev/null     # 引き取りの途中で死んだ者の残り
+      [ $_n -gt 30 ] && die "鍵を取れません: $LOCK"
+    fi
+  done
+  trap 'unlock' EXIT
   trap 'exit 130' INT TERM
 }
+
+# オフライン作業 (イメージの外でバンドを直接書き換える shrink など) の間、マウントを断る。
+# 鍵 (STORE/lock) はイメージの中にあり、外した間は見えないので、イメージの外に印を置く。
+offline_owner() { cat "$OFFLINE/owner" 2>/dev/null; }
+offline_active() {  # 自分以外が、生きたままオフライン作業をしているか
+  [ -d "$OFFLINE" ] || return 1
+  _oo="$(offline_owner)"
+  [ "$_oo" = "$(proc_id $$)" ] && return 1
+  id_alive "$_oo" && return 0
+  rm -rf "$OFFLINE"      # 持ち主がいない (異常終了の残り)
+  return 1
+}
+offline_begin() {
+  mkdir -p "$(dirname "$OFFLINE")"
+  offline_active && die "ほかのオフライン作業が実行中です (PID $(offline_owner | cut -d' ' -f1))"
+  if ! mkdir "$OFFLINE" 2>/dev/null; then
+    [ "$(offline_owner)" = "$(proc_id $$)" ] || die "オフライン作業の印を作れません: $OFFLINE"
+  fi
+  proc_id $$ >"$OFFLINE/owner"
+  # すでに始まっているマウント (UPLOCK の中) が終わるのを待つ。このあとの mount_image は、印を見て断る
+  _i=0
+  while ! mkdir "$UPLOCK" 2>/dev/null; do
+    _i=$((_i + 1)); [ $_i -gt 120 ] && { rmdir "$UPLOCK" 2>/dev/null; _i=0; }
+    sleep 1
+  done
+  rmdir "$UPLOCK"
+}
+offline_end() { [ "$(offline_owner)" = "$(proc_id $$)" ] && rm -rf "$OFFLINE"; return 0; }
 
 cmd_init() {
   size="${1:-30g}"
@@ -142,6 +201,7 @@ cmd_init() {
 mount_image() {
   is_mounted "$CLAYFS_MNT" && return 0
   [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE (clayfsctl init)"
+  offline_active && die "オフライン作業中のためマウントしません (PID $(offline_owner | cut -d' ' -f1)。shrink などが終わるまで待ってください)"
   # 鍵の親が無いと mkdir は必ず失敗する。待ち続けないよう、先に作っておく
   mkdir -p "$(dirname "$UPLOCK")"
   _i=0
@@ -152,6 +212,7 @@ mount_image() {
     sleep 1
     is_mounted "$CLAYFS_MNT" && return 0
   done
+  if offline_active; then rmdir "$UPLOCK"; die "オフライン作業中のためマウントしません"; fi   # UPLOCK を取る間に始まった場合
   if ! is_mounted "$CLAYFS_MNT"; then
     mkdir -p "$CLAYFS_MNT"
     is_empty_dir "$CLAYFS_MNT" || { rmdir "$UPLOCK"; die "$CLAYFS_MNT が空ではありません"; }
@@ -184,6 +245,10 @@ cmd_up() {
 
 cmd_down() {
   is_mounted "$CLAYFS_MNT" || { echo "マウントされていません: $CLAYFS_MNT"; return 0; }
+  # commit や compress の途中で外さない (--force でも。使用中のプログラムを無視する指定で、実行中の clayfsctl を無視する指定ではない)。
+  # 鍵はイメージの中にあるので、外す前に手放す
+  lock
+  unlock
   if [ "${1:-}" = --force ]; then
     quiet hdiutil detach -force "$CLAYFS_MNT" || die "外せません: $CLAYFS_MNT"
   else
@@ -242,6 +307,8 @@ cmd_restore() {
 cmd_compact() {
   [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE"
   is_mounted "$CLAYFS_MNT" && die "マウント中は回収できません。先に clayfsctl down"
+  offline_begin
+  trap 'offline_end' EXIT
   before="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
   quiet hdiutil compact "$CLAYFS_IMAGE" || echo "警告: 回収に失敗しました" >&2
   after="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
@@ -254,6 +321,8 @@ HOLEPUNCH="${HOLEPUNCH:-$HOME/build/bin/holepunch}"
 SHRINK_MARGIN_KB="${SHRINK_MARGIN_KB:-10485760}"   # ホストに残す余裕 (10GB)
 
 shrink_restore() {
+  # 中断されたときに、ゼロ埋めのファイルをイメージの中に残さない (残ると、ボリュームの空きが 0 のままになる)
+  [ -n "${shrink_tmp:-}" ] && is_mounted "$shrink_tmp" && rm -f "$shrink_tmp/.clayfs-zerofill"
   [ -n "${shrink_tmp:-}" ] && is_mounted "$shrink_tmp" && quiet hdiutil detach "$shrink_tmp"
   [ -n "${shrink_tmp:-}" ] && rmdir "$shrink_tmp" 2>/dev/null
   is_mounted "$CLAYFS_MNT" || cmd_up >/dev/null 2>&1 || echo "警告: 再マウントできません。clayfsctl up で戻してください" >&2
@@ -270,7 +339,8 @@ cmd_shrink() {
   [ "$host_free" -ge $(( vol_free + SHRINK_MARGIN_KB )) ] \
     || die "ホストの空きが足りません (ホスト ${host_free} KB < ボリュームの空き ${vol_free} KB + 余裕 ${SHRINK_MARGIN_KB} KB)"
   lock
-  trap 'shrink_restore; rm -rf "$LOCK"' EXIT
+  offline_begin
+  trap 'shrink_restore; offline_end; unlock' EXIT
   before="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
   echo "ボリュームの空き $((vol_free / 1048576)) GB、ホストの空き $((host_free / 1048576)) GB"
   cmd_down || die "外せません。使っているものを止めてから再実行してください"
@@ -313,6 +383,8 @@ cmd_info() {
 }
 
 cmd_run() {  # launchd 用: マウントし、変更があればコミットする
+  # shrink などのオフライン作業中は何もしない (失敗ではない。次の周期でやり直す)
+  if offline_active; then echo "$(date '+%F %T') オフライン作業中なのでスキップします"; return 0; fi
   mount_image || die "マウントできません: $CLAYFS_IMAGE"
   [ "$CLAYFS_COMMIT_INTERVAL" = 0 ] && return 0
   [ -f "$STORE/work.json" ] || return 0
