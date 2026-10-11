@@ -281,8 +281,69 @@ def t_misc(vol):
         shutil.rmtree(home, ignore_errors=True)
 
 
+def t_scrub_layers(vol):
+    print('[scrub --layers: コミットにしか無い古い版]')
+    f = f'{vol}/work/f.bin'
+    w(f, os.urandom(300000))
+    r = run(vol, 'commit', '-m', 'v1')
+    layer1 = [n for n in sorted(os.listdir(f'{vol}/store/layers')) if not n.startswith('.')][0]
+    time.sleep(1.1)
+    w(f, os.urandom(300000))
+    run(vol, 'commit', '-m', 'v2')
+    run(vol, 'dedup', '--dry-run')                    # 索引を作る (コミットが版を記録し始める条件)
+    r = run(vol, 'scrub', '--layers')
+    check('最初は既存のコミットから古い版を拾い、ハッシュを記録する', r.returncode == 0 and '拾いました' in r.stdout and '新しくハッシュを記録 1' in r.stdout, r.stdout + r.stderr)
+    r = run(vol, 'scrub', '--layers')
+    check('2 回目は一致する', r.returncode == 0 and '一致 1' in r.stdout and '問題 0' in r.stdout, r.stdout + r.stderr)
+    # 古い版を、更新時刻と大きさを保ったまま壊す
+    old = f'{vol}/store/layers/{layer1}/fs/f.bin'
+    s0 = os.lstat(old)
+    with open(old, 'r+b') as h:
+        h.seek(1000); h.write(b'CORRUPT!')
+    os.utime(old, ns=(s0.st_atime_ns, s0.st_mtime_ns))
+    r = run(vol, 'scrub', '--layers')
+    check('古い版が壊れていれば、終了コード 1 で報告する', r.returncode == 1 and '問題 1' in r.stdout and 'f.bin' in r.stdout, r.stdout + r.stderr)
+    r = run(vol, 'scrub')
+    check('作業ツリーの scrub は、壊れた古い版に影響されない', r.returncode == 0, r.stdout + r.stderr)
+    # 索引ができた後のコミットは、その時点の版を自分で記録する
+    time.sleep(1.1)
+    w(f'{vol}/work/g.bin', os.urandom(200000))
+    run(vol, 'commit', '-m', 'v3')
+    layer3 = [n for n in sorted(os.listdir(f'{vol}/store/layers')) if not n.startswith('.')][-1]
+    time.sleep(1.1)
+    w(f'{vol}/work/g.bin', os.urandom(200000))
+    run(vol, 'commit', '-m', 'v4')
+    g3 = f'{vol}/store/layers/{layer3}/fs/g.bin'
+    s0 = os.lstat(g3)
+    with open(g3, 'r+b') as h:
+        h.seek(10); h.write(b'BAD')
+    os.utime(g3, ns=(s0.st_atime_ns, s0.st_mtime_ns))
+    r = run(vol, 'scrub', '--layers')
+    check('コミット時に記録した版も検査できる (g.bin の v3)', r.returncode == 1 and 'g.bin' in r.stdout, r.stdout + r.stderr)
+    # gc でどのレイヤーにも無くなった版は、記録から消える
+    r = run(vol, 'gc', '--keep', '1')
+    r = run(vol, 'scrub', '--layers')
+    check('誰も持たなくなった版は記録から消え、問題も消える', r.returncode == 0 and '問題 0' in r.stdout, r.stdout + r.stderr)
+
+
+def t_scrub_budget(vol):
+    print('[scrub --layers: 予算]')
+    for i in range(3):
+        w(f'{vol}/work/b{i}.bin', os.urandom(700000))
+    run(vol, 'commit', '-m', 'a')
+    time.sleep(1.1)
+    for i in range(3):
+        w(f'{vol}/work/b{i}.bin', os.urandom(700000))
+    run(vol, 'commit', '-m', 'b')
+    run(vol, 'dedup', '--dry-run')
+    r = run(vol, 'scrub', '--layers', '--budget-mb', '1')
+    check('予算を超える分は残りに回す', r.returncode == 0 and '新しくハッシュを記録 1' in r.stdout and '残り 2' in r.stdout, r.stdout + r.stderr)
+    r = run(vol, 'scrub', '--layers', '--budget-mb', '100')
+    check('次の実行で残りを検査する', r.returncode == 0 and '残り 0' in r.stdout, r.stdout + r.stderr)
+
+
 def main():
-    tests = [t_misc, t_apply_symlink, t_dedup_open_file, t_dedup_stale_index, t_dedup_identity, t_json_robust,
+    tests = [t_scrub_layers, t_scrub_budget, t_misc, t_apply_symlink, t_dedup_open_file, t_dedup_stale_index, t_dedup_identity, t_json_robust,
              t_commit_unreadable, t_gc_immutable, t_rebuild_failure]
     only = sys.argv[1:]
     for t in tests:

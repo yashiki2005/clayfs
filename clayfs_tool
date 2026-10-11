@@ -713,6 +713,7 @@ def cmd_wcommit(st, a):
     # 変わったファイルのハッシュを記録する (dedup と scrub が使う)
     if os.path.exists(os.path.join(st.root, 'index.sqlite')):
         index_changes(st, work_changes_all)
+        record_versions(st, name, work_changes_all)
     print(f'[{name}] {a.message or ""}\n {len(notes)} 件の変更')
 
 
@@ -831,6 +832,10 @@ def index_db(st):
     db.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER,'
                ' ino INTEGER, sha256 TEXT, shared_with INTEGER)')
     db.execute('CREATE INDEX IF NOT EXISTS files_content ON files (sha256, size)')
+    # コミットに残る「ファイルの版」。作業ツリーの現在の版と違うものは、レイヤーの中にしか無く、scrub --layers の対象
+    db.execute('CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY, path TEXT, size INTEGER, mtime_ns INTEGER,'
+               ' sha256 TEXT, layer TEXT, checked_at REAL, UNIQUE (path, size, mtime_ns))')
+    db.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)')
     return db
 
 
@@ -930,6 +935,35 @@ def index_changes(st, notes):
         elif os.path.isfile(os.path.join(d, rel)) and not os.path.islink(os.path.join(d, rel)):
             todo.append(os.path.join(d, rel))
     store_hashes(db, d, hash_many(todo))
+    db.close()
+
+
+def record_versions(st, layer, notes):
+    """コミットで追加・変更されたファイルの版を、そのレイヤーの中のコピーからハッシュして記録する
+    (作業ツリーからではない: 複製のあとに変わっていても、レイヤーが持っているものを記録する)。"""
+    root = st.fs(layer)
+    todo = []
+    for kind, p in notes:
+        rel = p.rstrip('/')
+        if kind == 'D':
+            continue
+        if p.endswith('/'):
+            if kind == 'A':
+                todo += [os.path.join(root, r) for r, _ in walk_files(root, rel)]
+        else:
+            full = os.path.join(root, rel)
+            if os.path.isfile(full) and not os.path.islink(full):
+                todo.append(full)
+    if not todo:
+        return
+    db = index_db(st)
+    for path, size, mtime_ns, ino, sha in hash_many(todo):
+        if size < 0:
+            continue
+        db.execute('INSERT INTO versions (path, size, mtime_ns, sha256, layer, checked_at) VALUES (?,?,?,?,?,?)'
+                   ' ON CONFLICT(path, size, mtime_ns) DO UPDATE SET sha256 = excluded.sha256, layer = excluded.layer,'
+                   ' checked_at = excluded.checked_at', (os.path.relpath(path, root), size, mtime_ns, sha, layer, time.time()))
+    db.commit()
     db.close()
 
 
@@ -1213,7 +1247,108 @@ def cmd_dedup(st, a):
     db.close()
 
 
+def seed_versions(st, db):
+    """既存のコミットから、作業ツリーの現在の版と違う版を拾って、ハッシュ無しで記録する (最初の 1 回)。
+    古いコミットから順に lstat だけで調べるので、読み出しは無い。ハッシュは、scrub --layers が予算の範囲で取る。"""
+    d = work_dir(st)
+    layers = [n for n in st.names() if os.path.isdir(st.fs(n))]
+    seen = {}      # path -> {(size, mtime_ns): 最初に持っていたレイヤー}
+    for n in layers:
+        root = st.fs(n)
+        for rel, s in walk_files(root):
+            seen.setdefault(rel, {}).setdefault((s.st_size, s.st_mtime_ns), n)
+    current = {r[0]: (r[1], r[2]) for r in db.execute('SELECT path, size, mtime_ns FROM files')}
+    added = 0
+    for rel, vs in seen.items():
+        for (size, mtime_ns), n in vs.items():
+            if current.get(rel) == (size, mtime_ns):
+                continue
+            db.execute('INSERT OR IGNORE INTO versions (path, size, mtime_ns, sha256, layer, checked_at) VALUES (?,?,?,NULL,?,NULL)',
+                       (rel, size, mtime_ns, n))
+            added += 1
+    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('versions_seeded', ?)", (str(time.time()),))
+    db.commit()
+    return added
+
+
+def scrub_layers(st, db, budget_mb):
+    """コミットの中にしか無い古い版を検査する。返り値: (一致, 新しくハッシュを記録, 問題の一覧, 残り, 消した行)。
+    作業ツリーの現在の版と同じものは、作業ツリーの検査 (scrub) と同じ領域を共有するので、ここでは見ない。"""
+    layers = [n for n in st.names() if os.path.isdir(st.fs(n))]
+    current = {r[0]: (r[1], r[2]) for r in db.execute('SELECT path, size, mtime_ns FROM files')}
+    rows = db.execute('SELECT id, path, size, mtime_ns, sha256, layer FROM versions'
+                      ' ORDER BY checked_at IS NOT NULL, checked_at, id').fetchall()
+    budget = budget_mb * (1 << 20) if budget_mb else None
+    todo, used, gone, skipped_cur, rest = [], 0, [], 0, 0
+    for vid, rel, size, mtime_ns, sha, layer in rows:
+        if current.get(rel) == (size, mtime_ns):
+            skipped_cur += 1
+            continue
+        if budget is not None and used + size > budget and todo:
+            rest += 1
+            continue
+        # この版を持つレイヤーを探す: 記録したレイヤーが残っていればそれ、無ければ古い順に
+        found = None
+        for n in ([layer] if layer in layers else []) + layers:
+            try:
+                ls = os.lstat(os.path.join(st.fs(n), rel))
+            except OSError:
+                continue
+            if stat.S_ISREG(ls.st_mode) and (ls.st_size, ls.st_mtime_ns) == (size, mtime_ns):
+                found = n
+                break
+        if found is None:
+            # 全レイヤーを探しても無い: その版はもう誰も持っていない (gc で消えた)。行を消す。
+            # ファイルが壊れて消えた場合と区別できないので、記録したレイヤーが残っているときは問題として報告する
+            if layer in layers:
+                todo.append((vid, rel, size, mtime_ns, sha, layer, None))
+            else:
+                gone.append(vid)
+            continue
+        used += size
+        todo.append((vid, rel, size, mtime_ns, sha, found, os.path.join(st.fs(found), rel)))
+    ok = fresh = 0
+    broken = []
+    results = hash_many([t[6] for t in todo if t[6]])
+    by_path = {r[0]: r for r in results}
+    for vid, rel, size, mtime_ns, sha, layer, full in todo:
+        if full is None:
+            broken.append((layer, rel, 'ファイルがありません'))
+            continue
+        _, sz, mt, _, got = by_path[full]
+        if sz < 0:
+            broken.append((layer, rel, got))
+        elif sha is None:
+            db.execute('UPDATE versions SET sha256 = ?, layer = ?, checked_at = ? WHERE id = ?', (got, layer, time.time(), vid))
+            fresh += 1
+        elif got != sha:
+            broken.append((layer, rel, '中身が記録したハッシュと違う'))
+        else:
+            db.execute('UPDATE versions SET layer = ?, checked_at = ? WHERE id = ?', (layer, time.time(), vid))
+            ok += 1
+    db.executemany('DELETE FROM versions WHERE id = ?', [(g,) for g in gone])
+    db.commit()
+    return ok, fresh, broken, rest, len(gone)
+
+
+def cmd_scrub_layers(st, a):
+    db = index_db(st)
+    if a.seed or not db.execute("SELECT 1 FROM meta WHERE key = 'versions_seeded'").fetchone():
+        refresh_index(st, db)       # 作業ツリーの現在の版を、先に索引に反映する
+        n = seed_versions(st, db)
+        print(f'既存のコミットから、作業ツリーと違う版を {n} 個拾いました')
+    ok, fresh, broken, rest, gone = scrub_layers(st, db, a.budget_mb)
+    print(f'コミットの検査: 一致 {ok}、新しくハッシュを記録 {fresh}、問題 {len(broken)}、残り {rest}、誰も持たなくなって記録から消した {gone}')
+    for layer, rel, why in broken[:50]:
+        print(f'  問題: {rel} ({layer}: {why})')
+    db.close()
+    if broken:
+        sys.exit(1)
+
+
 def cmd_scrub(st, a):
+    if a.layers:
+        return cmd_scrub_layers(st, a)
     d = work_dir(st)
     db = index_db(st)
     hashed, gone, bad = refresh_index(st, db)
@@ -1729,7 +1864,9 @@ def main():
     p = sub.add_parser('log'); p.add_argument('-n', type=int); p.set_defaults(fn=cmd_log)
     p = sub.add_parser('show'); p.add_argument('gen', nargs='?'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('dedup'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_dedup)
-    p = sub.add_parser('scrub'); p.set_defaults(fn=cmd_scrub)
+    p = sub.add_parser('scrub'); p.add_argument('--layers', action='store_true', help='コミットの中にしか無い古い版を検査する')
+    p.add_argument('--seed', action='store_true', help='(--layers) 既存のコミットから版を拾い直す')
+    p.add_argument('--budget-mb', type=int, default=0, help='(--layers) この量だけ検査して終わる (0: 全部)'); p.set_defaults(fn=cmd_scrub)
     p = sub.add_parser('compress'); p.add_argument('paths', nargs='*'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_compress)
     p = sub.add_parser('keep'); p.add_argument('paths', nargs='*'); p.set_defaults(fn=cmd_keep)
     p = sub.add_parser('unkeep'); p.add_argument('paths', nargs='+'); p.set_defaults(fn=cmd_unkeep)

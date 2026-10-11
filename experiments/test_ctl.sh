@@ -80,5 +80,26 @@ free_kb="$(df -k "$CLAYFS_MNT" | tail -1 | awk '{print $4}')"
 chk "ボリュームの空きが戻っている (${free_kb} KB)" '[ "$free_kb" -gt 500000 ]'
 chk "印と鍵が残らない" '[ ! -d "$CLAYFS_MNT.offline" ] && [ ! -e "$CLAYFS_MNT/store/lock" ] && [ ! -L "$CLAYFS_MNT/store/lock" ]'
 
+echo "[run: 古い版の自動検査]"
+export CLAYFS_ALLOW_BATTERY=1
+W="$CLAYFS_MNT/work"
+head -c 200000 /dev/urandom >"$W/v.bin"; "$CTL" commit -m s1 >/dev/null 2>&1
+sleep 1.2; head -c 200000 /dev/urandom >"$W/v.bin"; "$CTL" commit -m s2 >/dev/null 2>&1
+"$CTL" scrub >/dev/null 2>&1                      # 索引を作る
+out="$("$CTL" run 2>&1)"; rc=$?
+chk "索引ができていれば、run が古い版を検査する" '[ $rc = 0 ] && echo "$out" | grep -q "コミットの古い版を検査" && [ -f "$CLAYFS_MNT/store/layers-scrub.last" ]'
+out="$("$CTL" run 2>&1)"
+chk "間隔が空くまでは、もう一度検査しない" '! echo "$out" | grep -q "コミットの古い版を検査"'
+L1=""; for n in $(ls "$CLAYFS_MNT/store/layers" | grep -v '^\.'); do [ -f "$CLAYFS_MNT/store/layers/$n/fs/v.bin" ] && { L1="$n"; break; }; done
+s_=$(stat -f %m "$CLAYFS_MNT/store/layers/$L1/fs/v.bin")
+printf 'CORRUPT' | dd of="$CLAYFS_MNT/store/layers/$L1/fs/v.bin" bs=1 seek=500 conv=notrunc 2>/dev/null
+touch -t 200001010000 "$CLAYFS_MNT/store/layers-scrub.last"
+python3 - "$CLAYFS_MNT/store/layers/$L1/fs/v.bin" "$s_" <<'PY'
+import os,sys; p=sys.argv[1]; st=os.stat(p); os.utime(p, ns=(st.st_atime_ns, int(sys.argv[2])*10**9 + (st.st_mtime_ns % 10**9)))
+PY
+out="$("$CTL" run 2>&1)"; rc=$?
+chk "壊れた版があっても run は成功し、警告と印を残す" '[ $rc = 0 ] && echo "$out" | grep -q "壊れた版" && [ -f "$CLAYFS_MNT/store/layers-scrub.broken" ]'
+unset CLAYFS_ALLOW_BATTERY
+
 echo "結果: $pass passed, $fail failed"
 [ "$fail" = 0 ]

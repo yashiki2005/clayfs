@@ -24,7 +24,9 @@
 #   clayfsctl gc --keep N     新しい N 個を残して、古いコミットの中身を消す (一覧と変更内容は残る)
 #   clayfsctl dedup [--dry-run]
 #                             中身が同じファイルをクローンにまとめる (--dry-run: 数えるだけ)
-#   clayfsctl scrub           記録したハッシュと中身を照合し、壊れたファイルを報告する
+#   clayfsctl scrub [--layers [--budget-mb N] [--seed]]
+#                             記録したハッシュと中身を照合し、壊れたファイルを報告する。--layers は、コミットの中にしか
+#                             無い古い版を検査する (N MB だけ検査して終わる。自動実行 (run) が暇なときに行う)
 #   clayfsctl compress [--dry-run] [PATH...]
 #                             7 日以上更新のないファイルと、圧縮を保つパスを透過圧縮する
 #   clayfsctl keep [PATH...]
@@ -51,6 +53,8 @@
 #   CLAYFS_IMAGE (~/<DIR の名前>.dmg.sparsebundle)  イメージ (APFS のスパースバンドル)
 #   CLAYFS_COMMIT_INTERVAL (3600)  自動コミットの間隔 (秒)。0 にすると、自動実行はマウントだけを行う
 #   CLAYFS_LOG (~/Library/Logs/clayfs.log)
+#   CLAYFS_SCRUB_LAYERS_MB (4096)  自動実行が 1 回に検査するコミットの古い版の量 (MB)。0 で自動検査をやめる
+#   CLAYFS_SCRUB_LAYERS_INTERVAL (86400)  自動検査の間隔 (秒)。電源につながっているときだけ行う (CLAYFS_ALLOW_BATTERY=1 で電池でも行う)
 #
 # 読めないファイル (開けない、壊れている) は、警告を出して飛ばす。
 set -u
@@ -274,7 +278,7 @@ cmd_show() { need_up; tool show "$@"; }
 cmd_commit() { need_up; lock; tool commit "$@"; }
 cmd_gc() { need_up; lock; tool gc "$@"; }
 cmd_dedup() { need_up; lock; tool dedup "$@"; }
-cmd_scrub() { need_up; lock; tool scrub; }
+cmd_scrub() { need_up; lock; tool scrub "$@"; }
 cmd_compress() { need_up; lock; tool compress "$@"; }
 cmd_keep() { need_up; lock; tool keep "$@"; }
 cmd_unkeep() { need_up; lock; tool unkeep "$@"; }
@@ -373,6 +377,8 @@ cmd_info() {
   if is_mounted "$CLAYFS_MNT" && [ -f "$STORE/work.json" ]; then
     echo "HEAD     $(sed -n 's/.*"base": "\([^"]*\)".*/\1/p' "$STORE/work.json")"
     echo "コミット $(wc -l <"$STORE/log.jsonl" | tr -d ' ') 個 ($STORE)"
+    [ -f "$STORE/layers-scrub.broken" ] && echo "警告     コミットの中に壊れた版があります (clayfsctl scrub --layers で詳細。$(cat "$STORE/layers-scrub.broken"))"
+    [ -f "$STORE/layers-scrub.last" ] && echo "古い版の検査 前回 $(date -r "$(stat -f %m "$STORE/layers-scrub.last")" '+%F %T')"
     if [ -f "$STORE/keep.json" ]; then
       _keep="$(grep -o '"[^"]*"' "$STORE/keep.json" 2>/dev/null | tr -d '"' | tr '\n' ' ')"
       [ -n "$_keep" ] && echo "圧縮を保つ $_keep"
@@ -392,6 +398,33 @@ cmd_run() {  # launchd 用: マウントし、変更があればコミットす�
     echo "$(date '+%F %T') 変更があるのでコミットします"
     cmd_commit -m "auto"
   fi
+  auto_scrub_layers
+}
+
+# 暇なとき (電源につながっていて、前回から間隔が空いたとき) に、コミットの古い版を少しずつ検査する。
+# 失敗しても run 自体は失敗にしない。問題が見つかれば、ログと STORE/layers-scrub.broken に残す。
+auto_scrub_layers() {
+  _mb="${CLAYFS_SCRUB_LAYERS_MB:-4096}"
+  case "$_mb" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_mb" = 0 ] && return 0
+  [ -f "$STORE/index.sqlite" ] || return 0      # 索引が無ければ、版の記録もまだ無い (dedup か scrub で作られる)
+  [ "${CLAYFS_ALLOW_BATTERY:-0}" = 1 ] || pmset -g batt 2>/dev/null | head -1 | grep -q "AC Power" || return 0
+  _last="$STORE/layers-scrub.last"
+  _now="$(date +%s)"
+  if [ -f "$_last" ]; then
+    _then="$(stat -f %m "$_last" 2>/dev/null || echo 0)"
+    [ $((_now - _then)) -ge "${CLAYFS_SCRUB_LAYERS_INTERVAL:-86400}" ] || return 0
+  fi
+  lock
+  echo "$(date '+%F %T') コミットの古い版を検査します (最大 $_mb MB)"
+  if nice -n 15 "$CLAYFS_TOOL" -s "$STORE" -C "$WORK" scrub --layers --budget-mb "$_mb"; then
+    rm -f "$STORE/layers-scrub.broken"
+  else
+    echo "$(date '+%F %T') 警告: コミットの中に壊れた版があります" >&2
+    date '+%F %T' >"$STORE/layers-scrub.broken"
+  fi
+  : >"$_last"
+  return 0
 }
 
 xesc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
@@ -453,7 +486,7 @@ case "$cmd" in
   restore) cmd_restore "$@" ;;
   gc) cmd_gc "$@" ;;
   dedup) cmd_dedup "$@" ;;
-  scrub) cmd_scrub ;;
+  scrub) cmd_scrub "$@" ;;
   compress) cmd_compress "$@" ;;
   keep) cmd_keep "$@" ;;
   unkeep) cmd_unkeep "$@" ;;
