@@ -51,13 +51,14 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 
 ## 実装の状況
 
-実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 31 件合格）。
+実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 42 件合格）。
 
-- 済み: init / commit / status / show / log / restore / gc / scrub / dedup / compress / keep / unkeep / run
+- 済み: init / commit / status / show / log / restore / gc / scrub / dedup / compress / keep / unkeep / run / adopt / rebuild
 - 自動実行: `linux/systemd/`（毎時の `run`、毎日の `gc`、毎週の `scrub`）。構文は `systemd-analyze verify` で確認。
   実際のタイマーの動作は、まだ確かめていない（コンテナでは systemd が動かないため）。
-- 未実装: rebuild（`btrfs send | receive`）、インストール用のスクリプト、`CLAYFS_DIR` のリンク管理、
-  ホストの root での実行（コンテナ外）の試験。
+- rebuild: 各コミットを `btrfs send -p | receive` で別の btrfs へ移す。未コミット分は rw の work/ として移す。
+- adopt: 普通のフォルダ (例 ~/src) を work/ へ複製し、元は SRC.orig に残して、SRC を work/ へのリンクにする。
+- 未実装: インストール用のスクリプト、ホストの root での実行（コンテナ外）の試験。
 
 試験で分かったこと（設計に反映済み）:
 

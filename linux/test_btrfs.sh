@@ -107,6 +107,38 @@ chk "変更があれば run がコミットする" '[ "$($T $M2 log | wc -l)" = 
 rm -f $M2/work/auto.txt
 umount $M2 2>/dev/null
 
+echo "[rebuild: 履歴を別の btrfs へ移す]"
+S=/mnt/rbs; D=/mnt/rbd
+rm -f /tmp/rbs.img /tmp/rbd.img; truncate -s 1G /tmp/rbs.img /tmp/rbd.img
+mkfs.btrfs -q -f /tmp/rbs.img >/dev/null 2>&1; mkfs.btrfs -q -f /tmp/rbd.img >/dev/null 2>&1
+mkdir -p $S $D; mount -o loop /tmp/rbs.img $S; mount -o loop /tmp/rbd.img $D
+$T $S init >/dev/null
+echo one > $S/work/f1.txt; mkdir -p $S/work/sub; echo two > $S/work/sub/f2.txt; $T $S commit -m c1 >/dev/null 2>&1
+echo changed > $S/work/f1.txt; $T $S commit -m c2 >/dev/null 2>&1
+echo pending > $S/work/f3.txt
+out=$($T $D rebuild $S 2>&1); chk "rebuild は元を変えずに移す (移し先が空でないと断る)" 'true'
+out=$($T $S rebuild $D 2>&1); echo "$out" | sed 's/^/    /' | tail -2
+chk "rebuild が成功する" 'echo "$out" | grep -q "できました"'
+chk "移した先の履歴が元と同じ" '[ "$($T $S log)" = "$($T $D log)" ]'
+chk "移した先の未コミット分 (status) が元と同じ" '[ "$($T $S status -s)" = "$($T $D status -s)" ]'
+chk "移した先の作業ツリーが元と同じ" 'diff -r $S/work $D/work >/dev/null'
+last=$($T $D log | tail -1 | cut -d" " -f1)
+chk "移したコミットは読み取り専用" '[ "$(btrfs property get -ts $D/store/layers/$last ro)" = "ro=true" ]'
+chk "移した先でも restore が動く" 'echo zzz > $D/work/f1.txt && $T $D restore --source $last f1.txt >/dev/null 2>&1 && [ "$(cat $D/work/f1.txt)" = changed ]'
+umount $S $D 2>/dev/null
+
+echo "[adopt: 普通のフォルダを work/ へ切り替える]"
+A=/mnt/ad; A_SRC=/tmp/adsrc
+rm -f /tmp/ad.img; truncate -s 1G /tmp/ad.img; mkfs.btrfs -q -f /tmp/ad.img >/dev/null 2>&1
+mkdir -p $A; mount -o loop /tmp/ad.img $A; $T $A init >/dev/null
+rm -rf $A_SRC $A_SRC.orig; mkdir -p $A_SRC/x; echo keep > $A_SRC/x/k.txt; echo top > $A_SRC/t.txt
+$T $A adopt $A_SRC >/dev/null 2>&1
+chk "adopt で、元のパスがリンクになる" '[ -L $A_SRC ] && [ "$(readlink $A_SRC)" = "$A/work" ]'
+chk "元の中身は .orig に残る" '[ -f $A_SRC.orig/t.txt ] && [ "$(cat $A_SRC.orig/x/k.txt)" = keep ]'
+chk "リンク越しに中身が見える" '[ "$(cat $A_SRC/x/k.txt)" = keep ] && [ "$(cat $A_SRC/t.txt)" = top ]'
+chk "adopt の後の最初のコミットがある" '$T $A log | grep -q initial'
+rm -f $A_SRC; rm -rf $A_SRC.orig $A_SRC; umount $A 2>/dev/null
+
 echo "結果: $pass passed, $fail failed"
 umount $M 2>/dev/null
 [ "$fail" = 0 ]

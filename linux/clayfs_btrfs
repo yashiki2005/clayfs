@@ -22,6 +22,8 @@
   clayfs_btrfs MNT compress PATH...     btrfs の圧縮 (zstd) で書き直す。reflink の共有は崩れる
   clayfs_btrfs MNT keep [PATH...] | unkeep PATH...   圧縮を保つパス (新しいファイルも圧縮する)
   clayfs_btrfs MNT run                  変更があればコミットする (自動実行用)
+  clayfs_btrfs MNT adopt SRC            普通のフォルダ SRC を work/ へ移し、SRC を work/ へのリンクにする (SRC は SRC.orig に残す)
+  clayfs_btrfs MNT rebuild DEST         履歴を、別の btrfs (DEST) へ send | receive で移す
 """
 import argparse
 import fcntl
@@ -29,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -273,6 +276,89 @@ def cmd_status(vol, a):
             print(f'\t{LABEL[k]}:   {p}')
     else:
         print('\n変更はありません')
+
+
+def cmd_adopt(vol, a):
+    """普通のフォルダ SRC を、この btrfs の work/ へ移す。SRC は SRC.orig に残し、SRC は work/ へのリンクにする。
+    中身は reflink で複製し、同じであることを diff で確かめてから切り替える (macOS 版の switch に当たる)。"""
+    src = os.path.realpath(os.path.expanduser(a.src))
+    if os.path.islink(a.src):
+        die(f'すでにリンクです: {a.src}')
+    if not os.path.isdir(src):
+        die(f'ディレクトリではありません: {src}')
+    orig = src + '.orig'
+    if os.path.exists(orig):
+        die(f'すでにあります: {orig} (前回の退避が残っています)')
+    if os.listdir(vol.work):
+        die(f'work/ が空ではありません: {vol.work}')
+    fd = lock(vol)
+    try:
+        for n in os.listdir(src):
+            run(['cp', '-a', '--reflink=never', os.path.join(src, n), os.path.join(vol.work, n)])
+        r = subprocess.run(['diff', '-rq', src, vol.work], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f'複製が一致しません。元のフォルダは変えていません:\n{r.stdout[:500]}')
+    finally:
+        os.close(fd)
+    # 鍵を外してから、コミットする (commit は自分で鍵を取る)
+    if head(vol) is None:
+        cmd_commit(vol, argparse.Namespace(name=None, message='initial', allow_empty=True))
+    os.rename(src, orig)
+    os.symlink(vol.work, src)
+    print(f'切り替えました: {src} -> {vol.work}')
+    print(f'元の中身: {orig} (確かめたら消して構いません)')
+
+
+def cmd_rebuild(vol, a):
+    """履歴を、別の btrfs (DEST の MNT) へ移す。send | receive で、各コミットを順に送る。元は読むだけ。"""
+    dest = Vol(a.dest)
+    if os.path.exists(dest.work) or os.path.exists(dest.store):
+        die(f'移し先が空ではありません: {dest.mnt}')
+    if not os.path.ismount(dest.mnt):
+        die(f'移し先の btrfs がマウントされていません: {dest.mnt}')
+    fd = lock(vol)
+    try:
+        os.makedirs(dest.layers)
+        names = [e['name'] for e in load_log(vol) if os.path.isdir(vol.layer(e['name']))]
+        if not names:
+            die('移す履歴がありません')
+        prev = None
+        for n in names:
+            if prev is None:
+                cmd = f'btrfs send {shlex.quote(vol.layer(n))} | btrfs receive {shlex.quote(dest.layers)}'
+            else:
+                cmd = (f'btrfs send -p {shlex.quote(vol.layer(prev))} {shlex.quote(vol.layer(n))} | '
+                       f'btrfs receive {shlex.quote(dest.layers)}')
+            r = subprocess.run(['sh', '-c', cmd], capture_output=True, text=True)
+            if r.returncode != 0:
+                die(f'{n} を送れません: {r.stderr.strip()[:300]}')
+            prev = n
+            print(f'移しました: {n}')
+        # 作業ツリーの未コミット分: HEAD からの差分を送り、それを rw の work/ にする
+        tmp = os.path.join(vol.store, f'rebuild.{os.getpid()}')
+        snapshot_ro(vol.work, tmp)
+        try:
+            base = head(vol)
+            cmd = (f'btrfs send -p {shlex.quote(vol.layer(base))} {shlex.quote(tmp)} | '
+                   f'btrfs receive {shlex.quote(dest.store)}') if base else \
+                  f'btrfs send {shlex.quote(tmp)} | btrfs receive {shlex.quote(dest.store)}'
+            r = subprocess.run(['sh', '-c', cmd], capture_output=True, text=True)
+            if r.returncode != 0:
+                die(f'未コミット分を送れません: {r.stderr.strip()[:300]}')
+            pending = os.path.join(dest.store, os.path.basename(tmp))
+            run(['btrfs', 'subvolume', 'snapshot', pending, dest.work])
+            delete_subvol(pending)
+        finally:
+            delete_subvol(tmp)
+        for name in ('log.jsonl', 'work.json', 'keep.json'):
+            src = os.path.join(vol.store, name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(dest.store, name))
+        if os.path.isdir(vol.changes):
+            shutil.copytree(vol.changes, dest.changes)
+        print(f'できました: {len(names)} 個のコミットと、未コミット分を {dest.mnt} に移しました')
+    finally:
+        os.close(fd)
 
 
 def cmd_run(vol, a):
@@ -569,6 +655,8 @@ def main():
     p.add_argument('--allow-empty', action='store_true'); p.set_defaults(fn=cmd_commit)
     p = sub.add_parser('status'); p.add_argument('-s', '--short', action='store_true'); p.set_defaults(fn=cmd_status)
     p = sub.add_parser('run'); p.set_defaults(fn=cmd_run)
+    p = sub.add_parser('adopt'); p.add_argument('src', help='切り替える普通のフォルダ (例 ~/src)'); p.set_defaults(fn=cmd_adopt)
+    p = sub.add_parser('rebuild'); p.add_argument('dest', help='移し先の btrfs のマウント先 (空であること)'); p.set_defaults(fn=cmd_rebuild)
     p = sub.add_parser('log'); p.add_argument('-n', type=int); p.set_defaults(fn=cmd_log)
     p = sub.add_parser('show'); p.add_argument('gen', nargs='?'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('restore'); p.add_argument('paths', nargs='*'); p.add_argument('--all', action='store_true')
