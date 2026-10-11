@@ -18,6 +18,8 @@
   clayfs_tool -s STORE -C DIR gc --keep N            新しい N 個を残して、古いコミットの中身を消す (一覧は残る)
   clayfs_tool -s STORE -C DIR dedup [--dry-run]      中身が同じファイルをクローンにまとめる
   clayfs_tool -s STORE -C DIR scrub                  記録したハッシュと中身を照合する (壊れていれば終了コード 1)
+  clayfs_tool -s STORE -C DIR rebuild-into NEWROOT --mode fresh|replay
+                                                     マウント済みの新しいボリューム NEWROOT に、圧縮して入れ直す
 コミットは HEAD、または名前の一部 (一意に決まる範囲) で指定できる。
 過去のコミットの中身は STORE/layers/コミット名/fs にあり、普通のフォルダとして開ける。
 -C を省くと STORE の親を DIR とみなす (STORE を DIR/.clayfs に置く使い方。直下の .clayfs はコミットに含めない)。
@@ -347,10 +349,10 @@ def cmd_fill(st, a):
     print(f'コピーしました: {src} -> {d}' + (f' (読めなかった {skipped} 件を除く)' if skipped else ''))
 
 
-def snapshot(st, conf):
+def snapshot(st, conf, name=None):
     """Clone everything in the working directory into a new layer; returns its name."""
     d = work_dir(st)
-    name = time.strftime('base-%Y%m%d-%H%M%S')
+    name = name or time.strftime('base-%Y%m%d-%H%M%S')
     if os.path.exists(st.dir(name)):
         die('同じ秒に 2 回はコミットできません')
     bad = {os.path.join(d, p) for p in conf.get('noclone', [])}
@@ -466,12 +468,12 @@ def changes_file(st, name):
     return os.path.join(st.root, 'changes', name + '.changes')
 
 
-def record(st, name, msg, notes):
+def record(st, name, msg, notes, when=None):
     os.makedirs(os.path.join(st.root, 'changes'), exist_ok=True)
     with open(changes_file(st, name), 'w') as f:
         f.write(f'# {name} {msg or ""}\n' + ''.join(f'{k} {p}\n' for k, p in notes))
     with open(os.path.join(st.root, 'log.jsonl'), 'a') as f:
-        f.write(json.dumps({'name': name, 'message': msg or '', 'time': time.time(), 'changes': len(notes)}, ensure_ascii=False) + '\n')
+        f.write(json.dumps({'name': name, 'message': msg or '', 'time': when or time.time(), 'changes': len(notes)}, ensure_ascii=False) + '\n')
 
 
 def resolve_gen(st, conf, spec):
@@ -893,6 +895,93 @@ def cmd_scrub(st, a):
         sys.exit(1)
 
 
+def ditto(src, dst):
+    """透過圧縮をかけながらコピーする。--noclone が無いと、同じボリューム内ではクローンになり圧縮されない。"""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    r = subprocess.run(['ditto', '--hfsCompression', '--noclone', src, dst], capture_output=True, text=True)
+    if r.returncode:
+        print(f'警告: コピーできませんでした: {src} ({r.stderr.strip()[:120]})', file=sys.stderr)
+    return r.returncode == 0
+
+
+def cmd_rebuild_into(st, a):
+    """新しいボリュームに work/ と store/ を作り直す。元の側は読むだけで、書き換えない。
+
+    fresh:  今の作業ツリーを圧縮して入れ、それを最初のコミットにする (履歴は引き継がない)
+    replay: 残っているコミットを古い順に再現する。最初の 1 つを丸ごと入れ、以後は変更一覧の分だけ入れる
+    """
+    global WORK_DIR
+    old_work = work_dir(st)
+    conf = work_conf(st)
+    new_root = os.path.realpath(a.dest)
+    new_work = os.path.join(new_root, 'work')
+    if os.path.exists(new_work) or os.path.exists(os.path.join(new_root, 'store')):
+        die(f'入れ直し先が空ではありません: {new_root}')
+    os.mkdir(new_work)
+    nst = Store(os.path.join(new_root, 'store'))
+    nconf = {'base': None}
+    t0, c0 = time.time(), os.times()
+
+    def copy_all(src_root):
+        for n in top_entries(src_root):
+            ditto(os.path.join(src_root, n), os.path.join(new_work, n))
+
+    def apply(src_root, notes):
+        for kind, p in notes:
+            rel = p.rstrip('/')
+            src, dst = os.path.join(src_root, rel), os.path.join(new_work, rel)
+            if kind == 'M' and p.endswith('/'):
+                continue
+            remove(dst)
+            if kind != 'D' and os.path.lexists(src):
+                ditto(src, dst)
+
+    def commit(name, msg, notes, when=None):
+        WORK_DIR = new_work
+        globals()['WORK_DIR'] = new_work
+        got = snapshot(nst, nconf, name)
+        record(nst, got, msg, notes, when)
+        nconf['base'] = got
+        save_work_conf(nst, nconf)
+        globals()['WORK_DIR'] = old_work
+        return got
+
+    def dedup_new():
+        # 最初のコミットの前にまとめる。コミットが無いうちなら、付け替えは作業ツリーの中だけで済む
+        globals()['WORK_DIR'] = new_work
+        cmd_dedup(nst, argparse.Namespace(dry_run=False))
+        globals()['WORK_DIR'] = old_work
+
+    if a.mode == 'fresh':
+        copy_all(old_work)
+        dedup_new()
+        commit(None, '入れ直し (履歴なし)', [])
+        n = 1
+    else:
+        gens = [e for e in log_entries(st) if os.path.isdir(st.dir(e['name']))]
+        if not gens:
+            die('再現できるコミットがありません')
+        copy_all(st.fs(gens[0]['name']))
+        dedup_new()
+        commit(gens[0]['name'], gens[0]['message'], [], gens[0]['time'])
+        for e in gens[1:]:
+            with open(changes_file(st, e['name'])) as f:
+                notes = [tuple(line.rstrip('\n').split(' ', 1)) for line in f if line[:1] != '#' and line.strip()]
+            apply(st.fs(e['name']), notes)
+            commit(e['name'], e['message'], notes, e['time'])
+        # 最後のコミットの後に作業ツリーで変わった分
+        pending = visible(work_changes(st, conf))
+        if pending:
+            apply(old_work, pending)
+            commit(None, '入れ直しの時点の未コミット分', pending)
+        n = len(gens) + bool(pending)
+    c1 = os.times()
+    cpu = (c1.user - c0.user) + (c1.system - c0.system) + (c1.children_user - c0.children_user) + (c1.children_system - c0.children_system)
+    v = os.statvfs(new_root)
+    print(f'入れ直し ({a.mode}): コミット {n} 個、{time.time() - t0:.0f} 秒、CPU {cpu:.0f} 秒、'
+          f'ボリュームの使用量 {(v.f_blocks - v.f_bfree) * v.f_frsize / (1 << 30):.2f} GB')
+
+
 def main():
     ap = argparse.ArgumentParser(prog='clayfs_tool', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('-s', '--store', default=os.environ.get('CLAYFS_STORE', '~/.src.clayfs/store'))
@@ -919,6 +1008,7 @@ def main():
     p = sub.add_parser('show'); p.add_argument('gen', nargs='?'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('dedup'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_dedup)
     p = sub.add_parser('scrub'); p.set_defaults(fn=cmd_scrub)
+    p = sub.add_parser('rebuild-into'); p.add_argument('dest'); p.add_argument('--mode', choices=['fresh', 'replay'], required=True); p.set_defaults(fn=cmd_rebuild_into)
     p = sub.add_parser('gc'); p.add_argument('--keep', type=int, required=True); p.set_defaults(fn=cmd_gc)
 
     a = ap.parse_args()

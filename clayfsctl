@@ -25,6 +25,9 @@
 #   clayfsctl dedup [--dry-run]
 #                             中身が同じファイルをクローンにまとめる (--dry-run: 数えるだけ)
 #   clayfsctl scrub           記録したハッシュと中身を照合し、壊れたファイルを報告する
+#   clayfsctl rebuild --fresh|--replay [NEWIMAGE]
+#                             新しいイメージ (既定 CLAYFS_IMAGE の隣に .new) を作り、圧縮して入れ直す。
+#                             今のイメージには触れない。--fresh は履歴なし、--replay は履歴を再現する
 #   clayfsctl compact         イメージの空き領域を回収する (down の状態で)
 #   clayfsctl info            設定と状態を表示する
 #   clayfsctl run             マウントし、変更があればコミットする (自動実行用)
@@ -198,6 +201,24 @@ cmd_gc() { need_up; lock; tool gc "$@"; }
 cmd_dedup() { need_up; lock; tool dedup "$@"; }
 cmd_scrub() { need_up; lock; tool scrub; }
 
+cmd_rebuild() {
+  case "${1:-}" in --fresh) mode=fresh ;; --replay) mode=replay ;; *) die "使い方: clayfsctl rebuild --fresh|--replay [NEWIMAGE]" ;; esac
+  new="${2:-${CLAYFS_IMAGE%.sparsebundle}.new.sparsebundle}"
+  need_up
+  [ -e "$new" ] && die "すでにあります: $new"
+  lock
+  size="$(hdiutil imageinfo "$CLAYFS_IMAGE" 2>/dev/null | awk '/Total Bytes/ {print $3; exit}')"
+  quiet hdiutil create -size "$(( ${size:-32212254720} / 1048576 ))m" -type SPARSEBUNDLE -fs APFS -volname "$(basename "$CLAYFS_DIR")" "$new" || die "作成に失敗: $new"
+  tmp="$(mktemp -d "$HOME/.clayfs-rebuild.XXXXXX")" || die "作業用の場所を作れません"
+  quiet hdiutil attach -nobrowse -owners on -mountpoint "$tmp" "$new" || { rmdir "$tmp"; die "つなげません: $new"; }
+  tool rebuild-into "$tmp" --mode "$mode"; rc=$?
+  [ -d "$tmp/store" ] && : >"$tmp/store/.metadata_never_index"
+  quiet hdiutil detach "$tmp" || echo "警告: 外せませんでした: $tmp" >&2
+  rmdir "$tmp" 2>/dev/null
+  [ $rc = 0 ] || die "入れ直しに失敗 (作りかけ: $new)"
+  echo "できました: $new ($(du -sh "$new" | cut -f1 | tr -d ' '))"
+}
+
 cmd_restore() {
   [ $# -ge 1 ] || die "使い方: clayfsctl restore [--source コミット] PATH... (全体を戻すなら --all)"
   need_up
@@ -296,6 +317,7 @@ case "$cmd" in
   gc) cmd_gc "$@" ;;
   dedup) cmd_dedup "$@" ;;
   scrub) cmd_scrub ;;
+  rebuild) cmd_rebuild "$@" ;;
   compact) cmd_compact ;;
   info) cmd_info ;;
   run) cmd_run ;;
