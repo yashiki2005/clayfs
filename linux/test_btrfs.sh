@@ -139,6 +139,21 @@ chk "リンク越しに中身が見える" '[ "$(cat $A_SRC/x/k.txt)" = keep ] &
 chk "adopt の後の最初のコミットがある" '$T $A log | grep -q initial'
 rm -f $A_SRC; rm -rf $A_SRC.orig $A_SRC; umount $A 2>/dev/null
 
+echo "[migrate: 普通のフォルダから移す]"
+G=/mnt/mg
+rm -f /tmp/mg.img; truncate -s 1G /tmp/mg.img; mkfs.btrfs -q -f /tmp/mg.img >/dev/null 2>&1
+mkdir -p $G; mount -o loop /tmp/mg.img $G; $T $G init >/dev/null
+MS=/tmp/mgsrc; rm -rf $MS; mkdir -p $MS/Documents/a/b $MS/empty; echo one > $MS/Documents/a/f.txt; echo two > $MS/Documents/a/b/g.txt
+chmod 640 $MS/Documents/a/f.txt; touch -d '2020-01-02 03:04:05' $MS/Documents/a/f.txt
+out=$(sh /w/migrate_from_dir.sh $MS $G $T 2>&1); echo "$out" | sed 's/^/    /' | tail -2
+chk "移行が成功する" 'echo "$out" | grep -q "完了"'
+chk "中身が同じ" 'diff -r $MS/Documents $G/work/Documents >/dev/null'
+chk "権限と時刻が保たれる" '[ "$(stat -c %a $G/work/Documents/a/f.txt)" = 640 ] && [ "$(stat -c %Y $G/work/Documents/a/f.txt)" = "$(stat -c %Y $MS/Documents/a/f.txt)" ]'
+chk "空のディレクトリも移る" '[ -d $G/work/empty ]'
+chk "移行が最初のコミットになる" '$T $G log | grep -q "移行"'
+chk "元は残る" '[ -f $MS/Documents/a/f.txt ]'
+umount $G 2>/dev/null
+
 echo "結果: $pass passed, $fail failed"
 umount $M 2>/dev/null
 [ "$fail" = 0 ]
