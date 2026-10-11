@@ -24,6 +24,7 @@
   clayfs_btrfs MNT run                  変更があればコミットする (自動実行用)
   clayfs_btrfs MNT adopt SRC            普通のフォルダ SRC を work/ へ移し、SRC を work/ へのリンクにする (SRC は SRC.orig に残す)
   clayfs_btrfs MNT rebuild DEST         履歴を、別の btrfs (DEST) へ send | receive で移す
+  clayfs_btrfs create [SIZE] [--image P] [--mnt D] [--dry-run]   イメージを作り、フォーマットし、マウントし、init する (既定 20G、/var/lib/clayfs/clayfs.img、/srv/clayfs)
 """
 import argparse
 import fcntl
@@ -648,7 +649,55 @@ def cmd_dedup(vol, a):
         os.close(fd)
 
 
+def cmd_create(argv):
+    """イメージ (スパース) を作り、btrfs にフォーマットして、マウントし、init まで行う (cfsctl create に当たる)。
+    使い方: clayfs_btrfs create [SIZE] [--image PATH] [--mnt DIR] [--dry-run]
+    既定: SIZE 20G、イメージ /var/lib/clayfs/clayfs.img、マウント先 /srv/clayfs。root が要る (--dry-run を除く)。"""
+    ap = argparse.ArgumentParser(prog='clayfs_btrfs create')
+    ap.add_argument('size', nargs='?', default='20G', help='イメージの大きさ (使った分だけ大きくなる。既定 20G)')
+    ap.add_argument('--image', default='/var/lib/clayfs/clayfs.img')
+    ap.add_argument('--mnt', default='/srv/clayfs')
+    ap.add_argument('--dry-run', action='store_true', help='実行するコマンドを表示するだけ')
+    a = ap.parse_args(argv)
+    img, mnt = os.path.abspath(a.image), os.path.abspath(a.mnt)
+    steps = [
+        ['truncate', '-s', a.size, img],
+        ['mkfs.btrfs', '-q', '-f', '-L', 'CLAYFS', img],
+        ['mkdir', '-p', mnt],
+        ['mount', '-o', 'loop,compress-force=zstd:3', img, mnt],
+    ]
+    if a.dry_run:
+        print(f'作る予定: {img} ({a.size}、btrfs)、マウント先 {mnt}')
+        for st in steps:
+            print('+ ' + ' '.join(st))
+        print(f'+ clayfs_btrfs {mnt} init')
+        return
+    if os.geteuid() != 0:
+        die('root で実行してください (フォーマットとマウントのため)')
+    if os.path.exists(img):
+        die(f'すでにあります: {img}')
+    if os.path.isdir(mnt) and os.listdir(mnt):
+        die(f'マウント先が空ではありません: {mnt}')
+    os.makedirs(os.path.dirname(img), exist_ok=True)
+    try:
+        for st in steps:
+            run(st)
+    except SystemExit:
+        # 作りかけを残さない (マウントできていれば外す)
+        subprocess.run(['umount', mnt], capture_output=True)
+        if os.path.exists(img):
+            os.unlink(img)
+        raise
+    vol = Vol(mnt)
+    cmd_init(vol, None)
+    print(f'作りました: {img} (btrfs、{a.size} まで)、マウント: {mnt}')
+    print('次: sudo ./install.sh ' + mnt + ' を実行すると、自動実行が入ります')
+    print(f'注意: 再起動すると外れます (fstab は後で決める)。行の例: {img} {mnt} btrfs loop,compress-force=zstd:3,nofail 0 0')
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'create':
+        return cmd_create(sys.argv[2:])
     ap = argparse.ArgumentParser(prog='clayfs_btrfs', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('mnt', help='btrfs のマウント先')
     sub = ap.add_subparsers(dest='cmd', required=True)

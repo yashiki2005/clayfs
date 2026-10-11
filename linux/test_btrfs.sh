@@ -154,6 +154,19 @@ chk "移行が最初のコミットになる" '$T $G log | grep -q "移行"'
 chk "元は残る" '[ -f $MS/Documents/a/f.txt ]'
 umount $G 2>/dev/null
 
+echo "[create: イメージを作って、フォーマットし、マウントし、init まで]"
+CR=/mnt/cr; CRI=/tmp/cr-test.img
+rm -f $CRI; umount $CR 2>/dev/null; rm -rf $CR
+chk "dry-run は何も作らない" '$T create 1G --image $CRI --mnt $CR --dry-run >/dev/null && [ ! -e $CRI ]'
+$T create 1G --image $CRI --mnt $CR >/dev/null 2>&1
+chk "create が、イメージとマウントと work/ を作る" '[ -f $CRI ] && mountpoint -q $CR && btrfs subvolume show $CR/work >/dev/null 2>&1'
+chk "create は btrfs の圧縮オプションでマウントする" 'mount | grep " $CR " | grep -q compress-force'
+out=$($T create 1G --image $CRI --mnt $CR 2>&1); chk "既存のイメージは作り直さない" 'echo "$out" | grep -q "すでにあります"'
+umount $CR; rm -f $CRI
+mkdir -p $CR; echo x > $CR/junk
+out=$($T create 1G --image $CRI --mnt $CR 2>&1); chk "空でないマウント先は使わない" 'echo "$out" | grep -q "空ではありません" && [ ! -e $CRI ]'
+rm -rf $CR
+
 echo "結果: $pass passed, $fail failed"
 umount $M 2>/dev/null
 [ "$fail" = 0 ]

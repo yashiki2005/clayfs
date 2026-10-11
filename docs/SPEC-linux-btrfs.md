@@ -51,7 +51,7 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 
 ## 実装の状況
 
-実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 48 件合格）。
+実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 53 件合格）。
 
 - 済み: init / commit / status / show / log / restore / gc / scrub / dedup / compress / keep / unkeep / run / adopt / rebuild
 - 自動実行: `linux/systemd/`（毎時の `run`、毎日の `gc`、毎週の `scrub`）。構文は `systemd-analyze verify` で確認。
@@ -60,6 +60,7 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 - adopt: 普通のフォルダ (例 ~/src) を work/ へ複製し、元は SRC.orig に残して、SRC を work/ へのリンクにする。
 - インストール: `linux/install.sh MNT [KEEP]`（root が要る）。`--dry-run` で、実行するコマンドだけを表示できる。
   アンインストール: `linux/uninstall.sh`（データと設定は残す）。
+- create: `clayfs_btrfs create [SIZE] [--image P] [--mnt D] [--dry-run]`（cfsctl create に当たる）。スパースのイメージを作り、btrfs にフォーマットし、`compress-force=zstd:3` でマウントして init する。既定は 20G、/var/lib/clayfs/clayfs.img、/srv/clayfs。
 - 移行: `linux/migrate_from_dir.sh SRC MNT TOOL`（普通のフォルダから work/ へ。中身とメタデータを照合してから最初のコミットにする。元は消さない）。
 - 実機: Pi で、タイマーの起動、変更の検出、初回のコミットを確認済み。
 - 未実施: 定時の実行 (01:00 など) の自動の確認、gc と scrub の定時実行の確認、Pi の再起動後のマウント (fstab)。
