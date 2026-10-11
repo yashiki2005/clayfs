@@ -3,7 +3,7 @@
 
 - 差し替え中の書き込みを失わない (replace_checked)
 - 一時ファイルは作業ツリーに残らず、途中終了の残骸は次の実行で消える
-- park / unpark の引数は、作業ツリーの中のプロジェクト名にだけ解決される
+- keep / unkeep の引数は、作業ツリーの中のパスにだけ解決される
 - 下の項目を削除しても、名前が似た別の項目の索引は消えない (LIKE の誤一致)
 """
 import importlib.machinery
@@ -83,19 +83,25 @@ def test_scratch_sweep_and_no_temp_in_work(root):
     print('  scratch: 途中終了の残骸を次の実行で消す。作業ツリーには一時ファイルを作らない')
 
 
-def test_project_name(root):
+def test_keep_path(root):
     work = os.path.join(root, 'work')
     os.makedirs(os.path.join(work, 'proj', 'sub'))
-    assert ct.project_name(work, 'proj') == 'proj'
-    assert ct.project_name(work, 'proj/sub') == 'proj'
-    assert ct.project_name(work, os.path.join(work, 'proj', 'sub')) == 'proj'
-    for bad in ['.', '..', '../outside', '/tmp']:
+    assert ct.keep_path(work, 'proj') == 'proj'
+    assert ct.keep_path(work, 'proj/sub') == os.path.join('proj', 'sub')
+    assert ct.keep_path(work, os.path.join(work, 'proj', 'sub')) == os.path.join('proj', 'sub')
+    assert ct.keep_path(work, '.') == '.', 'the whole tree is a valid keep path'
+    for bad in ['..', '../outside', '/tmp']:
         try:
-            ct.project_name(work, bad)
+            ct.keep_path(work, bad)
         except SystemExit:
             continue
         raise AssertionError(f'{bad!r} should be refused')
-    print('  project_name: 作業ツリー内のプロジェクト名だけを受け付ける (絶対パスは先頭だけを取らない)')
+    # 接頭辞の判定: 'proj' は 'proj/...' を含むが、'projX' は含まない
+    keeps = {'proj'}
+    assert ct.kept(os.path.join('proj', 'a.txt'), keeps)
+    assert not ct.kept('projX/a.txt', keeps)
+    assert ct.kept('anything', {'.'})
+    print('  keep_path: 作業ツリー内のパスだけを受け付け、接頭辞はパスの単位で一致する')
 
 
 def test_like_delete_is_exact(root):
@@ -156,7 +162,7 @@ def main():
     os.makedirs(root)
     try:
         for name in ['test_replace_checked_success', 'test_replace_checked_keeps_concurrent_write',
-                     'test_scratch_sweep_and_no_temp_in_work', 'test_project_name', 'test_like_delete_is_exact',
+                     'test_scratch_sweep_and_no_temp_in_work', 'test_keep_path', 'test_like_delete_is_exact',
                      'test_pycache_is_pruned']:
             case = os.path.join(root, name)
             os.makedirs(case)

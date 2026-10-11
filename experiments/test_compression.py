@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""APFS 透過圧縮、park / unpark、compress の動作検証テスト。"""
+"""APFS 透過圧縮、keep / unkeep、compress の動作検証テスト。"""
 import argparse
 import os
 import shutil
@@ -135,31 +135,41 @@ def main():
         assert st_new.st_flags & UF_COMPRESSED, "recent.txt should be compressed after explicit path compress"
         print("   recent.txt 明示指定圧縮成功")
 
-        # --- テスト 4: park (proj_park) ---
-        print("-> テスト 4: park proj_park")
-        r = run_tool(store, work, "park", "proj_park")
-        assert r.returncode == 0, f"park failed: {r.stderr}"
+        # --- テスト 4: keep (proj_park) ---
+        print("-> テスト 4: keep proj_park")
+        r = run_tool(store, work, "keep", "proj_park")
+        assert r.returncode == 0, f"keep failed: {r.stderr}"
         print("   output:", r.stdout.strip())
         st_park = os.lstat(park_txt)
-        assert st_park.st_flags & UF_COMPRESSED, "park_txt should be compressed when project is parked"
+        assert st_park.st_flags & UF_COMPRESSED, "parked_data.txt should be compressed when its path is kept"
 
-        # park 一覧確認
-        r = run_tool(store, work, "park")
-        assert "proj_park" in r.stdout, f"parked list should contain proj_park: {r.stdout}"
+        # 一覧確認
+        r = run_tool(store, work, "keep")
+        assert "proj_park" in r.stdout, f"keep list should contain proj_park: {r.stdout}"
 
-        # --- テスト 5: unpark (proj_park) ---
-        print("-> テスト 5: unpark proj_park")
-        r = run_tool(store, work, "unpark", "proj_park")
-        assert r.returncode == 0, f"unpark failed: {r.stderr}"
+        # 圧縮を保つ対象は、7 日未満でも compress で再圧縮される (書き換えで戻ったものを含む)
+        extra = "one more line\n"
+        with open(park_txt, "a") as f:
+            f.write(extra)
+        assert not (os.lstat(park_txt).st_flags & UF_COMPRESSED), "a write should drop compression"
+        r = run_tool(store, work, "compress")
+        assert r.returncode == 0, f"compress failed: {r.stderr}"
+        assert os.lstat(park_txt).st_flags & UF_COMPRESSED, "kept path should be recompressed without age check"
+
+        # --- テスト 5: unkeep (proj_park) ---
+        print("-> テスト 5: unkeep proj_park")
+        r = run_tool(store, work, "unkeep", "proj_park")
+        assert r.returncode == 0, f"unkeep failed: {r.stderr}"
         print("   output:", r.stdout.strip())
         st_unpark = os.lstat(park_txt)
-        assert not (st_unpark.st_flags & UF_COMPRESSED), "park_txt should NOT be compressed after unpark"
-        print("   unpark 成功: 非圧縮状態に正常復帰")
+        assert not (st_unpark.st_flags & UF_COMPRESSED), "parked_data.txt should NOT be compressed after unkeep"
+        print("   unkeep 成功: 非圧縮状態に正常復帰")
 
-        # 内容が破損していないことを確認
+        # 内容が破損していないことを確認 (追記した行を含む)
         with open(park_txt, "r") as f:
             c = f.read()
-        assert len(c) == len("Parked compressible text data repeated.\n" * 2000)
+        assert len(c) == len("Parked compressible text data repeated.\n" * 2000) + len(extra)
+        assert c.endswith(extra)
 
         # scrub で全ハッシュ照合
         print("-> テスト 6: scrub による整合性検証")

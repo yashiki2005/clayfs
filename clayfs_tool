@@ -19,9 +19,9 @@
   clayfs_tool -s STORE -C DIR dedup [--dry-run]      中身が同じファイルをクローンにまとめる
   clayfs_tool -s STORE -C DIR scrub                  記録したハッシュと中身を照合する (壊れていれば終了コード 1)
   clayfs_tool -s STORE -C DIR compress [--dry-run] [PATH...]
-                                                     7 日以上更新のないファイルと、畳んだプロジェクトを透過圧縮する
-  clayfs_tool -s STORE -C DIR park [PROJECT...]      プロジェクトを畳んで圧縮する (引数なしは一覧)
-  clayfs_tool -s STORE -C DIR unpark PROJECT...      畳んだ印を外し、非圧縮に戻す
+                                                     7 日以上更新のないファイルと、圧縮を保つパスを透過圧縮する
+  clayfs_tool -s STORE -C DIR keep [PATH...]         パスを圧縮を保つ対象にして圧縮する (引数なしは一覧)
+  clayfs_tool -s STORE -C DIR unkeep PATH...         対象から外し、残りの対象に含まれないものを非圧縮に戻す
   clayfs_tool -s STORE -C DIR rebuild-into NEWROOT --mode fresh|replay
                                                      マウント済みの新しいボリューム NEWROOT に、圧縮して入れ直す
 コミットは HEAD、または名前の一部 (一意に決まる範囲) で指定できる。
@@ -859,14 +859,14 @@ def replace_checked(path, tmp, s, scratch):
     return True
 
 
-def project_name(d, arg):
-    """引数を、作業ツリー直下のプロジェクト名にする。作業ツリーの外や、作業ツリー自身は受け付けない。"""
+def keep_path(d, arg):
+    """引数を、作業ツリーの中の相対パスにする。作業ツリーの外は受け付けない。'.' は作業ツリー全体。"""
     base = os.path.realpath(d)
     full = os.path.realpath(arg if os.path.isabs(arg) else os.path.join(base, arg))
     rel = os.path.relpath(full, base)
-    if rel == os.curdir or rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
-        die(f'作業ツリーの中のプロジェクトを指定してください: {arg}')
-    return rel.split(os.sep)[0]
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        die(f'作業ツリーの中のパスを指定してください: {arg}')
+    return rel
 
 
 _seq = 0
@@ -1023,7 +1023,7 @@ def ditto(src, dst):
     return r.returncode == 0
 
 
-# ---------- APFS 透過圧縮、プロジェクトの退避 (park) ----------
+# ---------- APFS 透過圧縮、圧縮を保つパス (keep) ----------
 
 # 既に圧縮されている形式 (圧縮しても縮まない)
 ALREADY_COMPRESSED_EXTS = {
@@ -1060,27 +1060,34 @@ def open_files_on_volume(st):
     return set()
 
 
-def parked_file(st):
-    return os.path.join(st.root, 'parked.json')
+def keep_file(st):
+    return os.path.join(st.root, 'keep.json')
 
 
-def load_parked(st):
-    p = parked_file(st)
-    if os.path.exists(p):
-        try:
-            with open(p, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return set(data)
-        except Exception:
-            pass
-    return set()
+def load_keep(st):
+    """圧縮を保つパス (作業ツリーからの相対パス) の集合。古い parked.json があれば、一度だけ移す。"""
+    p = keep_file(st)
+    if not os.path.exists(p):
+        old = os.path.join(st.root, 'parked.json')
+        if os.path.exists(old):
+            with open(old, 'r', encoding='utf-8') as f:
+                keeps = set(json.load(f))
+            save_keep(st, keeps)
+            os.remove(old)
+            return keeps
+        return set()
+    with open(p, 'r', encoding='utf-8') as f:
+        return set(json.load(f))
 
 
-def save_parked(st, parked_set):
-    p = parked_file(st)
-    with open(p, 'w', encoding='utf-8') as f:
-        json.dump(sorted(list(parked_set)), f, ensure_ascii=False, indent=2)
+def save_keep(st, keeps):
+    with open(keep_file(st), 'w', encoding='utf-8') as f:
+        json.dump(sorted(keeps), f, ensure_ascii=False, indent=2)
+
+
+def kept(rel, keeps):
+    """rel が、圧縮を保つパスの中か。'.' は作業ツリー全体を表す。"""
+    return any(k == '.' or rel == k or rel.startswith(k + os.sep) for k in keeps)
 
 
 _comp_seq = 0
@@ -1193,7 +1200,7 @@ def cmd_compress(st, a):
         refresh_index(st, db)
     now = time.time()
     seven_days_ago = now - 7 * 86400
-    parked = load_parked(st)
+    keeps = load_keep(st)
     open_files = open_files_on_volume(st)
     last_open = time.time()
 
@@ -1249,11 +1256,8 @@ def cmd_compress(st, a):
             skipped += 1
             continue
 
-        top = rel.split(os.sep)[0]
-        is_parked = top in parked
-
-        # 畳んだプロジェクトでなく、明示指定でもなければ 7 日以上前のものに限定
-        if not force_all_age and not is_parked:
+        # 圧縮を保つパスの中でなく、明示指定でもなければ 7 日以上前のものに限定
+        if not force_all_age and not kept(rel, keeps):
             if s.st_mtime > seven_days_ago:
                 continue
 
@@ -1297,63 +1301,68 @@ def cmd_compress(st, a):
     print(f'空き容量の増加: {(free_after - free_before) / (1 << 20):.1f} MB')
 
 
-def cmd_park(st, a):
+def cmd_keep(st, a):
     d = work_dir(st)
-    parked = load_parked(st)
+    keeps = load_keep(st)
 
-    projects_arg = getattr(a, 'projects', None)
-    if not projects_arg:
-        if not parked:
-            print('畳まれているプロジェクトはありません')
+    paths_arg = getattr(a, 'paths', None)
+    if not paths_arg:
+        if not keeps:
+            print('圧縮を保つパスはありません')
         else:
-            print(f'畳まれているプロジェクト: {", ".join(sorted(parked))}')
+            print(f'圧縮を保つパス: {", ".join(sorted(keeps))}')
         return
 
-    names = []
-    for proj in projects_arg:
-        proj_name = project_name(d, proj)
-        proj_dir = os.path.join(d, proj_name)
-        if not os.path.isdir(proj_dir):
-            die(f'プロジェクトのディレクトリがありません: {proj_name}')
-        parked.add(proj_name)
-        names.append(proj_name)
-        print(f'プロジェクト『{proj_name}』を畳みました (圧縮を実行します)')
-    save_parked(st, parked)
+    rels = []
+    for p in paths_arg:
+        rel = keep_path(d, p)
+        if not os.path.exists(os.path.join(d, rel)):
+            die(f'パスがありません: {p}')
+        keeps.add(rel)
+        rels.append(rel)
+        print(f'『{rel}』を圧縮を保つ対象に加えました (圧縮を実行します)')
+    save_keep(st, keeps)
 
-    # 畳んだプロジェクトの圧縮を直ちに実行
-    cmd_compress(st, argparse.Namespace(paths=[os.path.join(d, n) for n in names], dry_run=False))
+    # 圧縮を保つパスの圧縮を直ちに実行
+    cmd_compress(st, argparse.Namespace(paths=[os.path.join(d, r) for r in rels], dry_run=False))
 
 
-def cmd_unpark(st, a):
+def cmd_unkeep(st, a):
     d = work_dir(st)
-    parked = load_parked(st)
+    keeps = load_keep(st)
     db = index_db(st)
     scratch = prepare_scratch(st, d)
 
-    for proj in a.projects:
-        proj_name = project_name(d, proj)
-        if proj_name in parked:
-            parked.remove(proj_name)
-            print(f'プロジェクト『{proj_name}』の印を外しました (非圧縮に戻します)')
+    for p in a.paths:
+        rel = keep_path(d, p)
+        if rel in keeps:
+            keeps.remove(rel)
+            print(f'『{rel}』を圧縮を保つ対象から外しました')
         else:
-            print(f'プロジェクト『{proj_name}』は畳まれていません (非圧縮に戻します)')
+            print(f'『{rel}』は圧縮を保つ対象として直接は指定されていません')
 
-        proj_dir = os.path.join(d, proj_name)
-        if not os.path.isdir(proj_dir):
-            continue
+        # 残っている対象に含まれないものだけ、非圧縮に戻す
+        target = os.path.join(d, rel)
+        if os.path.isdir(target) and not os.path.islink(target):
+            items = list(walk_files(d, sub='' if rel == '.' else rel))
+        elif os.path.isfile(target):
+            items = [(rel, os.lstat(target))]
+        else:
+            items = []
 
         uncomp_count = 0
-        for rel, s in walk_files(d, sub=proj_name):
-            if s.st_flags & UF_COMPRESSED:
-                path = os.path.join(d, rel)
-                if uncompress_file(path, rel, s, scratch):
-                    uncomp_count += 1
-                    new_s = os.lstat(path)
-                    db.execute('UPDATE files SET ino = ?, mtime_ns = ? WHERE path = ?',
-                               (new_s.st_ino, new_s.st_mtime_ns, rel))
-        print(f'  {proj_name}: {uncomp_count} ファイルを非圧縮に戻しました')
+        for r, s in items:
+            if kept(r, keeps) or not s.st_flags & UF_COMPRESSED:
+                continue
+            path = os.path.join(d, r)
+            if uncompress_file(path, r, s, scratch):
+                uncomp_count += 1
+                new_s = os.lstat(path)
+                db.execute('UPDATE files SET ino = ?, mtime_ns = ? WHERE path = ?',
+                           (new_s.st_ino, new_s.st_mtime_ns, r))
+        print(f'  {rel}: {uncomp_count} ファイルを非圧縮に戻しました')
 
-    save_parked(st, parked)
+    save_keep(st, keeps)
     db.commit()
     db.close()
 
@@ -1373,8 +1382,8 @@ def cmd_rebuild_into(st, a):
         die(f'入れ直し先が空ではありません: {new_root}')
     os.mkdir(new_work)
     nst = Store(os.path.join(new_root, 'store'))
-    if os.path.exists(parked_file(st)):
-        shutil.copy2(parked_file(st), parked_file(nst))
+    if os.path.exists(keep_file(st)):
+        shutil.copy2(keep_file(st), keep_file(nst))
     nconf = {'base': None}
     t0, c0 = time.time(), os.times()
 
@@ -1465,8 +1474,8 @@ def main():
     p = sub.add_parser('dedup'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_dedup)
     p = sub.add_parser('scrub'); p.set_defaults(fn=cmd_scrub)
     p = sub.add_parser('compress'); p.add_argument('paths', nargs='*'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_compress)
-    p = sub.add_parser('park'); p.add_argument('projects', nargs='*'); p.set_defaults(fn=cmd_park)
-    p = sub.add_parser('unpark'); p.add_argument('projects', nargs='+'); p.set_defaults(fn=cmd_unpark)
+    p = sub.add_parser('keep'); p.add_argument('paths', nargs='*'); p.set_defaults(fn=cmd_keep)
+    p = sub.add_parser('unkeep'); p.add_argument('paths', nargs='+'); p.set_defaults(fn=cmd_unkeep)
     p = sub.add_parser('rebuild-into'); p.add_argument('dest'); p.add_argument('--mode', choices=['fresh', 'replay'], required=True); p.set_defaults(fn=cmd_rebuild_into)
     p = sub.add_parser('gc'); p.add_argument('--keep', type=int, required=True); p.set_defaults(fn=cmd_gc)
 
