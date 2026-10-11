@@ -363,11 +363,13 @@ def cmd_rebuild(vol, a):
 
 def cmd_run(vol, a):
     """自動実行用 (systemd タイマー): 変更があればコミットする。無ければ何もしない。"""
-    if head(vol) is not None:
-        _, notes = current_changes(vol)
-        if not notes:
-            return
-    # 最初の実行は、最初のコミットを作る (変更の有無にかかわらず)
+    if head(vol) is None:
+        # 最初の実行は、変更の有無にかかわらず最初のコミットを作る
+        cmd_commit(vol, argparse.Namespace(name=None, message='initial', allow_empty=True))
+        return
+    _, notes = current_changes(vol)
+    if not notes:
+        return
     cmd_commit(vol, argparse.Namespace(name=None, message='auto', allow_empty=False))
 
 
