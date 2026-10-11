@@ -58,7 +58,9 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
   実際のタイマーの動作は、まだ確かめていない（コンテナでは systemd が動かないため）。
 - rebuild: 各コミットを `btrfs send -p | receive` で別の btrfs へ移す。未コミット分は rw の work/ として移す。
 - adopt: 普通のフォルダ (例 ~/src) を work/ へ複製し、元は SRC.orig に残して、SRC を work/ へのリンクにする。
-- 未実装: インストール用のスクリプト、ホストの root での実行（コンテナ外）の試験。
+- インストール: `linux/install.sh MNT [KEEP]`（root が要る）。`--dry-run` で、実行するコマンドだけを表示できる。
+  アンインストール: `linux/uninstall.sh`（データと設定は残す）。
+- 未実施: ホストの root での実行（コンテナ外）の試験。タイマーの実動作。
 
 試験で分かったこと（設計に反映済み）:
 
