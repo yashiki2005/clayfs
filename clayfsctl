@@ -25,6 +25,12 @@
 #   clayfsctl dedup [--dry-run]
 #                             中身が同じファイルをクローンにまとめる (--dry-run: 数えるだけ)
 #   clayfsctl scrub           記録したハッシュと中身を照合し、壊れたファイルを報告する
+#   clayfsctl compress [--dry-run] [PATH...]
+#                             7 日以上更新のないファイルと、畳んだプロジェクトを透過圧縮する
+#   clayfsctl park [PROJECT...]
+#                             プロジェクトを畳んで圧縮する (引数なしは一覧)
+#   clayfsctl unpark PROJECT...
+#                             畳んだ印を外し、非圧縮に戻す
 #   clayfsctl rebuild --fresh|--replay [NEWIMAGE]
 #                             新しいイメージ (既定 CLAYFS_IMAGE の隣に .new) を作り、圧縮して入れ直す。
 #                             今のイメージには触れない。--fresh は履歴なし、--replay は履歴を再現する
@@ -200,6 +206,9 @@ cmd_commit() { need_up; lock; tool commit "$@"; }
 cmd_gc() { need_up; lock; tool gc "$@"; }
 cmd_dedup() { need_up; lock; tool dedup "$@"; }
 cmd_scrub() { need_up; lock; tool scrub; }
+cmd_compress() { need_up; lock; tool compress "$@"; }
+cmd_park() { need_up; lock; tool park "$@"; }
+cmd_unpark() { need_up; lock; tool unpark "$@"; }
 
 cmd_rebuild() {
   case "${1:-}" in --fresh) mode=fresh ;; --replay) mode=replay ;; *) die "使い方: clayfsctl rebuild --fresh|--replay [NEWIMAGE]" ;; esac
@@ -242,6 +251,10 @@ cmd_info() {
   if is_mounted "$CLAYFS_MNT" && [ -f "$STORE/work.json" ]; then
     echo "HEAD     $(sed -n 's/.*"base": "\([^"]*\)".*/\1/p' "$STORE/work.json")"
     echo "コミット $(wc -l <"$STORE/log.jsonl" | tr -d ' ') 個 ($STORE)"
+    if [ -f "$STORE/parked.json" ]; then
+      _parked="$(grep -o '"[^"]*"' "$STORE/parked.json" 2>/dev/null | tr -d '"' | tr '\n' ' ')"
+      [ -n "$_parked" ] && echo "畳んだ   $_parked"
+    fi
   fi
   [ -e "$ORIG" ] && echo "退避     $ORIG ($(du -sh "$ORIG" | cut -f1 | tr -d ' ')。確かめたら消せます)"
   if [ -f "$PLIST" ]; then echo "自動実行 あり (ログ: $CLAYFS_LOG)"; else echo "自動実行 なし (clayfsctl install-agent)"; fi
@@ -317,6 +330,9 @@ case "$cmd" in
   gc) cmd_gc "$@" ;;
   dedup) cmd_dedup "$@" ;;
   scrub) cmd_scrub ;;
+  compress) cmd_compress "$@" ;;
+  park) cmd_park "$@" ;;
+  unpark) cmd_unpark "$@" ;;
   rebuild) cmd_rebuild "$@" ;;
   compact) cmd_compact ;;
   info) cmd_info ;;

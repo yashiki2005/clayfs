@@ -18,6 +18,10 @@
   clayfs_tool -s STORE -C DIR gc --keep N            新しい N 個を残して、古いコミットの中身を消す (一覧は残る)
   clayfs_tool -s STORE -C DIR dedup [--dry-run]      中身が同じファイルをクローンにまとめる
   clayfs_tool -s STORE -C DIR scrub                  記録したハッシュと中身を照合する (壊れていれば終了コード 1)
+  clayfs_tool -s STORE -C DIR compress [--dry-run] [PATH...]
+                                                     7 日以上更新のないファイルと、畳んだプロジェクトを透過圧縮する
+  clayfs_tool -s STORE -C DIR park [PROJECT...]      プロジェクトを畳んで圧縮する (引数なしは一覧)
+  clayfs_tool -s STORE -C DIR unpark PROJECT...      畳んだ印を外し、非圧縮に戻す
   clayfs_tool -s STORE -C DIR rebuild-into NEWROOT --mode fresh|replay
                                                      マウント済みの新しいボリューム NEWROOT に、圧縮して入れ直す
 コミットは HEAD、または名前の一部 (一意に決まる範囲) で指定できる。
@@ -381,7 +385,13 @@ def snapshot(st, conf, name=None):
 _libc.listxattr.restype = _libc.getxattr.restype = ctypes.c_ssize_t
 _libc.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int]
 _libc.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+_libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+_libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
 XATTR_NOFOLLOW = 1
+
+UF_COMPRESSED = 0x20
+IMMUTABLE = 0x2 | 0x20000          # UF_IMMUTABLE | SF_IMMUTABLE
+COMPRESSION_XATTRS = (b'com.apple.decmpfs', b'com.apple.ResourceFork')
 
 
 def xattrs(path):
@@ -403,6 +413,13 @@ def xattrs(path):
     return out
 
 
+def user_xattrs(path):
+    x = xattrs(path)
+    if x is None:
+        return None
+    return {k: v for k, v in x.items() if k not in COMPRESSION_XATTRS}
+
+
 def touched(a, b, old, new, since):
     """Same size and times, but changed after the commit: look at what else can differ.
 
@@ -411,8 +428,9 @@ def touched(a, b, old, new, since):
     """
     if not since or b.st_ctime <= since:
         return False
-    # UF_TRACKED (0x40) は OS が付け外しする印で、名前の差し替えで新しいファイルへ移る。変更とはみなさない
-    return (a.st_flags & ~0x40) != (b.st_flags & ~0x40) or xattrs(old) != xattrs(new)
+    # UF_TRACKED (0x40) は OS が付け外しする印。UF_COMPRESSED (0x20) も透過圧縮の印。変更とはみなさない
+    ignore_flags = 0x40 | UF_COMPRESSED
+    return (a.st_flags & ~ignore_flags) != (b.st_flags & ~ignore_flags) or user_xattrs(old) != user_xattrs(new)
 
 
 def changes(old, new, rel='', since=None):
@@ -621,13 +639,6 @@ def cmd_gc(st, a):
 # ---------- ハッシュの索引、重複排除、検査 ----------
 # STORE/index.sqlite に、作業ツリーの各ファイルの SHA-256 を持つ。
 # (サイズ, 更新時刻, inode) が記録と同じなら中身も同じとみなし、ハッシュを取り直さない。
-
-UF_COMPRESSED = 0x20
-IMMUTABLE = 0x2 | 0x20000          # UF_IMMUTABLE | SF_IMMUTABLE
-_libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
-_libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
-# 透過圧縮の実体。圧縮の有無が違うファイルの間で写すと、読めないファイルができる
-COMPRESSION_XATTRS = (b'com.apple.decmpfs', b'com.apple.ResourceFork')
 
 
 def index_db(st):
@@ -904,6 +915,336 @@ def ditto(src, dst):
     return r.returncode == 0
 
 
+# ---------- APFS 透過圧縮、プロジェクトの退避 (park) ----------
+
+# 既に圧縮されている形式 (圧縮しても縮まない)
+ALREADY_COMPRESSED_EXTS = {
+    # アーカイブ・圧縮
+    '.gz', '.tgz', '.bz2', '.tbz', '.tbz2', '.xz', '.txz', '.zst', '.zip',
+    '.7z', '.rar', '.dmg', '.sparsebundle', '.iso',
+    # 画像
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif', '.avif',
+    '.ico', '.tiff', '.tif',
+    # 動画・音声
+    '.mp4', '.m4v', '.mov', '.mkv', '.avi', '.webm', '.mp3', '.m4a',
+    '.aac', '.flac', '.ogg', '.wav',
+    # ドキュメント・パッケージ
+    '.pdf', '.docx', '.xlsx', '.pptx', '.epub', '.jar', '.war', '.aar', '.whl'
+}
+
+# データベース (頻繁に更新・ランダムアクセスされ、圧縮すると壊れる恐れがある)
+DATABASE_EXTS = {
+    '.db', '.sqlite', '.sqlite3', '.db-wal', '.db-shm',
+    '.sqlite-wal', '.sqlite-shm', '.rdb'
+}
+DATABASE_NAMES = {'index.sqlite', 'quota.db'}
+
+
+def open_files_on_volume(st):
+    """ボリューム上で開かれているファイルの実体パスの集合を返す。"""
+    mnt = os.path.dirname(st.root)
+    try:
+        r = subprocess.run(['lsof', '-Fn', mnt], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return {os.path.realpath(line[1:]) for line in r.stdout.splitlines() if line.startswith('n/')}
+    except Exception:
+        pass
+    return set()
+
+
+def parked_file(st):
+    return os.path.join(st.root, 'parked.json')
+
+
+def load_parked(st):
+    p = parked_file(st)
+    if os.path.exists(p):
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return set(data)
+        except Exception:
+            pass
+    return set()
+
+
+def save_parked(st, parked_set):
+    p = parked_file(st)
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(sorted(list(parked_set)), f, ensure_ascii=False, indent=2)
+
+
+_comp_seq = 0
+
+
+def compress_file(st, path, rel, s):
+    """path を透過圧縮で置き換える。
+    返り値: (成功したか, 削減ブロック数, コミット付け替え数)
+    """
+    global _comp_seq
+    _comp_seq += 1
+
+    # 1. 圧縮前の SHA-256 を計算
+    try:
+        h0 = hashlib.sha256()
+        with open(path, 'rb') as f:
+            while True:
+                buf = f.read(1 << 20)
+                if not buf:
+                    break
+                h0.update(buf)
+        orig_sha = h0.hexdigest()
+    except OSError:
+        return False, 0, 0
+
+    # 2. 一時ファイルへ ditto --hfsCompression --noclone で圧縮
+    tmp = os.path.join(os.path.dirname(path), f'.clayfs-comp.{os.getpid()}.{_comp_seq}')
+    try:
+        r = subprocess.run(['ditto', '--hfsCompression', '--noclone', path, tmp], capture_output=True)
+        if r.returncode != 0:
+            return False, 0, 0
+
+        st_tmp = os.lstat(tmp)
+        # 圧縮の印が付いていない、またはブロック数が減っていない場合は縮まないのでやめる
+        if not (st_tmp.st_flags & UF_COMPRESSED) or st_tmp.st_blocks >= s.st_blocks:
+            return False, 0, 0
+
+        # 3. 読み戻してハッシュが一致することを確かめる
+        h1 = hashlib.sha256()
+        with open(tmp, 'rb') as f:
+            while True:
+                buf = f.read(1 << 20)
+                if not buf:
+                    break
+                h1.update(buf)
+        if h1.hexdigest() != orig_sha:
+            print(f'警告: 圧縮後のハッシュが一致しません: {rel}', file=sys.stderr)
+            return False, 0, 0
+
+        # 4. 圧縮中に元のファイルが変更されていないか確認
+        s_now = os.lstat(path)
+        if (s_now.st_size, s_now.st_mtime_ns) != (s.st_size, s.st_mtime_ns):
+            return False, 0, 0
+
+        # 5. 属性を元ファイルから tmp へ移す (copy_identity は UF_COMPRESSED を保持する)
+        copy_identity(s, path, tmp)
+
+        # 6. 元のファイルと原子的に差し替える
+        os.rename(tmp, path)
+    except OSError:
+        return False, 0, 0
+    finally:
+        if os.path.lexists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    # 7. コミットの中の同一ファイルも付け替える (クローンで共有され容量が空く)
+    in_layers = relink_in_layers(st, path, rel, s.st_size, s.st_mtime_ns)
+    saved_blocks = s.st_blocks - os.lstat(path).st_blocks
+    return True, max(0, saved_blocks), in_layers
+
+
+_uncomp_seq = 0
+
+
+def uncompress_file(path, rel, s):
+    """圧縮された path を非圧縮に戻す。"""
+    global _uncomp_seq
+    _uncomp_seq += 1
+
+    if not (s.st_flags & UF_COMPRESSED):
+        return False
+
+    tmp = os.path.join(os.path.dirname(path), f'.clayfs-uncomp.{os.getpid()}.{_uncomp_seq}')
+    try:
+        with open(path, 'rb') as f_in, open(tmp, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+        # 属性を写すが UF_COMPRESSED は除外する (copy_identity は dst が UF_COMPRESSED でなければ落とす)
+        copy_identity(s, path, tmp)
+        os.rename(tmp, path)
+        return True
+    except OSError:
+        return False
+    finally:
+        if os.path.lexists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def cmd_compress(st, a):
+    d = work_dir(st)
+    db = index_db(st)
+    hashed, gone, bad = refresh_index(st, db)
+    now = time.time()
+    seven_days_ago = now - 7 * 86400
+    parked = load_parked(st)
+    open_files = open_files_on_volume(st)
+
+    free_before = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
+
+    # 対象ファイルの決定
+    paths_arg = getattr(a, 'paths', None)
+    force_all_age = bool(paths_arg)
+    candidates = []
+
+    if paths_arg:
+        for p in paths_arg:
+            if os.path.isabs(p):
+                full = os.path.realpath(p)
+            else:
+                full = os.path.realpath(p)
+                if not (full.startswith(d + os.sep) or full == d):
+                    full = os.path.realpath(os.path.join(d, p))
+            if not full.startswith(d + os.sep) and full != d:
+                die(f'{d} の外のパスは指定できません: {p}')
+            rel_base = os.path.relpath(full, d)
+            if os.path.isfile(full) and not os.path.islink(full):
+                candidates.append((rel_base, os.lstat(full)))
+            elif os.path.isdir(full):
+                for r, s in walk_files(d, sub=rel_base if rel_base != '.' else ''):
+                    candidates.append((r, s))
+    else:
+        for r, s in walk_files(d):
+            candidates.append((r, s))
+
+    count = 0
+    saved_bytes = 0
+    in_layers_total = 0
+    skipped = 0
+    dry_run = getattr(a, 'dry_run', False)
+
+    for rel, s in candidates:
+        # 既に圧縮済み
+        if s.st_flags & UF_COMPRESSED:
+            continue
+        # 変更禁止
+        if s.st_flags & IMMUTABLE:
+            skipped += 1
+            continue
+        # 1 ブロック (4KiB) に収まる小さいファイルは除外
+        if s.st_size <= 4096:
+            continue
+        # ハードリンク
+        if s.st_nlink > 1:
+            skipped += 1
+            continue
+
+        top = rel.split(os.sep)[0]
+        is_parked = top in parked
+
+        # 畳んだプロジェクトでなく、明示指定でもなければ 7 日以上前のものに限定
+        if not force_all_age and not is_parked:
+            if s.st_mtime > seven_days_ago:
+                continue
+
+        # 拡張子・ファイル名チェック
+        ext = os.path.splitext(rel)[1].lower()
+        if ext in ALREADY_COMPRESSED_EXTS:
+            continue
+        if ext in DATABASE_EXTS or os.path.basename(rel) in DATABASE_NAMES:
+            continue
+
+        path = os.path.join(d, rel)
+        if os.path.realpath(path) in open_files:
+            skipped += 1
+            continue
+
+        if dry_run:
+            count += 1
+            continue
+
+        ok, saved_blocks, in_layers = compress_file(st, path, rel, s)
+        if ok:
+            count += 1
+            saved_bytes += saved_blocks * 512
+            in_layers_total += in_layers
+            new_s = os.lstat(path)
+            db.execute('UPDATE files SET ino = ?, mtime_ns = ? WHERE path = ?',
+                       (new_s.st_ino, new_s.st_mtime_ns, rel))
+        else:
+            skipped += 1
+
+    db.commit()
+    db.close()
+    if dry_run:
+        print(f'圧縮対象: {count} ファイル (飛ばす予定 {skipped})')
+        return
+
+    free_after = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
+    print(f'透過圧縮: {count} ファイル、削減 {saved_bytes / (1 << 20):.1f} MB (飛ばした {skipped})')
+    if in_layers_total:
+        print(f'コミットの中で付け替えたファイル: {in_layers_total}')
+    print(f'空き容量の増加: {(free_after - free_before) / (1 << 20):.1f} MB')
+
+
+def cmd_park(st, a):
+    d = work_dir(st)
+    parked = load_parked(st)
+
+    projects_arg = getattr(a, 'projects', None)
+    if not projects_arg:
+        if not parked:
+            print('畳まれているプロジェクトはありません')
+        else:
+            print(f'畳まれているプロジェクト: {", ".join(sorted(parked))}')
+        return
+
+    for proj in projects_arg:
+        proj_name = os.path.normpath(proj).strip(os.sep)
+        if os.sep in proj_name:
+            proj_name = proj_name.split(os.sep)[0]
+        proj_dir = os.path.join(d, proj_name)
+        if not os.path.isdir(proj_dir):
+            die(f'プロジェクトのディレクトリがありません: {proj_name}')
+        parked.add(proj_name)
+        print(f'プロジェクト『{proj_name}』を畳みました (圧縮を実行します)')
+    save_parked(st, parked)
+
+    # 畳んだプロジェクトの圧縮を直ちに実行
+    cmd_compress(st, argparse.Namespace(paths=[os.path.join(d, p) for p in projects_arg], dry_run=False))
+
+
+def cmd_unpark(st, a):
+    d = work_dir(st)
+    parked = load_parked(st)
+    db = index_db(st)
+
+    for proj in a.projects:
+        proj_name = os.path.normpath(proj).strip(os.sep)
+        if os.sep in proj_name:
+            proj_name = proj_name.split(os.sep)[0]
+        if proj_name in parked:
+            parked.remove(proj_name)
+            print(f'プロジェクト『{proj_name}』の印を外しました (非圧縮に戻します)')
+        else:
+            print(f'プロジェクト『{proj_name}』は畳まれていません (非圧縮に戻します)')
+
+        proj_dir = os.path.join(d, proj_name)
+        if not os.path.isdir(proj_dir):
+            continue
+
+        uncomp_count = 0
+        for rel, s in walk_files(d, sub=proj_name):
+            if s.st_flags & UF_COMPRESSED:
+                path = os.path.join(d, rel)
+                if uncompress_file(path, rel, s):
+                    uncomp_count += 1
+                    new_s = os.lstat(path)
+                    db.execute('UPDATE files SET ino = ?, mtime_ns = ? WHERE path = ?',
+                               (new_s.st_ino, new_s.st_mtime_ns, rel))
+        print(f'  {proj_name}: {uncomp_count} ファイルを非圧縮に戻しました')
+
+    save_parked(st, parked)
+    db.commit()
+    db.close()
+
+
 def cmd_rebuild_into(st, a):
     """新しいボリュームに work/ と store/ を作り直す。元の側は読むだけで、書き換えない。
 
@@ -919,6 +1260,8 @@ def cmd_rebuild_into(st, a):
         die(f'入れ直し先が空ではありません: {new_root}')
     os.mkdir(new_work)
     nst = Store(os.path.join(new_root, 'store'))
+    if os.path.exists(parked_file(st)):
+        shutil.copy2(parked_file(st), parked_file(nst))
     nconf = {'base': None}
     t0, c0 = time.time(), os.times()
 
@@ -1008,6 +1351,9 @@ def main():
     p = sub.add_parser('show'); p.add_argument('gen', nargs='?'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('dedup'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_dedup)
     p = sub.add_parser('scrub'); p.set_defaults(fn=cmd_scrub)
+    p = sub.add_parser('compress'); p.add_argument('paths', nargs='*'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_compress)
+    p = sub.add_parser('park'); p.add_argument('projects', nargs='*'); p.set_defaults(fn=cmd_park)
+    p = sub.add_parser('unpark'); p.add_argument('projects', nargs='+'); p.set_defaults(fn=cmd_unpark)
     p = sub.add_parser('rebuild-into'); p.add_argument('dest'); p.add_argument('--mode', choices=['fresh', 'replay'], required=True); p.set_defaults(fn=cmd_rebuild_into)
     p = sub.add_parser('gc'); p.add_argument('--keep', type=int, required=True); p.set_defaults(fn=cmd_gc)
 
