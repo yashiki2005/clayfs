@@ -51,7 +51,7 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 
 ## 実装の状況
 
-実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 67 件合格）。
+実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 69 件合格）。
 
 - 済み: init / commit / status / show / log / restore / gc / scrub / dedup / compress / keep / unkeep / run / adopt / rebuild
 - 自動実行: `linux/systemd/`（毎時の `run`、毎日の `gc`、毎週の `scrub`）。構文は `systemd-analyze verify` で確認。
@@ -66,6 +66,7 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 - info: どこに書けばよいか（書く場所 = work/）、履歴の場所、自動実行の状態を表示する。
 - 移行: `linux/migrate_from_dir.sh SRC MNT TOOL`（普通のフォルダから work/ へ。中身とメタデータを照合してから最初のコミットにする。元は消さない）。
 - 実機: Pi で、タイマーの起動、変更の検出、初回のコミットを確認済み。
+- 変更の検出: send --dump の名前は、空白とバックスラッシュが \ でエスケープされている。名前の変更は link と unlink の組で出るので、link を新しい名前の追加として扱う。
 - 変更の検出: スナップショットの前に sync する。時刻だけの変化（atime など、読むだけでも起きる）は変更にしない（mtime が変わったものだけ）。書き出しの時期のずれや同じ中身の書き直しは、extent が付け替わるが、中身（大きさと sha256）が同じなら変更にしない。
 - 未実施: 定時の実行 (01:00 など) の自動の確認、gc と scrub の定時実行の確認、Pi の再起動後のマウント (fstab)。
 

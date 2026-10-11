@@ -42,6 +42,13 @@ chk "同じ中身に書き直したものは変更にならない" '! $T $M stat
 printf 'X' | dd of=$M/work/same.bin bs=1 seek=100 conv=notrunc 2>/dev/null; sync
 chk "中身を変えたものは変更になる" '$T $M status -s | grep -q "^M same.bin"'
 $T $M commit -m base5 >/dev/null 2>&1
+cd $M/work; mkdir -p "odd d"; echo a > "odd d/x y.sql"; echo b > "a  b.txt"; echo k > oldname.txt
+$T $M commit -m odd >/dev/null 2>&1
+echo more > "odd d/x y.sql"; mv oldname.txt "new name.txt"; echo z > "a  b.txt"; sync; sleep 1
+st=$($T $M status -s); cd /
+chk "空白を含む名前の変更を、正しい名前で出す (M)" 'echo "$st" | grep -Fx "M odd d/x y.sql" >/dev/null && echo "$st" | grep -Fx "M a  b.txt" >/dev/null'
+chk "名前の変更 (link と unlink) を、新しい名前の追加と、古い名前の削除で出す" 'echo "$st" | grep -Fx "A new name.txt" >/dev/null && echo "$st" | grep -Fx "D oldname.txt" >/dev/null'
+$T $M commit -m odd2 >/dev/null 2>&1
 
 echo "[restore]"
 G1=$($T $M log | head -1 | cut -d" " -f1)

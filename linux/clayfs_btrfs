@@ -129,10 +129,22 @@ def set_head(vol, name):
     atomic_write(os.path.join(vol.store, 'work.json'), json.dumps({'base': name}))
 
 
+PATH_TOKEN = r'((?:\\.|[^\s\\])+)'      # 空白とバックスラッシュは \ でエスケープされている
+
+
+def unescape(p):
+    return re.sub(r'\\(.)', r'\1', p)
+
+
+def dump_path(tok):
+    """send --dump の path (./SNAP/...) から、スナップショットの中の相対パスを得る。"""
+    return PATH_PREFIX.sub('', unescape(tok)).rstrip('/')
+
+
 def parse_dump(text, mtime_changed=lambda rel: True, content_changed=lambda rel: True):
     """btrfs receive --dump の出力を、(A/M/D, 相対パス) の一覧にする。
-    新しいファイルは mkfile/mkdir の後の rename で名前が付くので、rename の宛先を A とみなす。"""
-    state = {}   # path -> 'A' | 'M' | 'D' | 'AD'
+    新しいファイルは mkfile/mkdir の後の rename (または link) で名前が付く。名前の変更は link と unlink の組。"""
+    state = {}   # path -> 'A' | 'M' | 'D'
 
     def mark(p, k):
         cur = state.get(p)
@@ -150,34 +162,40 @@ def parse_dump(text, mtime_changed=lambda rel: True, content_changed=lambda rel:
     for line in text.splitlines():
         if not line or line.startswith(('At ', 'snapshot', 'subvol')):
             continue
-        parts = line.split()
-        op = parts[0]
-        if op in ('unlink', 'rmdir') and len(parts) >= 2:
-            mark(PATH_PREFIX.sub('', parts[1]).rstrip('/'), 'D')
-        elif op == 'rename' and len(parts) >= 3:
-            dest = next((x[5:] for x in parts if x.startswith('dest=')), None)
-            if dest:
-                mark(PATH_PREFIX.sub('', dest).rstrip('/'), 'A')
-        elif op in ('update_extent', 'write', 'truncate') and len(parts) >= 2:
+        m = re.match(r'^(\S+)\s+' + PATH_TOKEN + r'(.*)$', line)
+        if not m:
+            continue
+        op, tok, rest = m.group(1), m.group(2), m.group(3)
+        p = dump_path(tok)
+        # 一時名 (oNNN-G-0) は、mkfile/mkdir で作られ、rename で名前が付く。rename の移動元は、一時名のままでよい
+        if not p or p == '.' or p.startswith(TMP_DIR):
+            continue
+        if op != 'rename' and re.search(r'(^|/)o\d+-\d+-\d+$', p):
+            continue
+        if op in ('unlink', 'rmdir'):
+            mark(p, 'D')
+        elif op in ('rename', 'link'):
+            # rename: path が移動元 (一時名)、dest が宛先。link: path が新しい名前、dest が元
+            d = re.search(r'dest=' + PATH_TOKEN, rest)
+            if op == 'link':
+                mark(p, 'A')
+            elif d:
+                dest = dump_path(d.group(1))
+                if dest and not dest.startswith(TMP_DIR):
+                    mark(dest, 'A')
+        elif op == 'symlink':
+            mark(p, 'A')
+        elif op == 'update_extent' or op == 'write' or op == 'truncate':
             # 同じ中身の書き直し、書き出しの時期のずれでも、extent は付け替わる。中身が本当に変わったものだけ数える
-            p = PATH_PREFIX.sub('', parts[1]).rstrip('/')
-            if p and p != '.' and not p.startswith(TMP_DIR) and content_changed(p):
+            if content_changed(p):
                 mark(p, 'M')
-        elif op in ('chmod', 'chown', 'set_xattr', 'remove_xattr') and len(parts) >= 2:
-            p = PATH_PREFIX.sub('', parts[1]).rstrip('/')
-            if p and p != '.' and not p.startswith(TMP_DIR):
-                mark(p, 'M')
-        elif op == 'utimes' and len(parts) >= 2:
+        elif op == 'utimes':
             # 時刻だけの変化 (主に atime: 読んだだけでも変わる) は変更ではない。mtime が変わったものだけ数える
-            p = PATH_PREFIX.sub('', parts[1]).rstrip('/')
-            if p and p != '.' and not p.startswith(TMP_DIR) and mtime_changed(p):
+            if mtime_changed(p):
                 mark(p, 'M')
-        elif op in ('symlink', 'mkfile', 'mkdir') and len(parts) >= 2:
-            if op == 'symlink':
-                mark(PATH_PREFIX.sub('', parts[1]).rstrip('/'), 'A')
-    # 最後に、名前の付いていない一時名 (o123-4-0) を除く
-    return sorted((k, p) for p, k in state.items()
-                  if not re.search(r'(^|/)o\d+-\d+-\d+$', p) and not p.startswith(TMP_DIR))
+        elif op in ('chmod', 'chown', 'set_xattr', 'remove_xattr'):
+            mark(p, 'M')
+    return sorted((k, p) for p, k in state.items())
 
 
 def diff_snapshots(vol, old, new):
