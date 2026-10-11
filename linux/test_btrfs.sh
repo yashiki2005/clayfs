@@ -30,6 +30,12 @@ G2=$($T $M log | tail -1 | cut -d" " -f1)
 chk "show が変更一覧を出す" '$T $M show | grep -q "a.txt"'
 out=$($T $M commit -m nothing 2>&1); chk "変更が無ければコミットしない" 'echo "$out" | grep -q "変更はありません"'
 chk "status: 変更なし" '$T $M status | grep -q "変更はありません"'
+$T $M commit -m base2 >/dev/null 2>&1
+cat $M/work/a.txt >/dev/null; sleep 1
+chk "読むだけ (atime の変化) は変更にならない" '[ -z "$($T $M status -s)" ]'
+touch -m -d "2030-01-01 00:00" $M/work/a.txt
+chk "mtime を変えただけのものは変更になる" '$T $M status -s | grep -q "^M a.txt"'
+$T $M commit -m base3 >/dev/null 2>&1
 
 echo "[restore]"
 G1=$($T $M log | head -1 | cut -d" " -f1)
