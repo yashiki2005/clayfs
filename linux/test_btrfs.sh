@@ -72,6 +72,41 @@ chk "開かれているファイルは置き換えない (inode が同じ)" '[ "
 chk "開かれているものは飛ばした件数に入る" 'echo "$out" | grep -q "飛ばした [1-9]"'
 wait $H 2>/dev/null
 
+umount $M 2>/dev/null
+echo "[keep / unkeep: 圧縮を保つパス (圧縮を強制しないマウント)]"
+M2=/mnt/cb2
+rm -f /tmp/cb2.img; truncate -s 1G /tmp/cb2.img; mkfs.btrfs -q -f /tmp/cb2.img >/dev/null 2>&1
+mkdir -p $M2; mount -o loop /tmp/cb2.img $M2 || { echo "mount2 failed"; exit 1; }
+$T $M2 init >/dev/null
+enc() { filefrag -v "$1" 2>/dev/null | grep -c encoded; }
+mkdir -p $M2/work/k1 $M2/work/n
+yes "keep test text line 0123456789 abcdefghij" | head -c 4000000 > $M2/work/k1/u.txt
+yes "normal text line 0123456789 abcdefghij" | head -c 4000000 > $M2/work/n/u.txt
+chk "保持の前は圧縮されていない (k1)" '[ "$(enc $M2/work/k1/u.txt)" = 0 ]'
+$T $M2 keep k1 >/dev/null 2>&1
+chk "keep で既存のファイルが圧縮される" '[ "$(enc $M2/work/k1/u.txt)" -gt 0 ]'
+chk "keep の一覧に出る" '$T $M2 keep | grep -q "^k1$"'
+yes "new file in kept dir 0123456789" | head -c 2000000 > $M2/work/k1/w.txt
+yes "new file in normal dir 0123456789" | head -c 2000000 > $M2/work/n/w.txt
+sync
+chk "keep したディレクトリの新しいファイルは圧縮される" '[ "$(enc $M2/work/k1/w.txt)" -gt 0 ]'
+chk "keep していないディレクトリの新しいファイルは圧縮されない" '[ "$(enc $M2/work/n/w.txt)" = 0 ]'
+$T $M2 unkeep k1 >/dev/null 2>&1
+yes "after unkeep 0123456789" | head -c 2000000 > $M2/work/k1/x.txt
+sync
+chk "unkeep の後に作るファイルは圧縮されない" '[ "$(enc $M2/work/k1/x.txt)" = 0 ]'
+chk "unkeep で一覧から外れる" '! $T $M2 keep | grep -q "^k1$"'
+echo "[run: 変更があるときだけコミット]"
+$T $M2 commit -m base >/dev/null 2>&1
+n0=$($T $M2 log | wc -l)
+$T $M2 run >/dev/null 2>&1
+chk "変更が無ければ run は何もしない" '[ "$($T $M2 log | wc -l)" = "$n0" ]'
+echo "run test" > $M2/work/auto.txt
+$T $M2 run >/dev/null 2>&1
+chk "変更があれば run がコミットする" '[ "$($T $M2 log | wc -l)" = "$((n0 + 1))" ] && $T $M2 log | tail -1 | grep -q auto'
+rm -f $M2/work/auto.txt
+umount $M2 2>/dev/null
+
 echo "結果: $pass passed, $fail failed"
 umount $M 2>/dev/null
 [ "$fail" = 0 ]

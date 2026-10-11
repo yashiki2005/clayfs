@@ -1,0 +1,10 @@
+# btrfs のデータ検査 (全スナップショットの中身を含む)。電源や負荷の都合で、週 1 回
+[Unit]
+Description=clayfs (btrfs): データの検査
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/clayfs-btrfs.env
+ExecStart=/usr/local/bin/clayfs_btrfs ${CLAYFS_MNT} scrub
+Nice=15
+IOSchedulingClass=idle

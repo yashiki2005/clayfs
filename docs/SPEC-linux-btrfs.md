@@ -48,3 +48,22 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 - 検証の Linux 環境（実機、VM、Docker のどれか）。
 - スナップショットの保持方針。
 - 作業ツリーのパス（`CLAYFS_DIR` の扱い）。
+
+## 実装の状況
+
+実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 31 件合格）。
+
+- 済み: init / commit / status / show / log / restore / gc / scrub / dedup / compress / keep / unkeep / run
+- 自動実行: `linux/systemd/`（毎時の `run`、毎日の `gc`、毎週の `scrub`）。構文は `systemd-analyze verify` で確認。
+  実際のタイマーの動作は、まだ確かめていない（コンテナでは systemd が動かないため）。
+- 未実装: rebuild（`btrfs send | receive`）、インストール用のスクリプト、`CLAYFS_DIR` のリンク管理、
+  ホストの root での実行（コンテナ外）の試験。
+
+試験で分かったこと（設計に反映済み）:
+
+- 重複排除の容量は、古いスナップショットが実体を掴んでいる間は戻らない（101 → 101 → gc の後 53 MB）。
+  保持の方針（何世代残すか）は、重複排除の効果と直結する。
+- `btrfs scrub` は全スナップショットの中身を検査するので、macOS 版の `scrub --layers` に相当するものは不要。
+- 変更の一覧は `btrfs send --no-data` の差分から取る。大きさと更新時刻に頼らないので、macOS 版の検出の欠陥を避けられる。
+- subvolume をまたぐ rename はできない（退避と重複排除の一時ファイルは、同じ subvolume の中に置く）。
+- 書き出していないデータ (delalloc) は圧縮し直せない。keep の前に sync する。

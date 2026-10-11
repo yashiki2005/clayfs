@@ -1,0 +1,9 @@
+# clayfs の自動コミット。変更があればコミットする (無ければ何もしない)
+[Unit]
+Description=clayfs (btrfs): 変更があればコミット
+RequiresMountsFor=/etc/clayfs-btrfs.env
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/clayfs-btrfs.env
+ExecStart=/usr/local/bin/clayfs_btrfs ${CLAYFS_MNT} run

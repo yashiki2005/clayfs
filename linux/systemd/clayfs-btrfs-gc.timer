@@ -1,0 +1,9 @@
+[Unit]
+Description=clayfs (btrfs): 毎日の整理
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

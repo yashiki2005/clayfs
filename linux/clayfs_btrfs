@@ -20,6 +20,8 @@
   clayfs_btrfs MNT dedup [--dry-run]    中身が同じファイルを reflink にまとめる
   clayfs_btrfs MNT scrub                btrfs のデータ検査 (全スナップショットの中身も対象)
   clayfs_btrfs MNT compress PATH...     btrfs の圧縮 (zstd) で書き直す。reflink の共有は崩れる
+  clayfs_btrfs MNT keep [PATH...] | unkeep PATH...   圧縮を保つパス (新しいファイルも圧縮する)
+  clayfs_btrfs MNT run                  変更があればコミットする (自動実行用)
 """
 import argparse
 import fcntl
@@ -273,6 +275,16 @@ def cmd_status(vol, a):
         print('\n変更はありません')
 
 
+def cmd_run(vol, a):
+    """自動実行用 (systemd タイマー): 変更があればコミットする。無ければ何もしない。"""
+    if head(vol) is not None:
+        _, notes = current_changes(vol)
+        if not notes:
+            return
+    # 最初の実行は、最初のコミットを作る (変更の有無にかかわらず)
+    cmd_commit(vol, argparse.Namespace(name=None, message='auto', allow_empty=False))
+
+
 def cmd_log(vol, a):
     rows = load_log(vol)
     if a.n:
@@ -373,6 +385,79 @@ def cmd_compress(vol, a):
         run(['btrfs', 'filesystem', 'defragment', '-r', '-czstd', full], check=False)
         print(f'圧縮しました: {os.path.relpath(full, vol.work)}')
     print('注意: 圧縮し直すと、reflink で共有していたファイルは共有が外れ、容量が増えることがあります')
+
+
+def keep_file(vol):
+    return os.path.join(vol.store, 'keep.json')
+
+
+def load_keep(vol):
+    p = keep_file(vol)
+    if not os.path.exists(p):
+        return set()
+    with open(p, encoding='utf-8') as f:
+        return set(json.load(f))
+
+
+def save_keep(vol, keeps):
+    atomic_write(keep_file(vol), json.dumps(sorted(keeps), ensure_ascii=False, indent=2))
+
+
+def work_rel(vol, p):
+    """引数を、作業ツリーの中の相対パスにする。作業ツリーの外は受け付けない。"""
+    full = os.path.realpath(p if os.path.isabs(p) else os.path.join(vol.work, p))
+    if full != vol.work and not full.startswith(vol.work + os.sep):
+        die(f'作業ツリーの中のパスを指定してください: {p}')
+    return os.path.relpath(full, vol.work)
+
+
+def cmd_keep(vol, a):
+    """圧縮を保つパスにする: 新しく作るファイルは btrfs の圧縮 (zstd) で作られ、既存のものは圧縮し直す。"""
+    if not a.paths:
+        keeps = sorted(load_keep(vol))
+        print('\n'.join(keeps) if keeps else '(なし)')
+        return
+    fd = lock(vol)
+    try:
+        keeps = load_keep(vol)
+        # 書き出しの済んでいないデータ (delalloc) は、圧縮し直せない。先に書き出す
+        os.sync()
+        for p in a.paths:
+            rel = work_rel(vol, p)
+            full = os.path.join(vol.work, rel)
+            if not os.path.lexists(full):
+                die(f'ありません: {rel}')
+            # 属性は、ディレクトリに付ければ新しく作るものへ継承される
+            run(['chattr', '+c', full], check=False)
+            if os.path.isdir(full) and not os.path.islink(full):
+                run(['btrfs', 'filesystem', 'defragment', '-r', '-czstd', full], check=False)
+            else:
+                run(['btrfs', 'filesystem', 'defragment', '-czstd', full], check=False)
+            keeps.add(rel)
+            print(f'圧縮を保つ: {rel}')
+        save_keep(vol, keeps)
+        print('注意: reflink で共有しているものは、圧縮し直すと共有が外れて容量が増えることがあります (dedup の後に keep しないこと)')
+    finally:
+        os.close(fd)
+
+
+def cmd_unkeep(vol, a):
+    fd = lock(vol)
+    try:
+        keeps = load_keep(vol)
+        for p in a.paths:
+            rel = work_rel(vol, p)
+            if rel not in keeps:
+                print(f'圧縮を保つ対象ではありません: {rel}')
+                continue
+            keeps.discard(rel)
+            full = os.path.join(vol.work, rel)
+            if os.path.lexists(full):
+                run(['chattr', '-c', full], check=False)
+            print(f'対象から外しました: {rel} (今の圧縮は、書き直すまで残ります)')
+        save_keep(vol, keeps)
+    finally:
+        os.close(fd)
 
 
 def open_paths(vol):
@@ -483,6 +568,7 @@ def main():
     p = sub.add_parser('commit'); p.add_argument('-m', '--message'); p.add_argument('--name')
     p.add_argument('--allow-empty', action='store_true'); p.set_defaults(fn=cmd_commit)
     p = sub.add_parser('status'); p.add_argument('-s', '--short', action='store_true'); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser('run'); p.set_defaults(fn=cmd_run)
     p = sub.add_parser('log'); p.add_argument('-n', type=int); p.set_defaults(fn=cmd_log)
     p = sub.add_parser('show'); p.add_argument('gen', nargs='?'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('restore'); p.add_argument('paths', nargs='*'); p.add_argument('--all', action='store_true')
@@ -491,6 +577,8 @@ def main():
     p = sub.add_parser('scrub'); p.set_defaults(fn=cmd_scrub)
     p = sub.add_parser('dedup'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_dedup)
     p = sub.add_parser('compress'); p.add_argument('paths', nargs='+'); p.set_defaults(fn=cmd_compress)
+    p = sub.add_parser('keep'); p.add_argument('paths', nargs='*'); p.set_defaults(fn=cmd_keep)
+    p = sub.add_parser('unkeep'); p.add_argument('paths', nargs='+'); p.set_defaults(fn=cmd_unkeep)
     a = ap.parse_args()
     vol = Vol(a.mnt)
     a.fn(vol, a)
