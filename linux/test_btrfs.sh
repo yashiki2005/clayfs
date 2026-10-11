@@ -36,6 +36,12 @@ chk "読むだけ (atime の変化) は変更にならない" '[ -z "$($T $M sta
 touch -m -d "2030-01-01 00:00" $M/work/a.txt
 chk "mtime を変えただけのものは変更になる" '$T $M status -s | grep -q "^M a.txt"'
 $T $M commit -m base3 >/dev/null 2>&1
+head -c 300000 /dev/urandom > $M/work/same.bin; sync; $T $M commit -m base4 >/dev/null 2>&1
+cp -p $M/work/same.bin /tmp/same.copy; cp -p /tmp/same.copy $M/work/same.bin; sync; sleep 1  # 時刻を保つ (時刻が変われば、それ自体は変更として数える)
+chk "同じ中身に書き直したものは変更にならない" '! $T $M status -s | grep -q "same.bin"'
+printf 'X' | dd of=$M/work/same.bin bs=1 seek=100 conv=notrunc 2>/dev/null; sync
+chk "中身を変えたものは変更になる" '$T $M status -s | grep -q "^M same.bin"'
+$T $M commit -m base5 >/dev/null 2>&1
 
 echo "[restore]"
 G1=$($T $M log | head -1 | cut -d" " -f1)

@@ -36,6 +36,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -128,7 +129,7 @@ def set_head(vol, name):
     atomic_write(os.path.join(vol.store, 'work.json'), json.dumps({'base': name}))
 
 
-def parse_dump(text, mtime_changed=lambda rel: True):
+def parse_dump(text, mtime_changed=lambda rel: True, content_changed=lambda rel: True):
     """btrfs receive --dump の出力を、(A/M/D, 相対パス) の一覧にする。
     新しいファイルは mkfile/mkdir の後の rename で名前が付くので、rename の宛先を A とみなす。"""
     state = {}   # path -> 'A' | 'M' | 'D' | 'AD'
@@ -157,7 +158,12 @@ def parse_dump(text, mtime_changed=lambda rel: True):
             dest = next((x[5:] for x in parts if x.startswith('dest=')), None)
             if dest:
                 mark(PATH_PREFIX.sub('', dest).rstrip('/'), 'A')
-        elif op in ('update_extent', 'write', 'truncate', 'chmod', 'chown', 'set_xattr', 'remove_xattr') and len(parts) >= 2:
+        elif op in ('update_extent', 'write', 'truncate') and len(parts) >= 2:
+            # 同じ中身の書き直し、書き出しの時期のずれでも、extent は付け替わる。中身が本当に変わったものだけ数える
+            p = PATH_PREFIX.sub('', parts[1]).rstrip('/')
+            if p and p != '.' and not p.startswith(TMP_DIR) and content_changed(p):
+                mark(p, 'M')
+        elif op in ('chmod', 'chown', 'set_xattr', 'remove_xattr') and len(parts) >= 2:
             p = PATH_PREFIX.sub('', parts[1]).rstrip('/')
             if p and p != '.' and not p.startswith(TMP_DIR):
                 mark(p, 'M')
@@ -188,7 +194,19 @@ def diff_snapshots(vol, old, new):
             return os.lstat(os.path.join(old, rel)).st_mtime_ns != os.lstat(os.path.join(new, rel)).st_mtime_ns
         except OSError:
             return True
-    return parse_dump(p2.stdout.decode('utf-8', errors='replace'), mtime_changed)
+
+    def content_changed(rel):
+        a, b = os.path.join(old, rel), os.path.join(new, rel)
+        try:
+            sa, sb = os.lstat(a), os.lstat(b)
+        except OSError:
+            return True
+        if not (stat.S_ISREG(sa.st_mode) and stat.S_ISREG(sb.st_mode)):
+            return True
+        if sa.st_size != sb.st_size:
+            return True
+        return digest(a) != digest(b)
+    return parse_dump(p2.stdout.decode('utf-8', errors='replace'), mtime_changed, content_changed)
 
 
 def snapshot_ro(src, dst):
