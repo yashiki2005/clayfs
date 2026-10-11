@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""clayfs_btrfs - clayfs の Linux 版 (btrfs)。作業ツリーの subvolume と、コミットの読み取り専用スナップショットで履歴を持つ。
+
+設計: docs/SPEC-linux-btrfs.md。macOS 版 (clayfs_tool) と違い、イメージに入れず、btrfs のボリュームを直接使う。
+
+  MNT/work/              作業ツリー (書き込み可能な subvolume)
+  MNT/store/layers/NAME  コミット (読み取り専用スナップショット)
+  MNT/store/log.jsonl    コミットの一覧 (1 行 1 コミット、古い順)
+  MNT/store/changes/NAME.changes  そのコミットの変更一覧 (gc で中身を消しても残る)
+  MNT/store/work.json    HEAD
+
+使い方 (root が要る。btrfs の操作のため):
+  clayfs_btrfs MNT init                 work/ を作る (既存の中身は取り込まない)
+  clayfs_btrfs MNT commit [-m MSG]      現状をコミットする
+  clayfs_btrfs MNT status [-s]          HEAD からの変更
+  clayfs_btrfs MNT log [-n N]
+  clayfs_btrfs MNT show [GEN]           変更一覧と中身の場所
+  clayfs_btrfs MNT restore [--source GEN] PATH... | --all
+  clayfs_btrfs MNT gc --keep N          新しい N 個を残し、古い中身を消す (一覧は残る)
+  clayfs_btrfs MNT dedup [--dry-run]    中身が同じファイルを reflink にまとめる
+  clayfs_btrfs MNT scrub                btrfs のデータ検査 (全スナップショットの中身も対象)
+  clayfs_btrfs MNT compress PATH...     btrfs の圧縮 (zstd) で書き直す。reflink の共有は崩れる
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+WORK = 'work'
+STORE = 'store'
+PATH_PREFIX = re.compile(r'^\./[^/]+/?')
+TMP_DIR = '.clayfs-tmp'      # 重複排除の一時置き場 (作業ツリーの中。subvolume をまたがないため)
+
+
+def die(msg, code=1):
+    print(f'エラー: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def run(args, check=True, capture=True):
+    r = subprocess.run(args, capture_output=capture, text=True)
+    if check and r.returncode != 0:
+        die(f'{" ".join(args)} が失敗しました: {r.stderr.strip()[:300]}')
+    return r
+
+
+class Vol:
+    def __init__(self, mnt):
+        self.mnt = os.path.realpath(os.path.expanduser(mnt))
+        self.work = os.path.join(self.mnt, WORK)
+        self.store = os.path.join(self.mnt, STORE)
+        self.layers = os.path.join(self.store, 'layers')
+        self.changes = os.path.join(self.store, 'changes')
+        self.trash = os.path.join(self.store, 'trash')
+        if not os.path.ismount(self.mnt) and not os.path.isdir(self.work):
+            die(f'btrfs の場所ではありません: {self.mnt} (work/ がありません。init をしてください)')
+
+    def layer(self, name):
+        if not name or '/' in name or name.startswith('.'):
+            die(f'bad layer name: {name!r}')
+        return os.path.join(self.layers, name)
+
+    def names(self):
+        if not os.path.isdir(self.layers):
+            return []
+        return sorted(n for n in os.listdir(self.layers) if not n.startswith('.'))
+
+
+def atomic_write(path, text):
+    tmp = f'{path}.tmp.{os.getpid()}'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def lock(vol):
+    """コミットや dedup などを 1 つずつ行う。カーネルが持ち主の終了で鍵を外すので、残骸が残らない。"""
+    os.makedirs(vol.store, exist_ok=True)
+    fd = os.open(os.path.join(vol.store, 'lock'), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        die('ほかの clayfs_btrfs が実行中です')
+    return fd
+
+
+def load_log(vol):
+    out = []
+    p = os.path.join(vol.store, 'log.jsonl')
+    if not os.path.exists(p):
+        return out
+    with open(p, encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                print('警告: log.jsonl の壊れた行を飛ばしました', file=sys.stderr)
+    return out
+
+
+def head(vol):
+    p = os.path.join(vol.store, 'work.json')
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding='utf-8') as f:
+        return json.load(f).get('base')
+
+
+def set_head(vol, name):
+    atomic_write(os.path.join(vol.store, 'work.json'), json.dumps({'base': name}))
+
+
+def parse_dump(text):
+    """btrfs receive --dump の出力を、(A/M/D, 相対パス) の一覧にする。
+    新しいファイルは mkfile/mkdir の後の rename で名前が付くので、rename の宛先を A とみなす。"""
+    state = {}   # path -> 'A' | 'M' | 'D' | 'AD'
+
+    def mark(p, k):
+        cur = state.get(p)
+        if cur is None:
+            state[p] = k
+        elif cur == 'D' and k == 'A':
+            state[p] = 'M'          # 消して作り直した
+        elif cur == 'A' and k == 'D':
+            del state[p]           # 作ってから消した
+        elif k == 'M' and cur in ('A', 'M'):
+            pass
+        else:
+            state[p] = k
+
+    for line in text.splitlines():
+        if not line or line.startswith(('At ', 'snapshot', 'subvol')):
+            continue
+        parts = line.split()
+        op = parts[0]
+        if op in ('unlink', 'rmdir') and len(parts) >= 2:
+            mark(PATH_PREFIX.sub('', parts[1]).rstrip('/'), 'D')
+        elif op == 'rename' and len(parts) >= 3:
+            dest = next((x[5:] for x in parts if x.startswith('dest=')), None)
+            if dest:
+                mark(PATH_PREFIX.sub('', dest).rstrip('/'), 'A')
+        elif op in ('update_extent', 'write', 'truncate', 'chmod', 'chown', 'utimes', 'set_xattr', 'remove_xattr') and len(parts) >= 2:
+            p = PATH_PREFIX.sub('', parts[1]).rstrip('/')
+            if p and p != '.' and not p.startswith(TMP_DIR):
+                mark(p, 'M')
+        elif op in ('symlink', 'mkfile', 'mkdir') and len(parts) >= 2:
+            if op == 'symlink':
+                mark(PATH_PREFIX.sub('', parts[1]).rstrip('/'), 'A')
+    # 最後に、名前の付いていない一時名 (o123-4-0) を除く
+    return sorted((k, p) for p, k in state.items()
+                  if not re.search(r'(^|/)o\d+-\d+-\d+$', p) and not p.startswith(TMP_DIR))
+
+
+def diff_snapshots(vol, old, new):
+    """2 つのスナップショット (ro) の差分。send の差分だけを読み、中身は読まない。"""
+    # btrfs send の出力 (バイナリ) を receive --dump に通す
+    p1 = subprocess.run(['btrfs', 'send', '--no-data', '-p', old, new], capture_output=True)
+    if p1.returncode != 0:
+        die(f'差分を取れません: {p1.stderr.decode(errors="replace").strip()[:300]}')
+    p2 = subprocess.run(['btrfs', 'receive', '--dump'], input=p1.stdout, capture_output=True)
+    if p2.returncode != 0:
+        die(f'差分を読めません: {p2.stderr.decode(errors="replace").strip()[:300]}')
+    return parse_dump(p2.stdout.decode('utf-8', errors='replace'))
+
+
+def snapshot_ro(src, dst):
+    run(['btrfs', 'subvolume', 'snapshot', '-r', src, dst])
+
+
+def delete_subvol(path):
+    run(['btrfs', 'subvolume', 'delete', path], check=False)
+
+
+def new_name(vol, explicit=None):
+    if explicit:
+        if os.path.exists(vol.layer(explicit)):
+            die(f'同じ名前のコミットがあります: {explicit}')
+        return explicit
+    base = time.strftime('c-%Y%m%d-%H%M%S')
+    name, n = base, 1
+    while os.path.exists(vol.layer(name)):
+        n += 1
+        name = f'{base}-{n}'
+    return name
+
+
+def record(vol, name, msg, notes, when=None):
+    os.makedirs(vol.changes, exist_ok=True)
+    body = f'# {name} {msg or ""}\n' + ''.join(f'{k} {p}\n' for k, p in notes)
+    atomic_write(os.path.join(vol.changes, f'{name}.changes'), body)
+    entry = {'name': name, 'message': msg or '', 'time': when or time.time(), 'changes': len(notes)}
+    with open(os.path.join(vol.store, 'log.jsonl'), 'a', encoding='utf-8') as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+
+
+# ---------- コマンド ----------
+
+def cmd_init(vol, a):
+    if os.path.exists(vol.work):
+        die(f'すでにあります: {vol.work}')
+    if not os.path.ismount(vol.mnt):
+        die(f'btrfs がマウントされていません: {vol.mnt}')
+    run(['btrfs', 'subvolume', 'create', vol.work])
+    os.makedirs(vol.layers, exist_ok=True)
+    print(f'作りました: {vol.work} (subvolume)')
+
+
+def cmd_commit(vol, a):
+    fd = lock(vol)
+    try:
+        base = head(vol)
+        name = new_name(vol, a.name)
+        tmp = os.path.join(vol.layers, f'.tmp.{os.getpid()}')
+        snapshot_ro(vol.work, tmp)
+        os.rename(tmp, vol.layer(name))
+        if base is None:
+            notes = []
+        else:
+            notes = diff_snapshots(vol, vol.layer(base), vol.layer(name))
+        if base is not None and not notes and not a.allow_empty:
+            delete_subvol(vol.layer(name))
+            print('変更はありません (コミットしません)')
+            return
+        record(vol, name, a.message, notes)
+        set_head(vol, name)
+        print(f'[{name}] {a.message or ""}\n {len(notes)} 件の変更')
+    finally:
+        os.close(fd)
+
+
+def current_changes(vol):
+    base = head(vol)
+    if base is None:
+        return None, []
+    tmp = os.path.join(vol.store, f'status.{os.getpid()}')
+    snapshot_ro(vol.work, tmp)
+    try:
+        return base, diff_snapshots(vol, vol.layer(base), tmp)
+    finally:
+        delete_subvol(tmp)
+
+
+LABEL = {'A': '追加', 'M': '変更', 'D': '削除'}
+
+
+def cmd_status(vol, a):
+    base, notes = current_changes(vol)
+    if base is None:
+        print('まだコミットがありません (commit で最初のコミットを作ります)')
+        return
+    if a.short:
+        for k, p in notes:
+            print(k, p)
+        return
+    print(f'HEAD {base}')
+    if notes:
+        print('\nコミットしていない変更:')
+        for k, p in notes:
+            print(f'\t{LABEL[k]}:   {p}')
+    else:
+        print('\n変更はありません')
+
+
+def cmd_log(vol, a):
+    rows = load_log(vol)
+    if a.n:
+        rows = rows[-a.n:]
+    for e in rows:
+        when = time.strftime('%Y-%m-%d %H:%M', time.localtime(e['time']))
+        print(f'{e["name"]}  {when}  {e["changes"]:>4} 件  {e["message"]}')
+
+
+def resolve_gen(vol, spec):
+    rows = [e['name'] for e in load_log(vol)]
+    if spec is None:
+        spec = head(vol)
+    if spec is None:
+        die('まだコミットがありません')
+    hits = [n for n in rows if n == spec] or [n for n in rows if spec in n]
+    if len(hits) != 1:
+        die(f'コミットが一意に決まりません: {spec} ({len(hits)} 件)')
+    return hits[0]
+
+
+def cmd_show(vol, a):
+    gen = resolve_gen(vol, a.gen)
+    p = os.path.join(vol.changes, f'{gen}.changes')
+    with open(p, encoding='utf-8') as f:
+        sys.stdout.write(f.read())
+    if os.path.isdir(vol.layer(gen)):
+        print(f'中身: {vol.layer(gen)}')
+    else:
+        print('中身: (gc で消されています)')
+
+
+def cmd_restore(vol, a):
+    gen = resolve_gen(vol, a.source)
+    if not os.path.isdir(vol.layer(gen)):
+        die(f'{gen} の中身は gc で消されています')
+    if a.all == bool(a.paths):
+        die('戻すパスを指定してください (全体を戻すなら --all)')
+    rels = sorted(set(os.listdir(vol.work)) | set(os.listdir(vol.layer(gen)))) if a.all else [os.path.normpath(p) for p in a.paths]
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    keep = os.path.join(vol.trash, stamp)
+    for rel in rels:
+        if rel.startswith('..') or rel in ('.', '') or os.path.isabs(rel):
+            die(f'戻せるのは work/ の中のものだけです: {rel}')
+        cur, src = os.path.join(vol.work, rel), os.path.join(vol.layer(gen), rel)
+        if os.path.lexists(cur):
+            # rename は subvolume をまたげないので、reflink で退避してから元を消す (中身は共有されたまま)
+            os.makedirs(os.path.dirname(os.path.join(keep, rel)), exist_ok=True)
+            run(['cp', '-a', '--reflink=always', cur, os.path.join(keep, rel)])
+            remove_tree(cur)
+        if os.path.lexists(src):
+            os.makedirs(os.path.dirname(cur), exist_ok=True)
+            run(['cp', '-a', '--reflink=always', src, cur])
+            print(f'戻しました: {rel} ({gen})')
+        else:
+            print(f'{gen} の時点にはありません: {rel}')
+    if os.path.isdir(keep):
+        print(f'戻す前の内容は、ここに退避してあります: {keep}')
+
+
+def remove_tree(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def cmd_gc(vol, a):
+    if a.keep < 1:
+        die('--keep は 1 以上にしてください (HEAD は消せません)')
+    fd = lock(vol)
+    try:
+        base = head(vol)
+        names = [e['name'] for e in load_log(vol) if os.path.isdir(vol.layer(e['name']))]
+        for old in names[:-a.keep]:
+            if old == base:
+                continue
+            delete_subvol(vol.layer(old))
+            print(f'消しました: {old}')
+        run(['btrfs', 'subvolume', 'sync', vol.mnt], check=False)
+    finally:
+        os.close(fd)
+
+
+def cmd_scrub(vol, a):
+    r = run(['btrfs', 'scrub', 'start', '-B', vol.mnt], check=False)
+    out = (r.stdout or '') + (r.stderr or '')
+    print(out.strip()[-600:])
+    if r.returncode != 0 or re.search(r'(uncorrectable|csum_errors|corrected)[^0-9]*[1-9]', out):
+        sys.exit(1)
+
+
+def cmd_compress(vol, a):
+    for p in a.paths:
+        full = os.path.realpath(os.path.join(vol.work, p)) if not os.path.isabs(p) else os.path.realpath(p)
+        if not full.startswith(vol.work + os.sep) and full != vol.work:
+            die(f'作業ツリーの外です: {p}')
+        run(['btrfs', 'filesystem', 'defragment', '-r', '-czstd', full], check=False)
+        print(f'圧縮しました: {os.path.relpath(full, vol.work)}')
+    print('注意: 圧縮し直すと、reflink で共有していたファイルは共有が外れ、容量が増えることがあります')
+
+
+def open_paths(vol):
+    """書き込みのために開かれているファイルの実体 (inode) の集合。/proc から読む。"""
+    inodes = set()
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        fd_dir = f'/proc/{pid}/fd'
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    st = os.stat(os.path.join(fd_dir, fd))
+                except OSError:
+                    continue
+                inodes.add((st.st_dev, st.st_ino))
+        except OSError:
+            continue
+    return inodes
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for buf in iter(lambda: f.read(1 << 20), b''):
+            h.update(buf)
+    return h.hexdigest()
+
+
+DATABASE_EXTS = {'.db', '.sqlite', '.sqlite3', '.db-wal', '.db-shm', '.sqlite-wal', '.sqlite-shm', '.rdb'}
+
+
+def cmd_dedup(vol, a):
+    fd = lock(vol)
+    try:
+        by_size = {}
+        for root, dirs, files in os.walk(vol.work):
+            for n in files:
+                p = os.path.join(root, n)
+                try:
+                    s = os.lstat(p)
+                except OSError:
+                    continue
+                if not os.path.isfile(p) or os.path.islink(p) or s.st_size < 4096:
+                    continue
+                if os.path.splitext(n)[1].lower() in DATABASE_EXTS:
+                    continue
+                by_size.setdefault(s.st_size, []).append(p)
+        tmpdir = os.path.join(vol.work, TMP_DIR)
+        if os.path.isdir(tmpdir):
+            shutil.rmtree(tmpdir)                       # 前回の途中で止まった残り
+        os.makedirs(tmpdir)
+        opened = open_paths(vol)
+        groups = files = skipped = changed = 0
+        free_before = os.statvfs(vol.mnt).f_bavail * os.statvfs(vol.mnt).f_frsize
+        for size, paths in by_size.items():
+            if len(paths) < 2:
+                continue
+            by_hash = {}
+            for p in paths:
+                try:
+                    by_hash.setdefault(digest(p), []).append(p)
+                except OSError:
+                    skipped += 1
+            for h, same in by_hash.items():
+                if len(same) < 2:
+                    continue
+                canon = same[0]
+                cs = os.lstat(canon)
+                groups += 1
+                for target in same[1:]:
+                    ts = os.lstat(target)
+                    if (ts.st_dev, ts.st_ino) in opened or ts.st_nlink > 1 or ts.st_ino == cs.st_ino:
+                        skipped += 1
+                        continue
+                    if a.dry_run:
+                        files += 1
+                        continue
+                    tmp = os.path.join(tmpdir, f'{groups}.{files}.{skipped}')
+                    try:
+                        run(['cp', '-a', '--reflink=always', canon, tmp])
+                        if digest(target) != h:          # 置き換える直前に、対象の中身を確かめる
+                            os.unlink(tmp)
+                            changed += 1
+                            continue
+                        os.replace(tmp, target)
+                        files += 1
+                    except (OSError, SystemExit):
+                        if os.path.lexists(tmp):
+                            os.unlink(tmp)
+                        skipped += 1
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        free_after = os.statvfs(vol.mnt).f_bavail * os.statvfs(vol.mnt).f_frsize
+        verb = '見つけた' if a.dry_run else '共有した'
+        print(f'{verb}: {groups} 組、{files} ファイル (飛ばした {skipped}、置き換え中に変わった {changed})')
+        if not a.dry_run:
+            print(f'空き容量の増加: {(free_after - free_before) / (1 << 20):.1f} MB')
+            print('注意: スナップショットが古い実体を掴んでいる間は、容量は戻りません (gc の後に戻ります)')
+    finally:
+        os.close(fd)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='clayfs_btrfs', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('mnt', help='btrfs のマウント先')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('init'); p.set_defaults(fn=cmd_init)
+    p = sub.add_parser('commit'); p.add_argument('-m', '--message'); p.add_argument('--name')
+    p.add_argument('--allow-empty', action='store_true'); p.set_defaults(fn=cmd_commit)
+    p = sub.add_parser('status'); p.add_argument('-s', '--short', action='store_true'); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser('log'); p.add_argument('-n', type=int); p.set_defaults(fn=cmd_log)
+    p = sub.add_parser('show'); p.add_argument('gen', nargs='?'); p.set_defaults(fn=cmd_show)
+    p = sub.add_parser('restore'); p.add_argument('paths', nargs='*'); p.add_argument('--all', action='store_true')
+    p.add_argument('--source'); p.set_defaults(fn=cmd_restore)
+    p = sub.add_parser('gc'); p.add_argument('--keep', type=int, required=True); p.set_defaults(fn=cmd_gc)
+    p = sub.add_parser('scrub'); p.set_defaults(fn=cmd_scrub)
+    p = sub.add_parser('dedup'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(fn=cmd_dedup)
+    p = sub.add_parser('compress'); p.add_argument('paths', nargs='+'); p.set_defaults(fn=cmd_compress)
+    a = ap.parse_args()
+    vol = Vol(a.mnt)
+    a.fn(vol, a)
+
+
+if __name__ == '__main__':
+    main()
