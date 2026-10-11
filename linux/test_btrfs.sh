@@ -5,6 +5,11 @@ set -u
 T=/w/clayfs_btrfs
 M=/mnt/cb
 pass=0; fail=0
+# loop 装置は、ホスト全体で数が限られる (Pi では snap のイメージで埋まりやすい)。足りないと、試験の途中で
+# mount が失敗して、ツールの不具合に見えてしまう。先に数えて、足りなければ理由を出して止まる
+need=3
+free=$(losetup -f >/dev/null 2>&1 && losetup -l 2>/dev/null | wc -l)
+if ! (losetup -f >/dev/null 2>&1) ; then echo "環境: 空きの loop 装置がありません。snap や試験用のマウントを外してから実行してください"; exit 2; fi
 ok()  { pass=$((pass+1)); echo "  ok:   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL: $1"; }
 chk() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
@@ -160,6 +165,15 @@ rm -f $CRI; umount $CR 2>/dev/null; rm -rf $CR
 chk "dry-run は何も作らない" '$T create 1G --image $CRI --mnt $CR --dry-run >/dev/null && [ ! -e $CRI ]'
 $T create 1G --image $CRI --mnt $CR >/dev/null 2>&1
 chk "create が、イメージとマウントと work/ を作る" '[ -f $CRI ] && mountpoint -q $CR && btrfs subvolume show $CR/work >/dev/null 2>&1'
+chk "info が書く場所 (work) を示す" '$T $CR info | grep -q "書く場所.*$CR/work"'
+LK=/tmp/lk-test/src
+rm -rf /tmp/lk-test; $T $CR link $LK --owner nobody >/dev/null 2>&1
+chk "link で、書く場所 (~/src 相当) が work/ へのリンクになる" '[ -L $LK ] && [ "$(readlink $LK)" = "$CR/work" ]'
+chk "リンク越しに書くと、work/ に入る" 'echo hi > $LK/via-link.txt && [ "$(cat $CR/work/via-link.txt)" = hi ]'
+chk "--owner で work/ の持ち主が変わる (nobody)" '[ "$(stat -c %U $CR/work)" = nobody ]'
+out=$($T $CR link $LK 2>&1); chk "既にある名前には張らない" 'echo "$out" | grep -q "すでにあります"'
+rm -f $CR/work/via-link.txt; rm -f $LK; rm -rf /tmp/lk-test
+chk "info が履歴の場所を示す" '$T $CR info | grep -q "履歴の保存先.*store/layers"'
 chk "create は btrfs の圧縮オプションでマウントする" 'mount | grep " $CR " | grep -q compress-force'
 out=$($T create 1G --image $CRI --mnt $CR 2>&1); chk "既存のイメージは作り直さない" 'echo "$out" | grep -q "すでにあります"'
 umount $CR; rm -f $CRI

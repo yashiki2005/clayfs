@@ -21,6 +21,8 @@
   clayfs_btrfs MNT scrub                btrfs のデータ検査 (全スナップショットの中身も対象)
   clayfs_btrfs MNT compress PATH...     btrfs の圧縮 (zstd) で書き直す。reflink の共有は崩れる
   clayfs_btrfs MNT keep [PATH...] | unkeep PATH...   圧縮を保つパス (新しいファイルも圧縮する)
+  clayfs_btrfs MNT link PATH [--owner U]   PATH (例 ~/src) を work/ へのリンクにする。書く場所はそこ
+  clayfs_btrfs MNT info                 どこに書けばよいか (書く場所 = MNT/work)、履歴の場所、自動実行の状態
   clayfs_btrfs MNT run                  変更があればコミットする (自動実行用)
   clayfs_btrfs MNT adopt SRC            普通のフォルダ SRC を work/ へ移し、SRC を work/ へのリンクにする (SRC は SRC.orig に残す)
   clayfs_btrfs MNT rebuild DEST         履歴を、別の btrfs (DEST) へ send | receive で移す
@@ -279,6 +281,35 @@ def cmd_status(vol, a):
         print('\n変更はありません')
 
 
+def resolve_owner(spec):
+    """ユーザー名か uid を、(uid, gid) にする。"""
+    import pwd
+    try:
+        pw = pwd.getpwuid(int(spec)) if spec.isdigit() else pwd.getpwnam(spec)
+    except KeyError:
+        die(f'ユーザーがいません: {spec}')
+    return pw.pw_uid, pw.pw_gid
+
+
+def make_link(vol, path, owner=None):
+    """利用者が書く場所 PATH を、work/ へのリンクにする。実体がどこにあっても、PATH に書けばよい。
+    owner を渡すと、work/ の持ち主をそのユーザーにする (sudo なしで PATH に書けるように)。"""
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.lexists(path):
+        die(f'すでにあります: {path} (リンクを張るには、その名前を空けてください)')
+    if owner:
+        uid, gid = resolve_owner(owner)
+        os.chown(vol.work, uid, gid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.symlink(vol.work, path)
+    print(f'書く場所: {path}  (実体: {vol.work})')
+
+
+def cmd_link(vol, a):
+    """既にある work/ へのリンクを張る (移行の後など。work/ の中身は触らない)。"""
+    make_link(vol, a.path, a.owner)
+
+
 def cmd_adopt(vol, a):
     """普通のフォルダ SRC を、この btrfs の work/ へ移す。SRC は SRC.orig に残し、SRC は work/ へのリンクにする。
     中身は reflink で複製し、同じであることを diff で確かめてから切り替える (macOS 版の switch に当たる)。"""
@@ -360,6 +391,24 @@ def cmd_rebuild(vol, a):
         print(f'できました: {len(names)} 個のコミットと、未コミット分を {dest.mnt} に移しました')
     finally:
         os.close(fd)
+
+
+def describe(vol):
+    """どこに書けばよいか、どこに履歴があるかを、ひと目で分かる形で示す。"""
+    lines = [
+        f'マウント先   {vol.mnt}   (btrfs。ここは覚えなくてよい)',
+        f'書く場所     {vol.work}   ← ファイルはここに置く',
+        f'履歴の保存先 {vol.layers}   (コミットごとのスナップショット。直接書かない)',
+    ]
+    base = head(vol)
+    lines.append(f'最後のコミット {base or "(まだありません)"}')
+    env = '/etc/clayfs-btrfs.env'
+    lines.append(f'自動実行     {"設定あり (" + env + ")" if os.path.exists(env) else "未設定 (install.sh で入る)"}')
+    return '\n'.join(lines)
+
+
+def cmd_info(vol, a):
+    print(describe(vol))
 
 
 def cmd_run(vol, a):
@@ -658,6 +707,8 @@ def cmd_create(argv):
     ap.add_argument('--image', default='/var/lib/clayfs/clayfs.img')
     ap.add_argument('--mnt', default='/srv/clayfs')
     ap.add_argument('--dry-run', action='store_true', help='実行するコマンドを表示するだけ')
+    ap.add_argument('--owner', help='work/ の持ち主 (ユーザー名か uid)。付けると、sudo なしで書けるようになる')
+    ap.add_argument('--link', help='書く場所にするパス (例 ~/src)。work/ へのリンクを張る')
     a = ap.parse_args(argv)
     img, mnt = os.path.abspath(a.image), os.path.abspath(a.mnt)
     steps = [
@@ -690,7 +741,15 @@ def cmd_create(argv):
         raise
     vol = Vol(mnt)
     cmd_init(vol, None)
-    print(f'作りました: {img} (btrfs、{a.size} まで)、マウント: {mnt}')
+    if a.owner:
+        uid, gid = resolve_owner(a.owner)
+        os.chown(vol.work, uid, gid)
+    if a.link:
+        make_link(vol, a.link, None)
+    print(f'作りました: {img} (btrfs、{a.size} まで)')
+    print(describe(vol))
+    if not a.link:
+        print('ヒント: --link ~/src を付けると、~/src が書く場所になり、btrfs の場所を覚えなくてよくなる')
     print('次: sudo ./install.sh ' + mnt + ' を実行すると、自動実行が入ります')
     print(f'注意: 再起動すると外れます (fstab は後で決める)。行の例: {img} {mnt} btrfs loop,compress-force=zstd:3,nofail 0 0')
 
@@ -705,6 +764,8 @@ def main():
     p = sub.add_parser('commit'); p.add_argument('-m', '--message'); p.add_argument('--name')
     p.add_argument('--allow-empty', action='store_true'); p.set_defaults(fn=cmd_commit)
     p = sub.add_parser('status'); p.add_argument('-s', '--short', action='store_true'); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser('info'); p.set_defaults(fn=cmd_info)
+    p = sub.add_parser('link'); p.add_argument('path', help='書く場所にしたいパス (例 ~/src)'); p.add_argument('--owner', help='work/ の持ち主 (ユーザー名か uid)'); p.set_defaults(fn=cmd_link)
     p = sub.add_parser('run'); p.set_defaults(fn=cmd_run)
     p = sub.add_parser('adopt'); p.add_argument('src', help='切り替える普通のフォルダ (例 ~/src)'); p.set_defaults(fn=cmd_adopt)
     p = sub.add_parser('rebuild'); p.add_argument('dest', help='移し先の btrfs のマウント先 (空であること)'); p.set_defaults(fn=cmd_rebuild)
