@@ -57,6 +57,34 @@ def die(msg):
     sys.exit(f'エラー: {msg}')
 
 
+def write_atomic(path, text):
+    """path を、一時ファイルに書いてから改名で差し替える。途中で止まっても、古い内容か新しい内容のどちらかが残る。"""
+    tmp = f'{path}.tmp.{os.getpid()}'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_json(path, default=None):
+    """JSON を読む。無ければ default。壊れていれば、何が壊れているかを示して止まる (例外の表示で終わらせない)。"""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except ValueError as e:
+        die(f'{path} が壊れています ({e})。別の場所のコピーから戻すか、消してください')
+
+
 _libc.copyfile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32]
 COPYFILE_ALL = 0xf          # ACL | STAT | XATTR | DATA
 COPYFILE_METADATA = 0x7     # ACL | STAT | XATTR
@@ -72,6 +100,31 @@ def copy(src, dst, flags):
 
 def _clone(src, dst):
     return _libc.clonefile(os.fsencode(src), os.fsencode(dst), 0) == 0
+
+
+def force_rmtree(path):
+    """変更禁止の印 (uchg) や、書き込めない・読めないディレクトリがあっても、ツリーごと消す。
+    ふつうの rmtree は、これらで PermissionError になり、半分消えた状態で止まる。"""
+    def unlock(p):
+        try:
+            os.chflags(p, 0, follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
+    unlock(path)
+    for root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+        for n in dirs + files:
+            q = os.path.join(root, n)
+            unlock(q)
+            if n in dirs and not os.path.islink(q):
+                try:
+                    os.chmod(q, 0o700)
+                except OSError:
+                    pass
+    shutil.rmtree(path)
 
 
 def clone_tree(src, dst, bad=None):
@@ -91,9 +144,16 @@ def clone_tree(src, dst, bad=None):
 
     if os.path.isdir(src) and not os.path.islink(src):
         os.mkdir(dst)
-        with os.scandir(src) as it:
-            for e in it:
-                clone_tree(e.path, os.path.join(dst, e.name), bad)
+        try:
+            with os.scandir(src) as it:
+                entries = list(it)
+        except OSError as e:
+            # 読めないディレクトリ: 中身は複製できない。空のディレクトリだけ残して続ける (全体を落とさない)
+            bad.add(src)
+            print(f'警告: 読めないため中身を飛ばしました: {src} ({e.strerror})', file=sys.stderr)
+            entries = []
+        for e in entries:
+            clone_tree(e.path, os.path.join(dst, e.name), bad)
         _libc.copyfile(os.fsencode(src), os.fsencode(dst), None, COPYFILE_METADATA | COPYFILE_NOFOLLOW)
         return
     bad.add(src)
@@ -119,15 +179,13 @@ class Store:
         return os.path.join(self.dir(name), 'fs')
 
     def meta(self, name):
-        try:
-            with open(os.path.join(self.dir(name), 'meta.json')) as f:
-                return json.load(f)
-        except FileNotFoundError:
+        m = load_json(os.path.join(self.dir(name), 'meta.json'))
+        if m is None:
             die(f'no such layer: {name}')
+        return m
 
     def write_meta(self, name, meta):
-        with open(os.path.join(self.dir(name), 'meta.json'), 'w') as f:
-            json.dump(meta, f)
+        write_atomic(os.path.join(self.dir(name), 'meta.json'), json.dumps(meta))
 
     def names(self):
         return sorted(n for n in os.listdir(self.layers) if not n.startswith('.'))
@@ -188,7 +246,7 @@ def cmd_rm(st, a):
     kids = [n for n in st.names() if st.meta(n)['parent'] == a.name]
     if kids and not a.force:
         die(f'{a.name} is the parent of: {" ".join(kids)} (use -f; children keep working, they hold their own clones)')
-    shutil.rmtree(st.dir(a.name))
+    force_rmtree(st.dir(a.name))
 
 
 def same(a, b):
@@ -212,7 +270,11 @@ def scan(d):
 
 def diff_tree(tar, old, new, rel=''):
     """Write what turns old into new, with OCI whiteouts for removals."""
-    o, n = scan(os.path.join(old, rel)), scan(os.path.join(new, rel))
+    try:
+        o, n = scan(os.path.join(old, rel)), scan(os.path.join(new, rel))
+    except PermissionError as e:
+        print(f'警告: 読めないため比べられません: {e.filename}', file=sys.stderr)
+        return
     for name in sorted(o.keys() - n.keys()):
         ti = tarfile.TarInfo(os.path.join(rel, WH + name))
         tar.addfile(ti)
@@ -301,16 +363,11 @@ def work_dir(st):
 
 
 def work_conf(st):
-    try:
-        with open(os.path.join(st.root, 'work.json')) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {'base': None}
+    return load_json(os.path.join(st.root, 'work.json'), {'base': None})
 
 
 def save_work_conf(st, conf):
-    with open(os.path.join(st.root, 'work.json'), 'w') as f:
-        json.dump(conf, f, indent=1)
+    write_atomic(os.path.join(st.root, 'work.json'), json.dumps(conf, indent=1))
 
 
 def need_base(conf):
@@ -413,6 +470,15 @@ IMMUTABLE = 0x2 | 0x20000          # UF_IMMUTABLE | SF_IMMUTABLE
 COMPRESSION_XATTRS = (b'com.apple.decmpfs', b'com.apple.ResourceFork')
 
 
+def has_real_rsrc(path, flags):
+    """透過圧縮の入れ物ではない、本物のリソースフォークを持つか。
+    リソースフォークは com.apple.ResourceFork という拡張属性で、圧縮済み (UF_COMPRESSED) のファイルでは圧縮データの置き場でもある。
+    圧縮済みでないのに持っていれば本物で、クローンや ditto で差し替えると中身を失うので、dedup と compress は触らない。"""
+    if flags & UF_COMPRESSED:
+        return False
+    return _libc.getxattr(os.fsencode(path), b'com.apple.ResourceFork', None, 0, 0, XATTR_NOFOLLOW) >= 0
+
+
 def xattrs(path):
     """All extended attributes of path itself (not a symlink's target), or None if unreadable."""
     p = os.fsencode(path)
@@ -458,7 +524,12 @@ def changes(old, new, rel='', since=None):
     `since` is when `old` was cloned from `new`: anything whose ctime is later
     was touched, which also catches xattr-only changes such as code signing.
     """
-    o, n = scan(os.path.join(old, rel)), scan(os.path.join(new, rel))
+    try:
+        o, n = scan(os.path.join(old, rel)), scan(os.path.join(new, rel))
+    except PermissionError as e:
+        # 読めないディレクトリは比べられない。中身が消えたと誤って報告しないよう、変更なしとして飛ばす
+        print(f'警告: 読めないため比べられません: {e.filename}', file=sys.stderr)
+        return
     for name in sorted(o.keys() | n.keys()):
         if (not rel and name in EXCLUDE) or name in PRUNE:
             continue
@@ -494,11 +565,20 @@ def visible(notes):
 #   changes/GEN.changes  そのコミットの変更一覧
 
 def log_entries(st):
+    out = []
     try:
-        with open(os.path.join(st.root, 'log.jsonl')) as f:
-            return [json.loads(line) for line in f if line.strip()]
+        with open(os.path.join(st.root, 'log.jsonl'), encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    # 書いている途中で止まった行。読み飛ばす (これだけで全部のコマンドが止まるのを避ける)
+                    print('警告: log.jsonl の壊れた行を飛ばしました', file=sys.stderr)
     except FileNotFoundError:
-        return []
+        pass
+    return out
 
 
 def changes_file(st, name):
@@ -507,10 +587,21 @@ def changes_file(st, name):
 
 def record(st, name, msg, notes, when=None):
     os.makedirs(os.path.join(st.root, 'changes'), exist_ok=True)
-    with open(changes_file(st, name), 'w') as f:
-        f.write(f'# {name} {msg or ""}\n' + ''.join(f'{k} {p}\n' for k, p in notes))
-    with open(os.path.join(st.root, 'log.jsonl'), 'a') as f:
-        f.write(json.dumps({'name': name, 'message': msg or '', 'time': when or time.time(), 'changes': len(notes)}, ensure_ascii=False) + '\n')
+    write_atomic(changes_file(st, name), f'# {name} {msg or ""}\n' + ''.join(f'{k} {p}\n' for k, p in notes))
+    line = json.dumps({'name': name, 'message': msg or '', 'time': when or time.time(), 'changes': len(notes)}, ensure_ascii=False) + '\n'
+    fd = os.open(os.path.join(st.root, 'log.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        # 前の行が途中で止まっていても、この行が巻き込まれないよう、改行で終わっていなければ足す
+        size = os.fstat(fd).st_size
+        if size:
+            with open(os.path.join(st.root, 'log.jsonl'), 'rb') as r:
+                r.seek(size - 1)
+                if r.read(1) != b'\n':
+                    line = '\n' + line
+        os.write(fd, line.encode('utf-8'))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def resolve_gen(st, conf, spec):
@@ -648,11 +739,19 @@ def cmd_gc(st, a):
     conf = work_conf(st)
     if a.keep < 1:
         die('--keep は 1 以上にしてください (HEAD は消せません)')
+    failed = 0
     names = [e['name'] for e in log_entries(st) if os.path.isdir(st.dir(e['name']))]
     for old in names[:-a.keep]:
         if old != conf.get('base'):
-            shutil.rmtree(st.dir(old))
+            try:
+                force_rmtree(st.dir(old))
+            except OSError as e:
+                failed += 1
+                print(f'消せませんでした: {old} ({e.strerror or e})', file=sys.stderr)
+                continue
             print(f'消しました: {old}')
+    if failed:
+        sys.exit(1)
 
 
 # ---------- ハッシュの索引、重複排除、検査 ----------
@@ -779,6 +878,13 @@ def copy_identity(src_stat, src, dst):
         if name not in COMPRESSION_XATTRS:
             _libc.setxattr(os.fsencode(dst), name, value, len(value), 0, XATTR_NOFOLLOW)
     _libc.copyfile(os.fsencode(src), os.fsencode(dst), None, 0x1 | COPYFILE_NOFOLLOW)    # ACL だけ
+    try:
+        os.lchown(dst, src_stat.st_uid, src_stat.st_gid)      # 所有者を変えられるのは root だけ。だめならグループだけでも写す
+    except PermissionError:
+        try:
+            os.lchown(dst, -1, src_stat.st_gid)
+        except PermissionError:
+            pass
     os.chmod(dst, stat.S_IMODE(src_stat.st_mode))
     keep = os.lstat(dst).st_flags & UF_COMPRESSED
     want = (src_stat.st_flags & ~UF_COMPRESSED) | keep
@@ -872,32 +978,56 @@ def keep_path(d, arg):
 _seq = 0
 
 
-def relink(canon, target, scratch):
+def relink(canon, target, scratch, digest=None, checked=True):
     """target を、同じ中身の canon のクローンに置き換える (属性は target のものを保つ)。
-    一時ファイルは scratch に作る。作業ツリーに置くと、途中で止まったときにコミットへ入ってしまう。"""
+    一時ファイルは scratch に作る。作業ツリーに置くと、途中で止まったときにコミットへ入ってしまう。
+
+    digest を渡すと、置き換える直前に target の中身がそれと同じか確かめ、違えば何もせず ChangedError にする
+    (索引のハッシュは、大きさと更新時刻が同じなら変わっていないという前提で、書き換えを見逃すことがある)。
+    checked なら、置き換えの間に target へ書き込みがあったときは取り消して ChangedError にする。
+    """
     global _seq
     _seq += 1
     s = os.lstat(target)
     tmp = os.path.join(scratch, f'dedup.{os.getpid()}.{_seq}')
     try:
+        if digest is not None and file_digest(target) != digest:
+            raise ChangedError('中身が索引の記録と違う')
+        cs = os.lstat(canon)
         if not _clone(canon, tmp):
             raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+        cn = os.lstat(canon)
+        if (cn.st_size, cn.st_mtime_ns) != (cs.st_size, cs.st_mtime_ns):
+            raise ChangedError('複製元が複製の間に変わった')
         copy_identity(s, target, tmp)
         if os.lstat(tmp).st_size != s.st_size:
             raise OSError(0, 'クローンのサイズが違う')
-        os.rename(tmp, target)
+        if checked:
+            if not replace_checked(target, tmp, s, scratch):
+                raise ChangedError('置き換えの間に書き込まれた')
+        else:
+            os.rename(tmp, target)
     except OSError:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+    except ChangedError:
         if os.path.lexists(tmp):
             os.unlink(tmp)
         raise
 
 
-def relink_in_layers(st, canon, rel, size, mtime_ns):
+class ChangedError(Exception):
+    """置き換えの途中で、対象か複製元が変わっていた。何も失わずに取り消した。"""
+
+
+def relink_in_layers(st, canon, rel, size, mtime_ns, digest):
     """コミットの中の同じファイルも付け替える。
 
     コミットは作業ツリーのクローンなので、付け替える前の実体を掴み続ける。
     そのままでは、作業ツリーでまとめても容量が空かない。
-    サイズと更新時刻が同じなら、コミットした時点から中身は変わっていない。
+    サイズと更新時刻が同じで、中身のハッシュも digest と同じものだけを付け替える
+    (更新時刻を戻す書き換えがあるので、大きさと時刻だけでは決めない)。
     """
     n = 0
     scratch = scratch_dir(st)
@@ -910,9 +1040,9 @@ def relink_in_layers(st, canon, rel, size, mtime_ns):
         if not stat.S_ISREG(ls.st_mode) or (ls.st_size, ls.st_mtime_ns) != (size, mtime_ns) or ls.st_nlink > 1:
             continue
         try:
-            relink(canon, f, scratch)
+            relink(canon, f, scratch, digest=digest, checked=False)
             n += 1
-        except OSError:
+        except (OSError, ChangedError):
             pass
     return n
 
@@ -926,8 +1056,12 @@ def cmd_dedup(st, a):
     for rel, why in bad[:20]:
         print(f'  読めない: {rel} ({why})')
     free_before = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
+    # 開かれているファイルは差し替えない (開いている側は、名前を失った古い実体へ書き続け、書き込みが消える)。
+    # 調べられなければ、何も書き換えずに止まる。dry-run は見積もりだけなので、調べられなくても続ける
+    open_files = (open_files_on_volume(st) or set()) if a.dry_run else require_open_files(st)
+    last_open = time.time()
 
-    groups = files = est = skipped = in_layers = 0
+    groups = files = est = skipped = in_layers = changed = 0
     # 1 回の問い合わせで、同じ中身の組を大きい順に取り出す (組ごとに引き直すと、件数の 2 乗の時間がかかる)
     import itertools
     cur = db.execute('SELECT sha256, size, path, mtime_ns, ino, shared_with FROM files WHERE size > 0'
@@ -936,14 +1070,23 @@ def cmd_dedup(st, a):
                      ' ORDER BY size DESC, sha256, path').fetchall()
     for (sha, size), members in itertools.groupby(cur, key=lambda r: (r[0], r[1])):
         rows = [m[2:] for m in members]
-        # 記録の後で変わったもの、ハードリンク、変更禁止のものは触らない
+        if not a.dry_run and time.time() - last_open > 60:
+            open_files = require_open_files(st)
+            last_open = time.time()
+        # 記録の後で変わったもの、ハードリンク、変更禁止のもの、データベース、開かれているもの、
+        # 本物のリソースフォークを持つものは触らない
         live = []
         for rel, mtime_ns, ino, shared in rows:
+            path = os.path.join(d, rel)
             try:
-                s = os.lstat(os.path.join(d, rel))
+                s = os.lstat(path)
             except OSError:
                 continue
             if (s.st_size, s.st_mtime_ns, s.st_ino) != (size, mtime_ns, ino) or s.st_nlink > 1 or s.st_flags & IMMUTABLE:
+                skipped += 1
+                continue
+            if os.path.splitext(rel)[1].lower() in DATABASE_EXTS or os.path.basename(rel) in DATABASE_NAMES \
+                    or os.path.realpath(path) in open_files or has_real_rsrc(path, s.st_flags):
                 skipped += 1
                 continue
             live.append((rel, s, shared))
@@ -953,6 +1096,19 @@ def cmd_dedup(st, a):
         live.sort(key=lambda x: (not x[1].st_flags & UF_COMPRESSED, x[0]))
         canon_rel, canon_stat, _ = live[0]
         canon = os.path.join(d, canon_rel)
+        canon_digest = None
+        if not a.dry_run:
+            # 索引のハッシュは、大きさと更新時刻が同じなら変わっていないという前提で取ったもの。複製元の中身を、いま確かめる
+            try:
+                canon_digest = file_digest(canon)
+            except OSError:
+                skipped += len(live) - 1
+                continue
+            if canon_digest != sha:
+                skipped += len(live) - 1
+                db.execute('DELETE FROM files WHERE path = ?', (canon_rel,))      # 索引が古い。次回ハッシュを取り直す
+                print(f'  飛ばした (複製元の中身が索引と違う): {canon_rel}', file=sys.stderr)
+                continue
         did = False
         for rel, s, shared in live[1:]:
             if shared == canon_stat.st_ino:
@@ -964,14 +1120,18 @@ def cmd_dedup(st, a):
                 continue
             target = os.path.join(d, rel)
             try:
-                relink(canon, target, scratch)
-            except OSError as e:
+                relink(canon, target, scratch, digest=canon_digest)
+            except (OSError, ChangedError) as e:
                 files -= 1
                 est -= s.st_blocks * 512
                 skipped += 1
-                print(f'  飛ばした: {rel} ({e.strerror or e})', file=sys.stderr)
+                if isinstance(e, ChangedError):
+                    changed += 1
+                    if str(e) == '中身が索引の記録と違う':
+                        db.execute('DELETE FROM files WHERE path = ?', (rel,))      # 次回ハッシュを取り直す
+                print(f'  飛ばした: {rel} ({getattr(e, "strerror", None) or e})', file=sys.stderr)
                 continue
-            in_layers += relink_in_layers(st, canon, rel, size, s.st_mtime_ns)
+            in_layers += relink_in_layers(st, canon, rel, size, s.st_mtime_ns, canon_digest)
             n = os.lstat(target)
             db.execute('UPDATE files SET ino = ?, mtime_ns = ?, shared_with = ? WHERE path = ?',
                        (n.st_ino, n.st_mtime_ns, canon_stat.st_ino, rel))
@@ -981,6 +1141,8 @@ def cmd_dedup(st, a):
     free_after = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
     verb = 'まとめられる' if a.dry_run else 'まとめた'
     print(f'{verb}: {groups} 組、{files} ファイル、見積もり {est / (1 << 20):.0f} MB (飛ばした {skipped})')
+    if changed:
+        print(f'  置き換えの前後で変わっていたため取り消したファイル: {changed}')
     if not a.dry_run:
         print(f'コミットの中で付け替えたファイル: {in_layers}')
         print(f'空き容量の増加: {(free_after - free_before) / (1 << 20):.0f} MB')
@@ -1019,8 +1181,12 @@ def ditto(src, dst):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     r = subprocess.run(['ditto', '--hfsCompression', '--noclone', src, dst], capture_output=True, text=True)
     if r.returncode:
+        DITTO_FAILED.append(src)
         print(f'警告: コピーできませんでした: {src} ({r.stderr.strip()[:120]})', file=sys.stderr)
     return r.returncode == 0
+
+
+DITTO_FAILED = []
 
 
 # ---------- APFS 透過圧縮、圧縮を保つパス (keep) ----------
@@ -1049,15 +1215,25 @@ DATABASE_NAMES = {'index.sqlite', 'quota.db'}
 
 
 def open_files_on_volume(st):
-    """ボリューム上で開かれているファイルの実体パスの集合を返す。"""
+    """ボリューム上で開かれているファイルの実体パスの集合を返す。調べられなかったときは None
+    (空の集合と区別する。呼び出し側は、None なら何も書き換えずに止まる)。
+    lsof は、開いているものが無いと終了コード 1 を返すので、出力が空で 1 の場合だけ「無し」とみなす。"""
     mnt = os.path.dirname(st.root)
     try:
-        r = subprocess.run(['lsof', '-Fn', mnt], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            return {os.path.realpath(line[1:]) for line in r.stdout.splitlines() if line.startswith('n/')}
+        r = subprocess.run(['lsof', '-Fn', mnt], capture_output=True, text=True, timeout=60)
     except Exception:
-        pass
-    return set()
+        return None
+    if r.returncode == 0 or (r.returncode == 1 and not r.stdout.strip() and not r.stderr.strip()):
+        return {os.path.realpath(line[1:]) for line in r.stdout.splitlines() if line.startswith('n/')}
+    return None
+
+
+def require_open_files(st):
+    """開かれているファイルの一覧を取る。取れなければ、書き換えを始めずに止まる。"""
+    s = open_files_on_volume(st)
+    if s is None:
+        die('開かれているファイルを調べられません (lsof が失敗)。書き換えを始めずに止めました')
+    return s
 
 
 def keep_file(st):
@@ -1076,13 +1252,11 @@ def load_keep(st):
             os.remove(old)
             return keeps
         return set()
-    with open(p, 'r', encoding='utf-8') as f:
-        return set(json.load(f))
+    return set(load_json(p, []))
 
 
 def save_keep(st, keeps):
-    with open(keep_file(st), 'w', encoding='utf-8') as f:
-        json.dump(sorted(keeps), f, ensure_ascii=False, indent=2)
+    write_atomic(keep_file(st), json.dumps(sorted(keeps), ensure_ascii=False, indent=2))
 
 
 def kept(rel, keeps):
@@ -1146,7 +1320,7 @@ def compress_file(st, path, rel, s, scratch):
                 pass
 
     # 7. コミットの中の同一ファイルも付け替える (クローンで共有され容量が空く)
-    in_layers = relink_in_layers(st, path, rel, s.st_size, s.st_mtime_ns)
+    in_layers = relink_in_layers(st, path, rel, s.st_size, s.st_mtime_ns, orig_sha)
     saved_blocks = s.st_blocks - os.lstat(path).st_blocks
     return True, max(0, saved_blocks), in_layers
 
@@ -1201,7 +1375,7 @@ def cmd_compress(st, a):
     now = time.time()
     seven_days_ago = now - 7 * 86400
     keeps = load_keep(st)
-    open_files = open_files_on_volume(st)
+    open_files = set() if dry_run else require_open_files(st)
     last_open = time.time()
 
     free_before = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
@@ -1238,8 +1412,8 @@ def cmd_compress(st, a):
 
     for rel, s in candidates:
         # 開かれているファイルの一覧は、実行の途中でも新しくする。長い実行の間に開かれたものを見落とさないため
-        if time.time() - last_open > 60:
-            open_files = open_files_on_volume(st)
+        if not dry_run and time.time() - last_open > 60:
+            open_files = require_open_files(st)
             last_open = time.time()
         # 既に圧縮済み
         if s.st_flags & UF_COMPRESSED:
@@ -1269,7 +1443,7 @@ def cmd_compress(st, a):
             continue
 
         path = os.path.join(d, rel)
-        if os.path.realpath(path) in open_files:
+        if os.path.realpath(path) in open_files or has_real_rsrc(path, s.st_flags):
             skipped += 1
             continue
 
@@ -1445,6 +1619,10 @@ def cmd_rebuild_into(st, a):
     v = os.statvfs(new_root)
     print(f'入れ直し ({a.mode}): コミット {n} 個、{time.time() - t0:.0f} 秒、CPU {cpu:.0f} 秒、'
           f'ボリュームの使用量 {(v.f_blocks - v.f_bfree) * v.f_frsize / (1 << 30):.2f} GB')
+    if DITTO_FAILED:
+        print(f'エラー: コピーできなかったファイルが {len(DITTO_FAILED)} 個あります (新しいボリュームには入っていません)。'
+              f'元のボリュームは消さないでください', file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
