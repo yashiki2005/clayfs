@@ -118,6 +118,36 @@ def test_like_delete_is_exact(root):
     print('  index: 削除は下の項目だけ。_ や % を含む名前が、ほかの項目を巻き込まない')
 
 
+def test_pycache_is_pruned(root):
+    import subprocess
+    store = os.path.join(root, 'store')
+    work = os.path.join(root, 'work')
+    os.makedirs(os.path.join(work, 'proj', '__pycache__'))
+    os.makedirs(os.path.join(work, '__pycache__'))
+    write(os.path.join(work, 'proj', 'a.py'), 'print(1)\n')
+    write(os.path.join(work, 'proj', '__pycache__', 'a.cpython-314.pyc'), 'bytecode-1')
+    write(os.path.join(work, '__pycache__', 'top.pyc'), 'bytecode-top')
+
+    def tool(*args):
+        return subprocess.run([sys.executable, TOOL, '-s', store, '-C', work, *args],
+                              capture_output=True, text=True)
+
+    r = tool('commit', '-m', 'init')
+    assert r.returncode == 0, r.stderr
+    layers = sorted(n for n in os.listdir(os.path.join(store, 'layers')) if not n.startswith('.'))
+    fs = os.path.join(store, 'layers', layers[-1], 'fs')
+    assert os.path.exists(os.path.join(fs, 'proj', 'a.py')), 'source must be committed'
+    assert not os.path.exists(os.path.join(fs, 'proj', '__pycache__')), 'nested pycache must not be committed'
+    assert not os.path.exists(os.path.join(fs, '__pycache__')), 'top-level pycache must not be committed'
+    # 生成物だけが変わっても、変更とはみなさない
+    write(os.path.join(work, 'proj', '__pycache__', 'a.cpython-314.pyc'), 'bytecode-2 changed')
+    r = tool('status')
+    assert '変更はありません' in r.stdout, f'pycache change must not show: {r.stdout}'
+    names = [rel for rel, _ in ct.walk_files(work)]
+    assert not any('__pycache__' in n.split(os.sep) for n in names), names
+    print('  pycache: コミットにも差分にも走査にも入らない (どの階層でも)')
+
+
 def main():
     print('=== compress レビュー指摘の修正テスト ===')
     root = os.path.abspath('test_clayfs_fixes_env')
@@ -126,7 +156,8 @@ def main():
     os.makedirs(root)
     try:
         for name in ['test_replace_checked_success', 'test_replace_checked_keeps_concurrent_write',
-                     'test_scratch_sweep_and_no_temp_in_work', 'test_project_name', 'test_like_delete_is_exact']:
+                     'test_scratch_sweep_and_no_temp_in_work', 'test_project_name', 'test_like_delete_is_exact',
+                     'test_pycache_is_pruned']:
             case = os.path.join(root, name)
             os.makedirs(case)
             globals()[name](case)

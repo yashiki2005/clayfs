@@ -284,6 +284,8 @@ def cmd_apply(st, a):
 STORE_NAME = '.clayfs'
 # ボリュームの直下にある、コミットに含めないもの (ストア自身と、macOS がボリュームごとに持つ管理用)
 EXCLUDE = {STORE_NAME, '.fseventsd', '.Spotlight-V100', '.Trashes', '.TemporaryItems', '.DocumentRevisions-V100'}
+# どの階層にあっても、コミットにも差分にも入れない生成物 (Python のバイトコード)。消えても再生成される
+PRUNE = {'__pycache__'}
 LABEL = {'A': '追加', 'M': '変更', 'D': '削除'}
 
 
@@ -319,6 +321,21 @@ def need_base(conf):
 
 def top_entries(d):
     return sorted(n for n in os.listdir(d) if n not in EXCLUDE)
+
+
+def strip_pruned(root):
+    """複製したコミットの中から、PRUNE の名前のフォルダを取り除く。作業ツリーの側は触らない。"""
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        with os.scandir(d) as it:
+            for e in it:
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+                if e.name in PRUNE:
+                    shutil.rmtree(e.path)
+                else:
+                    stack.append(e.path)
 
 
 def copy_tree(src, dst):
@@ -372,6 +389,7 @@ def snapshot(st, conf, name=None):
                 clone_tree(os.path.join(d, n), os.path.join(tmp, 'fs', n), bad)
         else:
             clone_tree(d, os.path.join(tmp, 'fs'), bad)
+        strip_pruned(os.path.join(tmp, 'fs'))
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -442,7 +460,7 @@ def changes(old, new, rel='', since=None):
     """
     o, n = scan(os.path.join(old, rel)), scan(os.path.join(new, rel))
     for name in sorted(o.keys() | n.keys()):
-        if not rel and name in EXCLUDE:
+        if (not rel and name in EXCLUDE) or name in PRUNE:
             continue
         p = os.path.join(rel, name)
         a, b = o.get(name), n.get(name)
@@ -691,7 +709,7 @@ def walk_files(d, sub=''):
             continue
         with it:
             for e in it:
-                if not rel and e.name in EXCLUDE:
+                if (not rel and e.name in EXCLUDE) or e.name in PRUNE:
                     continue
                 r = os.path.join(rel, e.name)
                 if e.is_symlink():
