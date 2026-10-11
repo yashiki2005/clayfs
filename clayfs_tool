@@ -1213,6 +1213,9 @@ DATABASE_EXTS = {
 }
 DATABASE_NAMES = {'index.sqlite', 'quota.db'}
 
+# APFS の透過圧縮 (ditto --hfsCompression) で圧縮できる最大のファイルの大きさ。これを超えると、圧縮されずにそのままコピーされる
+HFS_COMPRESS_MAX = 1 << 29
+
 
 def open_files_on_volume(st):
     """ボリューム上で開かれているファイルの実体パスの集合を返す。調べられなかったときは None
@@ -1409,6 +1412,7 @@ def cmd_compress(st, a):
     saved_bytes = 0
     in_layers_total = 0
     skipped = 0
+    too_big = 0
 
     for rel, s in candidates:
         # 開かれているファイルの一覧は、実行の途中でも新しくする。長い実行の間に開かれたものを見落とさないため
@@ -1424,6 +1428,11 @@ def cmd_compress(st, a):
             continue
         # 1 ブロック (4KiB) に収まる小さいファイルは除外
         if s.st_size <= 4096:
+            continue
+        # 512 MiB を超えるファイルは、ditto --hfsCompression が圧縮しない (実測: 2^29 バイトまで圧縮され、1 バイト超えると圧縮されない)。
+        # 試して無駄に読み書きするより、先に数えて知らせる
+        if s.st_size > HFS_COMPRESS_MAX:
+            too_big += 1
             continue
         # ハードリンク
         if s.st_nlink > 1:
@@ -1466,10 +1475,14 @@ def cmd_compress(st, a):
     db.close()
     if dry_run:
         print(f'圧縮対象: {count} ファイル (飛ばす予定 {skipped})')
+        if too_big:
+            print(f'  512 MiB を超えて圧縮できないファイル: {too_big}')
         return
 
     free_after = os.statvfs(d).f_bavail * os.statvfs(d).f_frsize
     print(f'透過圧縮: {count} ファイル、削減 {saved_bytes / (1 << 20):.1f} MB (飛ばした {skipped})')
+    if too_big:
+        print(f'512 MiB を超えて圧縮できないファイル: {too_big} (APFS の透過圧縮の上限)')
     if in_layers_total:
         print(f'コミットの中で付け替えたファイル: {in_layers_total}')
     print(f'空き容量の増加: {(free_after - free_before) / (1 << 20):.1f} MB')
