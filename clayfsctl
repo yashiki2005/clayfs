@@ -34,6 +34,8 @@
 #   clayfsctl rebuild --fresh|--replay [NEWIMAGE]
 #                             新しいイメージ (既定 CLAYFS_IMAGE の隣に .new) を作り、圧縮して入れ直す。
 #                             今のイメージには触れない。--fresh は履歴なし、--replay は履歴を再現する
+#   clayfsctl shrink [--verify]
+#                             空きをゼロで埋め、全バンドに穴を開けて縮める (オフライン。ホストに余裕が要る)
 #   clayfsctl compact         イメージの空き領域を回収する (down の状態で)
 #   clayfsctl info            設定と状態を表示する
 #   clayfsctl run             マウントし、変更があればコミットする (自動実行用)
@@ -140,11 +142,13 @@ cmd_init() {
 mount_image() {
   is_mounted "$CLAYFS_MNT" && return 0
   [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE (clayfsctl init)"
+  # 鍵の親が無いと mkdir は必ず失敗する。待ち続けないよう、先に作っておく
+  mkdir -p "$(dirname "$UPLOCK")"
   _i=0
   while ! mkdir "$UPLOCK" 2>/dev/null; do
     _i=$((_i + 1))
-    # 2 分待っても空かなければ、異常終了の残りとみなして引き取る
-    [ $_i -gt 120 ] && { rmdir "$UPLOCK" 2>/dev/null; continue; }
+    # 2 分待っても空かなければ、異常終了の残りとみなして引き取る (数えを戻して、待ちは続ける)
+    if [ $_i -gt 120 ]; then rmdir "$UPLOCK" 2>/dev/null; _i=0; fi
     sleep 1
     is_mounted "$CLAYFS_MNT" && return 0
   done
@@ -244,6 +248,54 @@ cmd_compact() {
   echo "回収しました: $(( (before - after) / 1024 )) MB (現在 $(( after / 1024 )) MB)"
 }
 
+# 空きを返す (オフライン)。ゼロ埋め → 埋めた分を消す → 全バンドに穴を開ける。
+# 穴あけはバンドを外した状態でしか行えない。途中で失敗しても、マウントを戻す。
+HOLEPUNCH="${HOLEPUNCH:-$HOME/build/bin/holepunch}"
+SHRINK_MARGIN_KB="${SHRINK_MARGIN_KB:-10485760}"   # ホストに残す余裕 (10GB)
+
+shrink_restore() {
+  [ -n "${shrink_tmp:-}" ] && is_mounted "$shrink_tmp" && quiet hdiutil detach "$shrink_tmp"
+  [ -n "${shrink_tmp:-}" ] && rmdir "$shrink_tmp" 2>/dev/null
+  is_mounted "$CLAYFS_MNT" || cmd_up >/dev/null 2>&1 || echo "警告: 再マウントできません。clayfsctl up で戻してください" >&2
+}
+
+cmd_shrink() {
+  verify=0
+  [ "${1:-}" = --verify ] && verify=1
+  [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE"
+  [ -x "$HOLEPUNCH" ] || die "holepunch がありません: $HOLEPUNCH (HOLEPUNCH で場所を指定)"
+  need_up
+  vol_free="$(df -k "$CLAYFS_MNT" | tail -1 | awk '{print $4}')"
+  host_free="$(df -k "$(dirname "$CLAYFS_IMAGE")" | tail -1 | awk '{print $4}')"
+  [ "$host_free" -ge $(( vol_free + SHRINK_MARGIN_KB )) ] \
+    || die "ホストの空きが足りません (ホスト ${host_free} KB < ボリュームの空き ${vol_free} KB + 余裕 ${SHRINK_MARGIN_KB} KB)"
+  lock
+  trap 'shrink_restore; rm -rf "$LOCK"' EXIT
+  before="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
+  echo "ボリュームの空き $((vol_free / 1048576)) GB、ホストの空き $((host_free / 1048576)) GB"
+  cmd_down || die "外せません。使っているものを止めてから再実行してください"
+  shrink_tmp="$(mktemp -d "$HOME/.clayfs-shrink.XXXXXX")" || die "作業用の場所を作れません"
+  attach_at "$shrink_tmp" || die "つなげません: $CLAYFS_IMAGE"
+  fill="$shrink_tmp/.clayfs-zerofill"
+  echo "空きをゼロで埋めています..."
+  dd if=/dev/zero of="$fill" bs=1048576 2>/dev/null || true
+  sync
+  [ -n "$fill" ] && rm -f "$fill"
+  sync
+  quiet hdiutil detach "$shrink_tmp" || die "外せません: $shrink_tmp"
+  rmdir "$shrink_tmp" 2>/dev/null
+  shrink_tmp=""
+  echo "バンドに穴を開けています..."
+  find "$CLAYFS_IMAGE/bands" -type f -print0 | xargs -0 -P 4 -n 1 "$HOLEPUNCH" >/dev/null 2>&1 \
+    || echo "警告: 穴あけに失敗したバンドがあります" >&2
+  quiet hdiutil compact "$CLAYFS_IMAGE" || true
+  after="$(du -sk "$CLAYFS_IMAGE" | cut -f1)"
+  cmd_up || die "マウントできません"
+  echo "縮めました: $(( (before - after) / 1024 )) MB (現在 $(( after / 1024 )) MB)"
+  [ $verify = 1 ] && tool scrub
+  exit 0
+}
+
 cmd_info() {
   echo "対象     $CLAYFS_DIR $([ -L "$CLAYFS_DIR" ] && echo "-> $(readlink "$CLAYFS_DIR")" || echo "(まだ切り替えていません)")"
   echo "マウント $CLAYFS_MNT $(is_mounted "$CLAYFS_MNT" && echo "(マウント中)" || echo "(マウントされていません)")"
@@ -335,6 +387,7 @@ case "$cmd" in
   unkeep) cmd_unkeep "$@" ;;
   rebuild) cmd_rebuild "$@" ;;
   compact) cmd_compact ;;
+  shrink) cmd_shrink "$@" ;;
   info) cmd_info ;;
   run) cmd_run ;;
   install-agent) cmd_install_agent ;;
