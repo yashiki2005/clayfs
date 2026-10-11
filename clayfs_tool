@@ -315,6 +315,13 @@ def remove(path):
         os.unlink(path)
 
 
+def inside_root(root, parent):
+    """root の下の parent (相対) の実体が、root の中にあるか。途中にシンボリックリンクがあって外を指していれば False。"""
+    rr = os.path.realpath(root)
+    rp = os.path.realpath(os.path.join(root, parent))
+    return rp == rr or rp.startswith(rr + os.sep)
+
+
 def apply_tar(root, tarpath):
     with tarfile.open(tarpath) as tar:
         for m in tar:
@@ -322,9 +329,14 @@ def apply_tar(root, tarpath):
             if name.startswith(('/', '..')):
                 die(f'unsafe path in layer: {m.name}')
             d, base = os.path.split(name)
+            # 親の途中にある、外を指すシンボリックリンクを通って、レイヤーの外のファイルを消したり書いたりしない
+            if not inside_root(root, d):
+                die(f'unsafe path in layer (リンクがレイヤーの外を指しています): {m.name}')
             if base == OPQ:
-                for e in os.listdir(os.path.join(root, d)):
-                    remove(os.path.join(root, d, e))
+                parent = os.path.join(root, d)
+                if os.path.isdir(parent) and not os.path.islink(parent):
+                    for e in os.listdir(parent):
+                        remove(os.path.join(parent, e))
                 continue
             if base.startswith(WH):
                 remove(os.path.join(root, d, base[len(WH):]))
@@ -431,9 +443,17 @@ def cmd_fill(st, a):
 def snapshot(st, conf, name=None):
     """Clone everything in the working directory into a new layer; returns its name."""
     d = work_dir(st)
+    explicit = name is not None
     name = name or time.strftime('base-%Y%m%d-%H%M%S')
     if os.path.exists(st.dir(name)):
-        die('同じ秒に 2 回はコミットできません')
+        if explicit:
+            die(f'同じ名前のコミットがあります: {name}')
+        # 同じ秒に 2 回目: 連番を付ける (スクリプトから続けて呼んでも失敗しない)
+        n = 2
+        while os.path.exists(st.dir(f'{name}-{n}')):
+            n += 1
+        name = f'{name}-{n}'
+
     bad = {os.path.join(d, p) for p in conf.get('noclone', [])}
     tmp = os.path.join(st.layers, f'.tmp.{os.getpid()}.{name}')
     started = time.time()
@@ -581,13 +601,30 @@ def log_entries(st):
     return out
 
 
+def quote_path(p):
+    """変更一覧は 1 行 1 件なので、改行とバックスラッシュをエスケープして書く。"""
+    return p.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r')
+
+
+def unquote_path(p):
+    out, i = [], 0
+    while i < len(p):
+        if p[i] == '\\' and i + 1 < len(p) and p[i + 1] in '\\nr':
+            out.append({'\\': '\\', 'n': '\n', 'r': '\r'}[p[i + 1]])
+            i += 2
+        else:
+            out.append(p[i])
+            i += 1
+    return ''.join(out)
+
+
 def changes_file(st, name):
     return os.path.join(st.root, 'changes', name + '.changes')
 
 
 def record(st, name, msg, notes, when=None):
     os.makedirs(os.path.join(st.root, 'changes'), exist_ok=True)
-    write_atomic(changes_file(st, name), f'# {name} {msg or ""}\n' + ''.join(f'{k} {p}\n' for k, p in notes))
+    write_atomic(changes_file(st, name), f'# {name} {msg or ""}\n' + ''.join(f'{k} {quote_path(p)}\n' for k, p in notes))
     line = json.dumps({'name': name, 'message': msg or '', 'time': when or time.time(), 'changes': len(notes)}, ensure_ascii=False) + '\n'
     fd = os.open(os.path.join(st.root, 'log.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
@@ -735,6 +772,32 @@ def cmd_show(st, a):
         print(f'中身: {st.fs(gen)}')
 
 
+def trash_report(st, days):
+    """restore が退避した内容 (STORE/trash/日時) を数える。days > 0 なら、それより古いものを消す。"""
+    root = os.path.join(st.root, 'trash')
+    if not os.path.isdir(root):
+        return
+    n = old = 0
+    limit = time.time() - days * 86400
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name)
+        try:
+            when = time.mktime(time.strptime(name, '%Y%m%d-%H%M%S'))
+        except ValueError:
+            continue
+        n += 1
+        if days > 0 and when < limit:
+            try:
+                force_rmtree(path)
+                old += 1
+            except OSError as e:
+                print(f'消せませんでした: {path} ({e.strerror or e})', file=sys.stderr)
+    if days > 0:
+        print(f'退避した内容: {n} 個のうち、{days} 日より古い {old} 個を消しました')
+    elif n:
+        print(f'退避した内容が {n} 個あります ({root})。古いものを消すには --trash-days N')
+
+
 def cmd_gc(st, a):
     conf = work_conf(st)
     if a.keep < 1:
@@ -750,6 +813,7 @@ def cmd_gc(st, a):
                 print(f'消せませんでした: {old} ({e.strerror or e})', file=sys.stderr)
                 continue
             print(f'消しました: {old}')
+    trash_report(st, getattr(a, 'trash_days', 0))
     if failed:
         sys.exit(1)
 
@@ -1370,9 +1434,10 @@ def uncompress_file(path, rel, s, scratch):
 def cmd_compress(st, a):
     d = work_dir(st)
     dry_run = getattr(a, 'dry_run', False)
-    db = index_db(st)
-    # 空実行は作業ツリーも索引も書き換えない。対象の決定には索引が要らない
+    # 空実行は作業ツリーも索引も書き換えない (索引を作ると、以後の commit がハッシュを取り始める)。対象の決定には索引が要らない
+    db = None
     if not dry_run:
+        db = index_db(st)
         scratch = prepare_scratch(st, d)
         refresh_index(st, db)
     now = time.time()
@@ -1471,8 +1536,9 @@ def cmd_compress(st, a):
         else:
             skipped += 1
 
-    db.commit()
-    db.close()
+    if db is not None:
+        db.commit()
+        db.close()
     if dry_run:
         print(f'圧縮対象: {count} ファイル (飛ばす予定 {skipped})')
         if too_big:
@@ -1618,7 +1684,7 @@ def cmd_rebuild_into(st, a):
         commit(gens[0]['name'], gens[0]['message'], [], gens[0]['time'])
         for e in gens[1:]:
             with open(changes_file(st, e['name'])) as f:
-                notes = [tuple(line.rstrip('\n').split(' ', 1)) for line in f if line[:1] != '#' and line.strip()]
+                notes = [(line.rstrip('\n').split(' ', 1)[0], unquote_path(line.rstrip('\n').split(' ', 1)[1])) for line in f if line[:1] != '#' and line.strip()]
             apply(st.fs(e['name']), notes)
             commit(e['name'], e['message'], notes, e['time'])
         # 最後のコミットの後に作業ツリーで変わった分
@@ -1640,7 +1706,7 @@ def cmd_rebuild_into(st, a):
 
 def main():
     ap = argparse.ArgumentParser(prog='clayfs_tool', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('-s', '--store', default=os.environ.get('CLAYFS_STORE', '~/.src.clayfs/store'))
+    ap.add_argument('-s', '--store', default=os.environ.get('CLAYFS_STORE'))
     ap.add_argument('-C', '--dir', help='作業ディレクトリ (省略時は STORE の親)')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
@@ -1668,7 +1734,8 @@ def main():
     p = sub.add_parser('keep'); p.add_argument('paths', nargs='*'); p.set_defaults(fn=cmd_keep)
     p = sub.add_parser('unkeep'); p.add_argument('paths', nargs='+'); p.set_defaults(fn=cmd_unkeep)
     p = sub.add_parser('rebuild-into'); p.add_argument('dest'); p.add_argument('--mode', choices=['fresh', 'replay'], required=True); p.set_defaults(fn=cmd_rebuild_into)
-    p = sub.add_parser('gc'); p.add_argument('--keep', type=int, required=True); p.set_defaults(fn=cmd_gc)
+    p = sub.add_parser('gc'); p.add_argument('--keep', type=int, required=True)
+    p.add_argument('--trash-days', type=int, default=0, help='restore が退避した内容のうち、この日数より古いものを消す (既定 0: 消さない)'); p.set_defaults(fn=cmd_gc)
 
     a = ap.parse_args()
     global WORK_DIR
@@ -1676,6 +1743,12 @@ def main():
         WORK_DIR = os.path.realpath(os.path.expanduser(a.dir))
         if not os.path.isdir(WORK_DIR):
             die(f'ディレクトリではありません: {WORK_DIR}')
+    if not a.store:
+        # 指定がなければ既定の場所を使うが、そこが無ければ(イメージがマウントされていない)作らない。
+        # マウント前のマウント点の下に作ると、以後そこにイメージをマウントできなくなる
+        a.store = '~/.src.clayfs/store'
+        if not os.path.isdir(os.path.expanduser(a.store)):
+            die(f'ストアがありません: {a.store} (イメージがマウントされていないか、-s で場所を指定してください)')
     a.fn(Store(a.store), a)
 
 

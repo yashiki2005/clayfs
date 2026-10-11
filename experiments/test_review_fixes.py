@@ -210,12 +210,86 @@ def t_rebuild_failure(vol):
         os.chmod(f'{vol}/work/unreadable.txt', 0o644)
 
 
+def t_apply_symlink(vol):
+    print('[apply: レイヤーの外を指すリンク]')
+    import importlib.machinery, importlib.util, tarfile, io
+    loader = importlib.machinery.SourceFileLoader('ct_apply', TOOL)
+    spec = importlib.util.spec_from_loader('ct_apply', loader)
+    ct = importlib.util.module_from_spec(spec)
+    loader.exec_module(ct)
+    base = tempfile.mkdtemp(prefix='clayfs-apply.')
+    try:
+        root, outside = os.path.join(base, 'layer'), os.path.join(base, 'outside')
+        os.makedirs(root); os.makedirs(outside)
+        w(os.path.join(outside, 'victim.txt'), b'keep me')
+        os.symlink(outside, os.path.join(root, 'evil'))
+        tp = os.path.join(base, 'l.tar')
+        with tarfile.open(tp, 'w') as t:
+            ti = tarfile.TarInfo('evil/.wh.victim.txt')
+            t.addfile(ti)
+        try:
+            ct.apply_tar(root, tp)
+        except SystemExit:
+            pass
+        check('外を指すリンク経由の削除の印で、レイヤーの外のファイルが消えない', os.path.exists(os.path.join(outside, 'victim.txt')))
+        tp2 = os.path.join(base, 'l2.tar')
+        with tarfile.open(tp2, 'w') as t:
+            ti = tarfile.TarInfo('nodir/.wh..wh..opq')
+            t.addfile(ti)
+        try:
+            ct.apply_tar(root, tp2)
+            ok = True
+        except Exception as e:
+            ok = False
+        check('無いディレクトリへの opaque の印で落ちない', ok)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def t_misc(vol):
+    print('[同じ秒のコミット・dry-run・改行を含む名前・trash・既定のストア]')
+    w(f'{vol}/work/a.txt', b'1')
+    r1 = run(vol, 'commit', '-m', 'one')
+    w(f'{vol}/work/b.txt', b'2')
+    r2 = run(vol, 'commit', '-m', 'two')
+    check('同じ秒に 2 回コミットしても失敗しない', r1.returncode == 0 and r2.returncode == 0, r2.stderr[-200:])
+    log = run(vol, 'log').stdout
+    check('2 つとも log に載る', 'one' in log and 'two' in log, log)
+    w(f'{vol}/work/big.txt', b'x' * 20000)
+    os.utime(f'{vol}/work/big.txt', (1e9, 1e9))
+    check('compress --dry-run は索引を作らない', run(vol, 'compress', '--dry-run').returncode == 0
+          and not os.path.exists(f'{vol}/store/index.sqlite'))
+    odd = 'line1\nline2.txt'
+    w(f'{vol}/work/{odd}', b'odd')
+    time.sleep(1.1)
+    r = run(vol, 'commit', '-m', 'newline')
+    show = run(vol, 'show').stdout
+    check('改行を含む名前も、変更一覧が壊れない', r.returncode == 0 and 'line1\\nline2.txt' in show and sum(1 for l in show.splitlines() if l.startswith('A ')) == 2, repr(show))
+    # 古い trash は、--trash-days を付けたときだけ消す
+    old = f'{vol}/store/trash/20000101-000000/x'
+    os.makedirs(old)
+    r = run(vol, 'gc', '--keep', '5')
+    check('--trash-days なしでは trash を消さず、個数を知らせる', os.path.isdir(f'{vol}/store/trash/20000101-000000') and 'trash' in r.stdout, r.stdout)
+    r = run(vol, 'gc', '--keep', '5', '--trash-days', '30')
+    check('--trash-days で古い trash を消す', not os.path.exists(f'{vol}/store/trash/20000101-000000'), r.stdout)
+    # 既定のストアが無ければ作らない (HOME を空の場所にして確かめる)
+    home = tempfile.mkdtemp(prefix='clayfs-home.')
+    try:
+        r = subprocess.run([sys.executable, '-I', TOOL, 'log'], capture_output=True, text=True, env={**os.environ, 'HOME': home})
+        check('既定のストアが無ければ、作らずに案内して止まる', r.returncode != 0 and not os.path.exists(f'{home}/.src.clayfs'), r.stdout + r.stderr)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def main():
-    tests = [t_dedup_open_file, t_dedup_stale_index, t_dedup_identity, t_json_robust,
+    tests = [t_misc, t_apply_symlink, t_dedup_open_file, t_dedup_stale_index, t_dedup_identity, t_json_robust,
              t_commit_unreadable, t_gc_immutable, t_rebuild_failure]
     only = sys.argv[1:]
     for t in tests:
         if only and t.__name__ not in only:
+            continue
+        if t is t_apply_symlink:
+            t(None)
             continue
         base, vol = make_volume()
         try:
