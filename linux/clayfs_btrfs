@@ -22,6 +22,7 @@
   clayfs_btrfs MNT compress PATH...     btrfs の圧縮 (zstd) で書き直す。reflink の共有は崩れる
   clayfs_btrfs MNT keep [PATH...] | unkeep PATH...   圧縮を保つパス (新しいファイルも圧縮する)
   clayfs_btrfs MNT link PATH [--owner U]   PATH (例 ~/src) を work/ へのリンクにする。書く場所はそこ
+  clayfs_btrfs MNT exclude [NAME...] [--remove NAME]   フォルダ名で除外 (変更の一覧と重複排除から外れる。すぐ効く)
   clayfs_btrfs MNT info                 どこに書けばよいか (書く場所 = MNT/work)、履歴の場所、自動実行の状態
   clayfs_btrfs MNT run                  変更があればコミットする (自動実行用)
   clayfs_btrfs MNT adopt SRC            普通のフォルダ SRC を work/ へ移し、SRC を work/ へのリンクにする (SRC は SRC.orig に残す)
@@ -199,6 +200,12 @@ def parse_dump(text, mtime_changed=lambda rel: True, content_changed=lambda rel:
 
 
 def diff_snapshots(vol, old, new):
+    changes = diff_snapshots_raw(vol, old, new)
+    names = load_exclude(vol)
+    return [(k, p) for k, p in changes if not is_excluded(p, names)] if names else changes
+
+
+def diff_snapshots_raw(vol, old, new):
     """2 つのスナップショット (ro) の差分。send の差分だけを読み、中身は読まない。"""
     # btrfs send の出力 (バイナリ) を receive --dump に通す
     p1 = subprocess.run(['btrfs', 'send', '--no-data', '-p', old, new], capture_output=True)
@@ -573,6 +580,47 @@ def cmd_compress(vol, a):
     print('注意: 圧縮し直すと、reflink で共有していたファイルは共有が外れ、容量が増えることがあります')
 
 
+def exclude_file(vol):
+    return os.path.join(vol.store, 'exclude.json')
+
+
+def load_exclude(vol):
+    """除外する名前 (どの階層にあってもフォルダ名として一致するもの)。毎回読むので、変えればすぐ効く。"""
+    p = exclude_file(vol)
+    if not os.path.exists(p):
+        return set()
+    with open(p, encoding='utf-8') as f:
+        return set(json.load(f))
+
+
+def is_excluded(rel, names):
+    return any(part in names for part in rel.split(os.sep))
+
+
+def cmd_exclude(vol, a):
+    """除外する名前の一覧・追加・削除。変更の一覧と重複排除から外れる (スナップショットの中身は残る)。"""
+    if not a.names and not a.remove:
+        names = sorted(load_exclude(vol))
+        print('\n'.join(names) if names else '(なし)')
+        return
+    for n in a.names + a.remove:
+        if not n or '/' in n or n in ('.', '..'):
+            die(f'フォルダ名を指定してください (パスは不可): {n!r}')
+    fd = lock(vol)
+    try:
+        names = load_exclude(vol)
+        for n in a.names:
+            names.add(n)
+            print(f'除外に追加: {n}')
+        for n in a.remove:
+            names.discard(n)
+            print(f'除外から外す: {n}')
+        atomic_write(exclude_file(vol), json.dumps(sorted(names), ensure_ascii=False, indent=2))
+        print('注意: 除外したフォルダの中身は、以前のコミットに残ったままです (コミットの中身は作業ツリーの丸ごとのスナップショット)。')
+    finally:
+        os.close(fd)
+
+
 def keep_file(vol):
     return os.path.join(vol.store, 'keep.json')
 
@@ -680,6 +728,7 @@ def cmd_dedup(vol, a):
     fd = lock(vol)
     try:
         by_size = {}
+        exclude_names = load_exclude(vol)
         for root, dirs, files in os.walk(vol.work):
             for n in files:
                 p = os.path.join(root, n)
@@ -690,6 +739,8 @@ def cmd_dedup(vol, a):
                 if not os.path.isfile(p) or os.path.islink(p) or s.st_size < 4096:
                     continue
                 if os.path.splitext(n)[1].lower() in DATABASE_EXTS:
+                    continue
+                if is_excluded(os.path.relpath(p, vol.work), exclude_names):
                     continue
                 by_size.setdefault(s.st_size, []).append(p)
         tmpdir = os.path.join(vol.work, TMP_DIR)
@@ -813,6 +864,7 @@ def main():
     p.add_argument('--allow-empty', action='store_true'); p.set_defaults(fn=cmd_commit)
     p = sub.add_parser('status'); p.add_argument('-s', '--short', action='store_true'); p.set_defaults(fn=cmd_status)
     p = sub.add_parser('info'); p.set_defaults(fn=cmd_info)
+    p = sub.add_parser('exclude'); p.add_argument('names', nargs='*', help='除外するフォルダ名 (例 .venv)'); p.add_argument('--remove', action='append', default=[], help='除外から外す名前'); p.set_defaults(fn=cmd_exclude)
     p = sub.add_parser('link'); p.add_argument('path', help='書く場所にしたいパス (例 ~/src)'); p.add_argument('--owner', help='work/ の持ち主 (ユーザー名か uid)'); p.set_defaults(fn=cmd_link)
     p = sub.add_parser('run'); p.set_defaults(fn=cmd_run)
     p = sub.add_parser('adopt'); p.add_argument('src', help='切り替える普通のフォルダ (例 ~/src)'); p.set_defaults(fn=cmd_adopt)

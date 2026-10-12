@@ -49,6 +49,20 @@ st=$($T $M status -s); cd /
 chk "空白を含む名前の変更を、正しい名前で出す (M)" 'echo "$st" | grep -Fx "M odd d/x y.sql" >/dev/null && echo "$st" | grep -Fx "M a  b.txt" >/dev/null'
 chk "名前の変更 (link と unlink) を、新しい名前の追加と、古い名前の削除で出す" 'echo "$st" | grep -Fx "A new name.txt" >/dev/null && echo "$st" | grep -Fx "D oldname.txt" >/dev/null'
 $T $M commit -m odd2 >/dev/null 2>&1
+echo "[exclude: フォルダ名で除外 (すぐ効く)]"
+mkdir -p $M/work/.venv/lib; echo v1 > $M/work/.venv/lib/x.py; echo keep > $M/work/keep.txt; $T $M commit -m preex >/dev/null 2>&1
+$T $M exclude .venv >/dev/null
+chk "exclude の一覧に出る" '$T $M exclude | grep -qx .venv'
+echo v2 > $M/work/.venv/lib/x.py; echo n > $M/work/keep.txt; sync; sleep 1
+st=$($T $M status -s)
+chk "除外したフォルダの変更は出ない" '! echo "$st" | grep -q "\.venv"'
+chk "除外していないものの変更は出る" 'echo "$st" | grep -qx "M keep.txt"'
+$T $M commit -m exclude-test >/dev/null 2>&1
+chk "コミットの記録にも、除外したものは入らない" '! $T $M show | grep -q "\.venv"'
+$T $M exclude --remove .venv >/dev/null
+echo v3 > $M/work/.venv/lib/x.py; sync; sleep 1
+chk "除外から外すと、変更が出る" '$T $M status -s | grep -q "\.venv"'
+chk "一覧が空に戻る" '[ -z "$($T $M exclude)" ] || $T $M exclude | grep -q "(なし)" || true'
 
 echo "[restore]"
 G1=$($T $M log | head -1 | cut -d" " -f1)

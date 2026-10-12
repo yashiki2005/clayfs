@@ -51,7 +51,7 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 
 ## 実装の状況
 
-実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 69 件合格）。
+実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 75 件合格）。
 
 - 済み: init / commit / status / show / log / restore / gc / scrub / dedup / compress / keep / unkeep / run / adopt / rebuild
 - 自動実行: `linux/systemd/`（毎時の `run`、毎日の `gc`、毎週の `scrub`）。構文は `systemd-analyze verify` で確認。
@@ -63,6 +63,7 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 - create: `clayfs_btrfs create [SIZE] [--image P] [--mnt D] [--dry-run]`（cfsctl create に当たる）。スパースのイメージを作り、btrfs にフォーマットし、`compress-force=zstd:3` でマウントして init する。既定は 20G、/var/lib/clayfs/clayfs.img、/srv/clayfs。
 - link: `clayfs_btrfs MNT link PATH [--owner U]`。利用者が書く場所（例 `~/src`）を `work/` へのリンクにする。実体（btrfs のマウント先）を意識しなくてよい。Mac の `~/src → ~/.src.clayfs/work` と同じ形。`create --link PATH --owner U` で、作成と同時に行える。
 - 任意の場所: マウント先（`create --mnt`、`install.sh MNT`）も、書く場所（`link`、`create --link`）も、任意の絶対パスでよい。空白や隠しフォルダを含むパスも試験済み。自動実行のユニットは `"${CLAYFS_MNT}"` と引用している。
+- exclude: フォルダ名（どの階層でも一致）で除外する。変更の一覧と重複排除から外れ、再起動なしで次の操作から効く。スナップショットの中身は残る（btrfs は作業ツリーを丸ごと取るため）。履歴にも入れたくないものは、作業ツリーの外に置く。
 - info: どこに書けばよいか（書く場所 = work/）、履歴の場所、自動実行の状態を表示する。
 - 移行: `linux/migrate_from_dir.sh SRC MNT TOOL`（普通のフォルダから work/ へ。中身とメタデータを照合してから最初のコミットにする。元は消さない）。
 - 実機: Pi で、タイマーの起動、変更の検出、初回のコミットを確認済み。
