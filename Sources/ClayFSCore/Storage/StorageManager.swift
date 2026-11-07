@@ -180,15 +180,26 @@ public final class StorageManager: Sendable {
         try FileManager.default.createDirectory(at: mountURL, withIntermediateDirectories: true)
         ClayFSPaths.ensureUserOwnership(at: mountURL)
 
-        let mountRes = try ProcessRunner.run(
+        var mountRes = try ProcessRunner.run(
             executable: "/bin/mount",
             arguments: ["-o", "loop,compress-force=zstd:3", finalBundleURL.path, mountURL.path]
         )
+        #if os(Linux)
+        if !mountRes.isSuccess && geteuid() != 0 {
+            // Try fallback to sudo mount if unprivileged
+            if let sudoRes = try? ProcessRunner.run(
+                executable: "/usr/bin/sudo",
+                arguments: ["/bin/mount", "-o", "loop,compress-force=zstd:3", finalBundleURL.path, mountURL.path]
+            ), sudoRes.isSuccess {
+                mountRes = sudoRes
+            }
+        }
+        #endif
         guard mountRes.isSuccess else {
             var errorMsg = mountRes.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             #if os(Linux)
             if geteuid() != 0 {
-                errorMsg += "\nヒント: Linux での仮想ドライブのマウントには管理者権限が必要です。'sudo clayfs mount \(driveName)' を実行してください。"
+                errorMsg += "\nヒント: Linux での仮想ドライブのマウントには管理者権限が必要です。'sudo clayfs mount \(driveName)' を実行するか、sudoers で mount を許可してください。"
             }
             #endif
             throw NSError(
@@ -231,7 +242,14 @@ public final class StorageManager: Sendable {
         if force {
             args.insert("-l", at: 0)
         }
-        let res = try ProcessRunner.run(executable: "/bin/umount", arguments: args)
+        var res = try ProcessRunner.run(executable: "/bin/umount", arguments: args)
+        if !res.isSuccess && geteuid() != 0 {
+            var sudoArgs = ["/bin/umount"]
+            sudoArgs.append(contentsOf: args)
+            if let sudoRes = try? ProcessRunner.run(executable: "/usr/bin/sudo", arguments: sudoArgs), sudoRes.isSuccess {
+                res = sudoRes
+            }
+        }
         guard res.isSuccess else {
             throw NSError(
                 domain: "ClayFSStorage",
