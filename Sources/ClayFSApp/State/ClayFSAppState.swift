@@ -100,7 +100,7 @@ public final class ClayFSAppState: ObservableObject {
 
     public func mountSelectedDrive() {
         guard let drive = selectedDrive else { return }
-        statusMessage = "マウント中..."
+        statusMessage = L10n.mounting
         Task {
             do {
                 let info = try StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: true)
@@ -113,7 +113,7 @@ public final class ClayFSAppState: ObservableObject {
                     startWatching(mountURL: m)
                 }
             } catch {
-                self.statusMessage = "マウント失敗: \(error.localizedDescription)"
+                self.statusMessage = L10n.mountFailed(error.localizedDescription)
             }
         }
     }
@@ -121,7 +121,7 @@ public final class ClayFSAppState: ObservableObject {
     public func unmountSelectedDrive() {
         guard let mountURL = activeMountURL else { return }
         stopWatching()
-        statusMessage = "アンマウント中..."
+        statusMessage = L10n.unmounting
         Task {
             do {
                 try StorageManager.shared.unmountDrive(mountURL: mountURL)
@@ -131,7 +131,7 @@ public final class ClayFSAppState: ObservableObject {
                 self.statusMessage = nil
                 refreshDrives()
             } catch {
-                self.statusMessage = "アンマウント失敗: \(error.localizedDescription)"
+                self.statusMessage = L10n.unmountFailed(error.localizedDescription)
             }
         }
     }
@@ -140,7 +140,7 @@ public final class ClayFSAppState: ObservableObject {
         guard let mountURL = activeMountURL else { return }
         isSavingSnapshot = true
         saveSuccess = false
-        saveStage = "APFS CoW で現在の状態を記録中..."
+        saveStage = L10n.recordingCowStage
 
         Task {
             // Short delay for smooth animation visibility
@@ -150,9 +150,9 @@ public final class ClayFSAppState: ObservableObject {
                 let snap = try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: message)
                 loadSnapshots(mountURL: mountURL)
                 await MainActor.run {
-                    self.saveStage = "保存完了: [\(snap.id)]"
+                    self.saveStage = L10n.saveDoneStage(snap.id)
                     self.saveSuccess = true
-                    self.statusMessage = "保存完了: [\(snap.id)]"
+                    self.statusMessage = L10n.saveDoneStage(snap.id)
                 }
 
                 // Show success feedback before closing modal
@@ -163,7 +163,7 @@ public final class ClayFSAppState: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.isSavingSnapshot = false
-                    self.statusMessage = "スナップショット失敗: \(error.localizedDescription)"
+                    self.statusMessage = L10n.saveFailed(error.localizedDescription)
                 }
             }
         }
@@ -173,7 +173,7 @@ public final class ClayFSAppState: ObservableObject {
         guard let mountURL = activeMountURL else { return }
         isRestoring = true
         restoreSuccess = false
-        restoreStage = "過去のスナップショットを展開中 (タイムトラベル)..."
+        restoreStage = L10n.restoringStage
 
         Task {
             // Short delay so the user clearly sees the clock animation
@@ -183,9 +183,9 @@ public final class ClayFSAppState: ObservableObject {
                 try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshot.id)
                 loadSnapshots(mountURL: mountURL)
                 await MainActor.run {
-                    self.restoreStage = "[\(snapshot.id)] の状態に復元完了！"
+                    self.restoreStage = L10n.restoreDoneStage(snapshot.id)
                     self.restoreSuccess = true
-                    self.statusMessage = "[\(snapshot.id)] へ復元完了"
+                    self.statusMessage = L10n.restoredMessage(snapshot.id)
                 }
 
                 // Show success feedback before closing modal
@@ -197,7 +197,7 @@ public final class ClayFSAppState: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.isRestoring = false
-                    self.statusMessage = "復元失敗: \(error.localizedDescription)"
+                    self.statusMessage = L10n.restoreFailed(error.localizedDescription)
                 }
             }
         }
@@ -228,7 +228,7 @@ public final class ClayFSAppState: ObservableObject {
                     if !diffs.isEmpty {
                         _ = try SnapshotManager.shared.createSnapshot(
                             volumeMountURL: m,
-                            message: "自動保存 (\(diffs.count)件の変更)"
+                            message: L10n.autoSaveMessage(diffs.count)
                         )
                         self.loadSnapshots(mountURL: m)
                     }

@@ -67,7 +67,7 @@ public struct ClayFSMenuView: View {
         VStack(alignment: .leading, spacing: 0) {
             // Sidebar Header
             HStack {
-                Text("仮想ドライブ")
+                Text(L10n.virtualDrives)
                     .font(.caption.bold())
                     .foregroundColor(.secondary)
                 Spacer()
@@ -89,7 +89,7 @@ public struct ClayFSMenuView: View {
                     Image(systemName: "externaldrive.badge.plus")
                         .font(.title2)
                         .foregroundColor(.secondary)
-                    Text("ドライブ未登録")
+                    Text(L10n.noDrivesRegistered)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -114,7 +114,7 @@ public struct ClayFSMenuView: View {
                                             .foregroundColor(.primary)
                                             .lineLimit(1)
 
-                                        Text(drive.isMounted ? "マウント中" : "未マウント")
+                                        Text(drive.isMounted ? L10n.mounted : L10n.unmounted)
                                             .font(.system(size: 10))
                                             .foregroundColor(.secondary)
                                     }
@@ -137,22 +137,22 @@ public struct ClayFSMenuView: View {
                             }
                             .contextMenu {
                                 if drive.isMounted {
-                                    Button("Finder で開く") {
+                                    Button(L10n.openInFinder) {
                                         appState.selectDrive(drive)
                                         appState.openInFinder()
                                     }
-                                    Button("アンマウント") {
+                                    Button(L10n.unmount) {
                                         appState.selectDrive(drive)
                                         appState.unmountSelectedDrive()
                                     }
                                 } else {
-                                    Button("マウント") {
+                                    Button(L10n.mount) {
                                         appState.selectDrive(drive)
                                         appState.mountSelectedDrive()
                                     }
                                 }
                                 Divider()
-                                Button("リストから削除", role: .destructive) {
+                                Button(L10n.removeFromList, role: .destructive) {
                                     appState.removeDrive(drive)
                                 }
                             }
@@ -168,7 +168,7 @@ public struct ClayFSMenuView: View {
             Button(action: { showCreateSheet = true }) {
                 HStack(spacing: 4) {
                     Image(systemName: "plus.circle.fill")
-                    Text("新規ドライブ")
+                    Text(L10n.newDrive)
                 }
                 .font(.caption)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -193,7 +193,7 @@ public struct ClayFSMenuView: View {
                             Text(drive.name)
                                 .font(.title3.bold())
 
-                            Text(drive.isMounted ? "マウント中" : "停止中")
+                            Text(drive.isMounted ? L10n.mounted : L10n.stopped)
                                 .font(.system(size: 10, weight: .bold))
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
@@ -215,15 +215,15 @@ public struct ClayFSMenuView: View {
                         Button(action: { appState.openInFinder() }) {
                             Image(systemName: "folder.badge.gearshape")
                         }
-                        .help("Finder で開く")
+                        .help(L10n.openInFinder)
 
-                        Button("解除") {
+                        Button(L10n.eject) {
                             appState.unmountSelectedDrive()
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                     } else {
-                        Button("マウント") {
+                        Button(L10n.mount) {
                             appState.mountSelectedDrive()
                         }
                         .buttonStyle(.borderedProminent)
@@ -239,11 +239,11 @@ public struct ClayFSMenuView: View {
                     let fraction = Double(usedBytes) / Double(drive.totalBytes)
                     VStack(alignment: .leading, spacing: 3) {
                         HStack {
-                            Text("ストレージ使用量")
+                            Text(L10n.storageUsage)
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                             Spacer()
-                            Text("\(formatBytes(usedBytes)) / \(formatBytes(drive.totalBytes)) (空き \(formatBytes(drive.freeBytes)))")
+                            Text(L10n.storageSummary(used: formatBytes(usedBytes), total: formatBytes(drive.totalBytes), free: formatBytes(drive.freeBytes)))
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
@@ -258,14 +258,14 @@ public struct ClayFSMenuView: View {
                 if drive.isMounted {
                     // Quick Snapshot
                     HStack(spacing: 6) {
-                        TextField("スナップショットのメモ...", text: $snapshotMessage)
+                        TextField(L10n.snapshotMemoPlaceholder, text: $snapshotMessage)
                             .textFieldStyle(.roundedBorder)
                             .controlSize(.small)
                             .onSubmit {
                                 takeSnapshot()
                             }
 
-                        Button("保存") {
+                        Button(L10n.save) {
                             takeSnapshot()
                         }
                         .buttonStyle(.borderedProminent)
@@ -277,11 +277,11 @@ public struct ClayFSMenuView: View {
                     // Timeline
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text("タイムライン (履歴)")
+                            Text(L10n.timelineHistory)
                                 .font(.caption.bold())
                                 .foregroundColor(.secondary)
                             Spacer()
-                            Text("\(appState.snapshots.count) 件")
+                            Text(L10n.itemCount(appState.snapshots.count))
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
@@ -292,7 +292,7 @@ public struct ClayFSMenuView: View {
                                 Image(systemName: "clock.arrow.circlepath")
                                     .font(.title3)
                                     .foregroundColor(.secondary)
-                                Text("履歴はまだありません。保存するかファイルを編集すると自動作成されます。")
+                                Text(L10n.emptyTimelineMessage)
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                                     .multilineTextAlignment(.center)
@@ -315,7 +315,7 @@ public struct ClayFSMenuView: View {
 
                                             Spacer()
 
-                                            Button("復元") {
+                                            Button(L10n.restore) {
                                                 appState.pendingRestoreSnapshot = snap
                                             }
                                             .buttonStyle(.borderless)
@@ -337,7 +337,7 @@ public struct ClayFSMenuView: View {
                         Image(systemName: "externaldrive.badge.wifi")
                             .font(.system(size: 36))
                             .foregroundColor(.secondary)
-                        Text("このドライブは現在マウントされていません。\n「マウント」を押すと Finder に現れ、作業を開始できます。")
+                        Text(L10n.unmountedNotice)
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
@@ -350,7 +350,7 @@ public struct ClayFSMenuView: View {
                     Image(systemName: "externaldrive")
                         .font(.system(size: 36))
                         .foregroundColor(.secondary)
-                    Text("左のリストからドライブを選択するか、\n「新規ドライブ」を作成してください。")
+                    Text(L10n.noDriveSelectedNotice)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -377,7 +377,7 @@ public struct ClayFSMenuView: View {
 
             Spacer()
 
-            Button("終了") {
+            Button(L10n.quit) {
                 NSApplication.shared.terminate(nil)
             }
             .buttonStyle(.plain)
@@ -390,24 +390,24 @@ public struct ClayFSMenuView: View {
 
     private var createDriveSheet: some View {
         VStack(spacing: 12) {
-            Text("新しい ClayFS 仮想ドライブ")
+            Text(L10n.createDriveTitle)
                 .font(.headline)
 
-            TextField("ドライブ名 (例: Projects)", text: $newDriveName)
+            TextField(L10n.driveNamePlaceholder, text: $newDriveName)
                 .textFieldStyle(.roundedBorder)
 
-            TextField("上限容量 (例: 50g, 100g)", text: $newDriveSize)
+            TextField(L10n.driveSizePlaceholder, text: $newDriveSize)
                 .textFieldStyle(.roundedBorder)
 
-            TextField("保存先パス (空欄でホームディレクトリ)", text: $newDrivePath)
+            TextField(L10n.drivePathPlaceholder, text: $newDrivePath)
                 .textFieldStyle(.roundedBorder)
 
             HStack {
-                Button("キャンセル") {
+                Button(L10n.cancel) {
                     showCreateSheet = false
                 }
                 Spacer()
-                Button("作成") {
+                Button(L10n.create) {
                     createDrive()
                     showCreateSheet = false
                 }
@@ -448,7 +448,7 @@ public struct ClayFSMenuView: View {
             newDriveName = ""
             newDrivePath = ""
         } catch {
-            appState.statusMessage = "作成エラー: \(error.localizedDescription)"
+            appState.statusMessage = L10n.createError(error.localizedDescription)
         }
     }
 
@@ -468,7 +468,7 @@ public struct ClayFSMenuView: View {
                 .foregroundColor(.orange)
 
             VStack(spacing: 6) {
-                Text("スナップショットを復元")
+                Text(L10n.restoreConfirmTitle)
                     .font(.headline)
 
                 Text("「\(snapshot.message)」\n(\(snapshot.id))")
@@ -476,7 +476,7 @@ public struct ClayFSMenuView: View {
                     .multilineTextAlignment(.center)
                     .foregroundColor(.primary)
 
-                Text("現在の作業フォルダの内容をこの状態に復元します。\n※復元直前の現在の状態も安全スナップショットとして自動保存されるため、いつでもやり直せます。")
+                Text(L10n.restoreConfirmExplanation)
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -486,14 +486,14 @@ public struct ClayFSMenuView: View {
             Divider()
 
             HStack {
-                Button("キャンセル") {
+                Button(L10n.cancel) {
                     appState.pendingRestoreSnapshot = nil
                 }
                 .keyboardShortcut(.cancelAction)
 
                 Spacer()
 
-                Button("復元を実行") {
+                Button(L10n.executeRestoreButton) {
                     appState.executeRestore(snapshot: snapshot)
                 }
                 .buttonStyle(.borderedProminent)
@@ -519,7 +519,7 @@ public struct ClayFSMenuView: View {
                 }
 
                 VStack(spacing: 6) {
-                    Text(appState.saveSuccess ? "スナップショット保存完了" : "スナップショットを保存中...")
+                    Text(appState.saveSuccess ? L10n.saveSuccessTitle : L10n.savingSnapshotTitle)
                         .font(.headline)
 
                     Text(appState.saveStage)
@@ -550,7 +550,7 @@ public struct ClayFSMenuView: View {
                 }
 
                 VStack(spacing: 6) {
-                    Text(appState.restoreSuccess ? "復元完了" : "過去の状態に復元中 (タイムトラベル)...")
+                    Text(appState.restoreSuccess ? L10n.restoreSuccessTitle : L10n.restoringTitle)
                         .font(.headline)
 
                     Text(appState.restoreStage)
