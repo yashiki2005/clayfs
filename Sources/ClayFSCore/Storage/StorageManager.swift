@@ -175,9 +175,21 @@ public final class StorageManager: Sendable {
         }
 
         let driveName = finalBundleURL.deletingPathExtension().lastPathComponent
-        let defaultMountBase = ClayFSPaths.effectiveHomeDirectory.appendingPathComponent(".clayfs/mnt")
-        let mountURL = defaultMountBase.appendingPathComponent(driveName)
-        try FileManager.default.createDirectory(at: mountURL, withIntermediateDirectories: true)
+        let userName: String
+        if let sudoUser = ProcessInfo.processInfo.environment["SUDO_USER"], !sudoUser.isEmpty {
+            userName = sudoUser
+        } else {
+            userName = NSUserName()
+        }
+        let mountBase = URL(fileURLWithPath: "/media").appendingPathComponent(userName)
+        let mountURL = mountBase.appendingPathComponent(driveName)
+
+        do {
+            try FileManager.default.createDirectory(at: mountURL, withIntermediateDirectories: true)
+        } catch {
+            _ = try? ProcessRunner.run(executable: "/usr/bin/sudo", arguments: ["/bin/mkdir", "-p", mountURL.path])
+        }
+        ClayFSPaths.ensureUserOwnership(at: mountBase)
         ClayFSPaths.ensureUserOwnership(at: mountURL)
 
         var mountRes = try ProcessRunner.run(
