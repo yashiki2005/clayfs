@@ -39,14 +39,24 @@ fi
 
 echo "ビルド成功: $BUILD_BIN"
 
-INSTALL_DIR="/usr/local/bin"
-if [ -w "$INSTALL_DIR" ]; then
+INSTALL_DIR=""
+if [[ ":$PATH:" == *":$HOME/bin:"* ]]; then
+    mkdir -p "$HOME/bin"
+    INSTALL_DIR="$HOME/bin"
+elif [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
+    mkdir -p "$HOME/.local/bin"
+    INSTALL_DIR="$HOME/.local/bin"
+elif [ -w "/usr/local/bin" ]; then
+    INSTALL_DIR="/usr/local/bin"
+fi
+
+if [ -n "$INSTALL_DIR" ]; then
     cp "$BUILD_BIN" "$INSTALL_DIR/clayfs"
     echo "インストール完了: $INSTALL_DIR/clayfs"
 else
-    echo "sudo で $INSTALL_DIR にインストールします..."
-    sudo cp "$BUILD_BIN" "$INSTALL_DIR/clayfs"
-    echo "インストール完了: $INSTALL_DIR/clayfs"
+    echo "sudo で /usr/local/bin にインストールします..."
+    sudo cp "$BUILD_BIN" "/usr/local/bin/clayfs"
+    echo "インストール完了: /usr/local/bin/clayfs"
 fi
 
 echo ""
