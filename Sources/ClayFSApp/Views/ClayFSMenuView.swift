@@ -60,6 +60,9 @@ public struct ClayFSMenuView: View {
         .sheet(isPresented: $appState.showRetentionSheet) {
             retentionPolicySheet
         }
+        .sheet(isPresented: $appState.showStartupSheet) {
+            startupSettingsSheet
+        }
     }
 
     // MARK: - Left Sidebar
@@ -161,6 +164,16 @@ public struct ClayFSMenuView: View {
                                 Button(L10n.retentionPolicyMenu) {
                                     appState.selectDrive(drive)
                                     appState.showRetentionSheet = true
+                                }
+                                Button(action: {
+                                    appState.toggleAutoMount(for: drive)
+                                }) {
+                                    HStack {
+                                        Text(L10n.autoMountOnLaunch)
+                                        if drive.autoMount {
+                                            Image(systemName: "checkmark")
+                                        }
+                                    }
                                 }
                                 Divider()
                                 Button(L10n.removeFromList, role: .destructive) {
@@ -383,7 +396,15 @@ public struct ClayFSMenuView: View {
     // MARK: - Footer
 
     private var footerView: some View {
-        HStack {
+        HStack(spacing: 8) {
+            Button(action: { appState.showStartupSheet = true }) {
+                Image(systemName: "gearshape")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(L10n.startupSettings)
+
             if let msg = appState.statusMessage {
                 Text(msg)
                     .font(.caption2)
@@ -542,6 +563,74 @@ public struct ClayFSMenuView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Startup Settings Sheet
+
+    private var startupSettingsSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text(L10n.startupSettings)
+                    .font(.headline)
+                Spacer()
+                Button(action: { appState.showStartupSheet = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle(L10n.launchAtLogin, isOn: Binding(
+                    get: { appState.launchAtLogin },
+                    set: { appState.setLaunchAtLogin($0) }
+                ))
+                .toggleStyle(.switch)
+
+                Divider()
+
+                Text(L10n.autoMountOnLaunch)
+                    .font(.subheadline.bold())
+
+                if appState.drives.isEmpty {
+                    Text(L10n.noDrivesRegistered)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    VStack(spacing: 8) {
+                        ForEach(appState.drives) { drive in
+                            HStack {
+                                Image(systemName: "externaldrive")
+                                    .foregroundColor(.accentColor)
+                                Text(drive.name)
+                                    .font(.caption)
+                                Spacer()
+                                Toggle("", isOn: Binding(
+                                    get: { drive.autoMount },
+                                    set: { _ in appState.toggleAutoMount(for: drive) }
+                                ))
+                                .toggleStyle(.switch)
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+            .cornerRadius(8)
+
+            HStack {
+                Spacer()
+                Button(L10n.close) {
+                    appState.showStartupSheet = false
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(20)
+        .frame(width: 340)
     }
 
     private func takeSnapshot() {

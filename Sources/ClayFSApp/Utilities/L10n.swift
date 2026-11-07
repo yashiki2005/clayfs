@@ -856,4 +856,56 @@ public enum L10n {
         case .english: return "Save Settings"
         }
     }
+
+    public static var startupSettings: String {
+        switch currentLanguage {
+        case .japanese: return "自動起動設定"
+        case .simplifiedChinese: return "自动启动设置"
+        case .traditionalChinese: return "自動啟動設定"
+        case .spanish: return "Configuración de inicio"
+        case .french: return "Paramètres de démarrage"
+        case .german: return "Starteinstellungen"
+        case .korean: return "시작 설정"
+        case .english: return "Startup Settings"
+        }
+    }
+
+    public static var launchAtLogin: String {
+        switch currentLanguage {
+        case .japanese: return "ログイン時に ClayFS を起動"
+        case .simplifiedChinese: return "开机登录时启动 ClayFS"
+        case .traditionalChinese: return "開機登入時啟動 ClayFS"
+        case .spanish: return "Iniciar ClayFS al iniciar sesión"
+        case .french: return "Lancer ClayFS à la connexion"
+        case .german: return "ClayFS bei der Anmeldung starten"
+        case .korean: return "로그인 시 ClayFS 실행"
+        case .english: return "Launch ClayFS at Login"
+        }
+    }
+
+    public static var autoMountOnLaunch: String {
+        switch currentLanguage {
+        case .japanese: return "起動時に自動マウント"
+        case .simplifiedChinese: return "启动时自动挂载"
+        case .traditionalChinese: return "啟動時自動掛載"
+        case .spanish: return "Montar automáticamente al iniciar"
+        case .french: return "Monter automatiquement au démarrage"
+        case .german: return "Beim Start automatisch aktivieren"
+        case .korean: return "시작 시 자동 마운트"
+        case .english: return "Auto-mount on Launch"
+        }
+    }
+
+    public static var close: String {
+        switch currentLanguage {
+        case .japanese: return "閉じる"
+        case .simplifiedChinese: return "关闭"
+        case .traditionalChinese: return "關閉"
+        case .spanish: return "Cerrar"
+        case .french: return "Fermer"
+        case .german: return "Schließen"
+        case .korean: return "닫기"
+        case .english: return "Close"
+        }
+    }
 }

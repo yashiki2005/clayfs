@@ -26,12 +26,48 @@ public final class ClayFSAppState: ObservableObject {
     // Retention Policy sheet
     @Published public var showRetentionSheet: Bool = false
 
+    // Startup Settings
+    @Published public var launchAtLogin: Bool = LaunchAtLogin.isEnabled
+    @Published public var showStartupSheet: Bool = false
+
     private var pollTimer: AnyCancellable?
     private var monitor: FSEventsMonitor?
 
     public init() {
+        self.launchAtLogin = LaunchAtLogin.isEnabled
         refreshDrives()
+        autoMountDrivesIfNeeded()
         startPolling()
+    }
+
+    public func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            try LaunchAtLogin.setEnabled(enabled)
+            self.launchAtLogin = LaunchAtLogin.isEnabled
+        } catch {
+            print("Failed to set launch at login: \(error)")
+        }
+    }
+
+    public func toggleAutoMount(for drive: VolumeInfo) {
+        var updated = drive
+        updated.autoMount.toggle()
+        try? DriveRegistry.shared.registerDrive(updated)
+        refreshDrives()
+    }
+
+    public func autoMountDrivesIfNeeded() {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let list = DriveRegistry.shared.loadDrives()
+            for drive in list where drive.autoMount {
+                if StorageManager.shared.findMountPoint(for: drive.bundleURL) == nil {
+                    _ = try? StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: true)
+                }
+            }
+            await MainActor.run {
+                self?.refreshDrives()
+            }
+        }
     }
 
     public func refreshDrives() {

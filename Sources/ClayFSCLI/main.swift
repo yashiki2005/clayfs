@@ -37,6 +37,10 @@ struct ClayFSCLIApp {
                 try handleCompact(cmdArgs)
             case "prune":
                 try handlePrune(cmdArgs)
+            case "autostart":
+                try handleAutostart(cmdArgs)
+            case "automount":
+                try handleAutomount(cmdArgs)
             case "watch":
                 try handleWatch(cmdArgs)
             case "--version", "-v":
@@ -167,17 +171,22 @@ struct ClayFSCLIApp {
             let mountURL = StorageManager.shared.findMountPoint(for: drive.bundleURL)
             let status = (mountURL != nil) ? "マウント中 (\(mountURL!.path))" : "未マウント"
             print("• \(drive.name)")
-            print("   イメージ: \(drive.bundleURL.path)")
-            print("   状態:     \(status)")
+            print("   イメージ:     \(drive.bundleURL.path)")
+            print("   状態:         \(status)")
+            print("   自動マウント: \(drive.autoMount ? "有効 (ON)" : "無効 (OFF)")")
             if let mURL = mountURL {
                 let snapshots = (try? SnapshotManager.shared.listSnapshots(volumeMountURL: mURL, limit: 1)) ?? []
                 if let latest = snapshots.first {
                     let df = DateFormatter()
                     df.dateFormat = "yyyy-MM-dd HH:mm:ss"
-                    print("   最新保存: \(latest.id) (\(df.string(from: latest.timestamp))) - \(latest.message)")
+                    print("   最新保存:     \(latest.id) (\(df.string(from: latest.timestamp))) - \(latest.message)")
                 }
             }
         }
+
+        let autostart = LaunchAtLogin.isEnabled ? "有効 (ON)" : "無効 (OFF)"
+        print("---")
+        print("ログイン時の ClayFS 自動起動: \(autostart)")
     }
 
     static func handleSnapshot(_ args: [String]) throws {
@@ -353,6 +362,57 @@ struct ClayFSCLIApp {
         }
     }
 
+    static func handleAutostart(_ args: [String]) throws {
+        if let mode = args.first?.lowercased() {
+            if mode == "on" || mode == "enable" || mode == "true" || mode == "1" {
+                try LaunchAtLogin.setEnabled(true)
+                print("ログイン時の ClayFS 自動起動を有効にしました。")
+            } else if mode == "off" || mode == "disable" || mode == "false" || mode == "0" {
+                try LaunchAtLogin.setEnabled(false)
+                print("ログイン時の ClayFS 自動起動を無効にしました。")
+            } else {
+                print("使い方: clayfs autostart [on|off]")
+            }
+        } else {
+            let status = LaunchAtLogin.isEnabled ? "有効 (ON)" : "無効 (OFF)"
+            print("ログイン時の ClayFS 自動起動: \(status)")
+            print("切り替えるには: clayfs autostart [on|off]")
+        }
+    }
+
+    static func handleAutomount(_ args: [String]) throws {
+        let drives = DriveRegistry.shared.loadDrives()
+        if drives.isEmpty {
+            print("エラー: 登録されたドライブがありません。'clayfs create <NAME>' で作成してください。")
+            exit(1)
+        }
+
+        let nonFlags = args.filter { !$0.starts(with: "-") }
+        let targetName = nonFlags.first(where: { name in drives.contains(where: { $0.name == name }) })
+        let target = (targetName != nil ? drives.first(where: { $0.name == targetName }) : drives.first)!
+
+        let modeArg = nonFlags.first(where: { $0 != target.name })
+
+        if let mode = modeArg?.lowercased() {
+            var updated = target
+            if mode == "on" || mode == "enable" || mode == "true" || mode == "1" {
+                updated.autoMount = true
+                try DriveRegistry.shared.registerDrive(updated)
+                print("ドライブ '\(target.name)' の起動時自動マウントを有効にしました。")
+            } else if mode == "off" || mode == "disable" || mode == "false" || mode == "0" {
+                updated.autoMount = false
+                try DriveRegistry.shared.registerDrive(updated)
+                print("ドライブ '\(target.name)' の起動時自動マウントを無効にしました。")
+            } else {
+                print("使い方: clayfs automount [DRIVE] [on|off]")
+            }
+        } else {
+            let status = target.autoMount ? "有効 (ON)" : "無効 (OFF)"
+            print("ドライブ '\(target.name)' の起動時自動マウント: \(status)")
+            print("切り替えるには: clayfs automount \(target.name) [on|off]")
+        }
+    }
+
     static func handleWatch(_ args: [String]) throws {
         guard let mountURL = resolveActiveMount(args: args) else {
             print("エラー: ドライブがマウントされていません。")
@@ -448,6 +508,8 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        指定スナップショットの状態に復元
               clayfs compact [NAME]                             未使用バンドルブロックを回収
               clayfs prune [NAME] [--keep N] [--days N]         古いスナップショット履歴を整理
+              clayfs autostart [on|off]                         ログイン時の ClayFS 自動起動を設定
+              clayfs automount [NAME] [on|off]                  起動時のドライブ自動マウントを設定
               clayfs watch [NAME]                               バックグラウンド自動スナップショット
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       多言語ヘルプ表示
             """)
@@ -466,6 +528,8 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        恢复到指定快照状态
               clayfs compact [NAME]                             压缩并回收未使用的存储空间
               clayfs prune [NAME] [--keep N] [--days N]         清理过期的快照历史
+              clayfs autostart [on|off]                         设置开机登录时自动启动 ClayFS
+              clayfs automount [NAME] [on|off]                  设置开机时驱动器自动挂载
               clayfs watch [NAME]                               后台自动快照监控
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       显示多语言帮助
             """)
@@ -484,6 +548,8 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        還原至指定快照狀態
               clayfs compact [NAME]                             壓縮並回收未使用的儲存空間
               clayfs prune [NAME] [--keep N] [--days N]         清理過期的快照歷史
+              clayfs autostart [on|off]                         設定開機登入時自動啟動 ClayFS
+              clayfs automount [NAME] [on|off]                  設定開機時磁碟自動掛載
               clayfs watch [NAME]                               背景自動快照監控
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       顯示多語言說明
             """)
@@ -502,6 +568,8 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restaurar al estado de una instantánea
               clayfs compact [NAME]                             Recuperar espacio no utilizado
               clayfs prune [NAME] [--keep N] [--days N]         Purgar historial de instantáneas antiguas
+              clayfs autostart [on|off]                         Configurar inicio automático al iniciar sesión
+              clayfs automount [NAME] [on|off]                  Configurar montaje automático de unidad al iniciar
               clayfs watch [NAME]                               Monitor de instantáneas automáticas
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Mostrar ayuda en varios idiomas
             """)
@@ -520,6 +588,8 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restaurer à l'état d'un instantané
               clayfs compact [NAME]                             Récupérer l'espace disque inutilisé
               clayfs prune [NAME] [--keep N] [--days N]         Purger les anciens instantanés
+              clayfs autostart [on|off]                         Activer/désactiver le démarrage automatique
+              clayfs automount [NAME] [on|off]                  Activer/désactiver le montage automatique au démarrage
               clayfs watch [NAME]                               Surveillance automatique en arrière-plan
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Afficher l'aide multilingue
             """)
@@ -538,6 +608,8 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Auf bestimmten Schnappschuss wiederherstellen
               clayfs compact [NAME]                             Ungenutzten Speicherplatz freigeben
               clayfs prune [NAME] [--keep N] [--days N]         Alte Schnappschüsse bereinigen
+              clayfs autostart [on|off]                         Automatischen Start bei Anmeldung konfigurieren
+              clayfs automount [NAME] [on|off]                  Automatisches Aktivieren beim Start konfigurieren
               clayfs watch [NAME]                               Automatische Hintergrundüberwachung
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Mehrsprachige Hilfe anzeigen
             """)
@@ -556,6 +628,8 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        특정 스냅샷 상태로 복원
               clayfs compact [NAME]                             미사용 디스크 공간 회수
               clayfs prune [NAME] [--keep N] [--days N]         오래된 스냅샷 기록 정리
+              clayfs autostart [on|off]                         로그인 시 ClayFS 자동 실행 설정
+              clayfs automount [NAME] [on|off]                  부팅 시 드라이브 자동 마운트 설정
               clayfs watch [NAME]                               백그라운드 자동 스냅샷 감시
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       다국어 도움말 표시
             """)
@@ -574,6 +648,8 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restore to a specific snapshot state
               clayfs compact [NAME]                             Reclaim unused sparse bundle blocks
               clayfs prune [NAME] [--keep N] [--days N]         Prune old snapshot history
+              clayfs autostart [on|off]                         Configure launch at login for ClayFS
+              clayfs automount [NAME] [on|off]                  Configure auto-mount on launch for a drive
               clayfs watch [NAME]                               Run background auto-snapshot monitor
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Show help in multiple languages
             """)

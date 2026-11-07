@@ -111,7 +111,18 @@ clayfs prune src --keep 30 --days 14
 clayfs watch src
 ```
 
-### 8. 多言語ヘルプ
+### 8. 起動設定 (Startup & Auto-mount)
+```bash
+# ログイン時の ClayFS 常駐アプリ自動起動を有効化/無効化
+clayfs autostart on
+clayfs autostart off
+
+# 特定ドライブの起動時自動マウントを設定
+clayfs automount src on
+clayfs automount src off
+```
+
+### 9. 多言語ヘルプ
 ```bash
 clayfs help                 # OSの言語設定に合わせて表示
 clayfs help --lang en       # 英語で表示
@@ -134,6 +145,7 @@ open ~/Applications/ClayFS.app
   - 📸 **Snapshot**: 1クリックで即座に保存
   - 🔄 **Compact**: ドライブの未使用領域を最適化
   - ⚙️ **Retention**: 最大件数・最大日数の保持ポリシーを設定＆即時整理
+  - ⚙️ **Startup**: フッターの歯車アイコンからログイン時自動起動やドライブ自動マウントを一元管理
   - ⏱️ **Restore**: 変更ファイル数を確認して安全にロールバック
 
 ---

@@ -23,10 +23,11 @@ public struct VolumeInfo: Codable, Identifiable, Sendable {
     public var freeBytes: Int64
     public var totalBytes: Int64
     public var autoSnapshot: Bool
+    public var autoMount: Bool
     public var retentionPolicy: RetentionPolicy
 
     enum CodingKeys: String, CodingKey {
-        case name, bundleURL, mountURL, isMounted, sizeLimit, freeBytes, totalBytes, autoSnapshot, retentionPolicy
+        case name, bundleURL, mountURL, isMounted, sizeLimit, freeBytes, totalBytes, autoSnapshot, autoMount, retentionPolicy
     }
 
     public init(
@@ -38,6 +39,7 @@ public struct VolumeInfo: Codable, Identifiable, Sendable {
         freeBytes: Int64 = 0,
         totalBytes: Int64 = 0,
         autoSnapshot: Bool = true,
+        autoMount: Bool = true,
         retentionPolicy: RetentionPolicy = .default
     ) {
         self.name = name
@@ -48,6 +50,7 @@ public struct VolumeInfo: Codable, Identifiable, Sendable {
         self.freeBytes = freeBytes
         self.totalBytes = totalBytes
         self.autoSnapshot = autoSnapshot
+        self.autoMount = autoMount
         self.retentionPolicy = retentionPolicy
     }
 
@@ -61,6 +64,7 @@ public struct VolumeInfo: Codable, Identifiable, Sendable {
         self.freeBytes = try container.decode(Int64.self, forKey: .freeBytes)
         self.totalBytes = try container.decode(Int64.self, forKey: .totalBytes)
         self.autoSnapshot = try container.decodeIfPresent(Bool.self, forKey: .autoSnapshot) ?? true
+        self.autoMount = try container.decodeIfPresent(Bool.self, forKey: .autoMount) ?? true
         self.retentionPolicy = try container.decodeIfPresent(RetentionPolicy.self, forKey: .retentionPolicy) ?? .default
     }
 }

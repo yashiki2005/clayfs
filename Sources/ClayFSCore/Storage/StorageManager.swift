@@ -239,13 +239,18 @@ public final class StorageManager: Sendable {
             } catch {}
         }
 
+        let existing = DriveRegistry.shared.loadDrives().first(where: { $0.bundleURL.standardizedFileURL == bundleURL.standardizedFileURL })
+
         return VolumeInfo(
             name: name,
             bundleURL: bundleURL,
             mountURL: mountURL,
             isMounted: mountURL != nil,
             freeBytes: freeBytes,
-            totalBytes: totalBytes
+            totalBytes: totalBytes,
+            autoSnapshot: existing?.autoSnapshot ?? true,
+            autoMount: existing?.autoMount ?? true,
+            retentionPolicy: existing?.retentionPolicy ?? .default
         )
     }
 }

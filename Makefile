@@ -23,6 +23,7 @@ install: app
 	mkdir -p $(APPDIR)
 	rm -rf $(APPDIR)/ClayFS.app
 	cp -R build/ClayFS.app $(APPDIR)/ClayFS.app
+	codesign --force --deep --sign - $(APPDIR)/ClayFS.app
 	@echo "Installed clayfs CLI to $(BINDIR)/clayfs"
 	@echo "Installed ClayFS.app to $(APPDIR)/ClayFS.app"
 
