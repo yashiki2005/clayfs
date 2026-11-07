@@ -10,7 +10,7 @@ public final class DriveRegistry: @unchecked Sendable {
         if let configURL = configURL {
             self.configURL = configURL
         } else {
-            let home = FileManager.default.homeDirectoryForCurrentUser
+            let home = ClayFSPaths.effectiveHomeDirectory
             self.configURL = home.appendingPathComponent(".config/clayfs/drives.json")
         }
     }

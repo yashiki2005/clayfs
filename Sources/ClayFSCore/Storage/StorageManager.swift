@@ -83,6 +83,7 @@ public final class StorageManager: Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "mkfs.btrfs failed: \(mkfsRes.stderr)"]
             )
         }
+        ClayFSPaths.ensureUserOwnership(at: finalBundleURL)
         #endif
 
         let drive = VolumeInfo(
@@ -174,23 +175,32 @@ public final class StorageManager: Sendable {
         }
 
         let driveName = finalBundleURL.deletingPathExtension().lastPathComponent
-        let defaultMountBase = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".clayfs/mnt")
+        let defaultMountBase = ClayFSPaths.effectiveHomeDirectory.appendingPathComponent(".clayfs/mnt")
         let mountURL = defaultMountBase.appendingPathComponent(driveName)
         try FileManager.default.createDirectory(at: mountURL, withIntermediateDirectories: true)
+        ClayFSPaths.ensureUserOwnership(at: mountURL)
 
         let mountRes = try ProcessRunner.run(
             executable: "/bin/mount",
             arguments: ["-o", "loop,compress-force=zstd:3", finalBundleURL.path, mountURL.path]
         )
         guard mountRes.isSuccess else {
+            var errorMsg = mountRes.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            #if os(Linux)
+            if geteuid() != 0 {
+                errorMsg += "\nヒント: Linux での仮想ドライブのマウントには管理者権限が必要です。'sudo clayfs mount \(driveName)' を実行してください。"
+            }
+            #endif
             throw NSError(
                 domain: "ClayFSStorage",
                 code: 13,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to mount Btrfs image: \(mountRes.stderr)"]
+                userInfo: [NSLocalizedDescriptionKey: "Failed to mount Btrfs image: \(errorMsg)"]
             )
         }
 
+        ClayFSPaths.ensureUserOwnership(at: mountURL)
         try initializeVolumeStructure(at: mountURL)
+        ClayFSPaths.ensureUserOwnership(at: mountURL.appendingPathComponent(".clayfs"))
         let info = buildVolumeInfo(bundleURL: finalBundleURL, mountURL: mountURL)
         if register {
             try DriveRegistry.shared.registerDrive(info)

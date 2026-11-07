@@ -108,7 +108,7 @@ struct ClayFSCLIApp {
             let expanded = (customPath as NSString).expandingTildeInPath
             bundleURL = URL(fileURLWithPath: expanded)
         } else {
-            let home = FileManager.default.homeDirectoryForCurrentUser
+            let home = ClayFSPaths.effectiveHomeDirectory
             #if os(macOS)
             bundleURL = home.appendingPathComponent("\(name).dmg.sparsebundle")
             #elseif os(Linux)
