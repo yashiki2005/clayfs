@@ -14,33 +14,43 @@ public struct ClayFSMenuView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            // Main Two-Column View
-            HStack(spacing: 0) {
-                // Left Column: Drive Sidebar
-                sidebarView
-                    .frame(width: 180)
-                    .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+        ZStack {
+            VStack(spacing: 0) {
+                // Main Two-Column View
+                HStack(spacing: 0) {
+                    // Left Column: Drive Sidebar
+                    sidebarView
+                        .frame(width: 180)
+                        .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+
+                    Divider()
+
+                    // Right Column: Detail & Timeline View
+                    detailView
+                        .frame(width: 360)
+                }
+                .frame(height: 420)
 
                 Divider()
 
-                // Right Column: Detail & Timeline View
-                detailView
-                    .frame(width: 360)
+                // Global Footer Bar
+                footerView
+                    .frame(height: 38)
+                    .padding(.horizontal, 12)
+                    .background(Color(NSColor.windowBackgroundColor))
             }
-            .frame(height: 420)
 
-            Divider()
-
-            // Global Footer Bar
-            footerView
-                .frame(height: 38)
-                .padding(.horizontal, 12)
-                .background(Color(NSColor.windowBackgroundColor))
+            // Restore Modal Progress Overlay
+            if appState.isRestoring {
+                restoreProgressOverlay
+            }
         }
         .frame(width: 540, height: 460)
         .sheet(isPresented: $showCreateSheet) {
             createDriveSheet
+        }
+        .sheet(item: $appState.pendingRestoreSnapshot) { snap in
+            confirmRestoreSheet(snapshot: snap)
         }
     }
 
@@ -288,7 +298,7 @@ public struct ClayFSMenuView: View {
                                             Spacer()
 
                                             Button("復元") {
-                                                appState.restore(snapshotID: snap.id)
+                                                appState.pendingRestoreSnapshot = snap
                                             }
                                             .buttonStyle(.borderless)
                                             .font(.caption2)
@@ -429,6 +439,84 @@ public struct ClayFSMenuView: View {
         formatter.allowedUnits = [.useAll]
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
+    }
+
+    // MARK: - Restore Confirmation & Progress
+
+    private func confirmRestoreSheet(snapshot: Snapshot) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 36))
+                .foregroundColor(.orange)
+
+            VStack(spacing: 6) {
+                Text("スナップショットを復元")
+                    .font(.headline)
+
+                Text("「\(snapshot.message)」\n(\(snapshot.id))")
+                    .font(.subheadline.bold())
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(.primary)
+
+                Text("現在の作業フォルダの内容をこの状態に復元します。\n※復元直前の現在の状態も安全スナップショットとして自動保存されるため、いつでもやり直せます。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 4)
+            }
+
+            Divider()
+
+            HStack {
+                Button("キャンセル") {
+                    appState.pendingRestoreSnapshot = nil
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Spacer()
+
+                Button("復元を実行") {
+                    appState.executeRestore(snapshot: snapshot)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+            }
+        }
+        .padding(20)
+        .frame(width: 320)
+    }
+
+    private var restoreProgressOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.35)
+                .edgesIgnoringSafeArea(.all)
+
+            VStack(spacing: 16) {
+                if appState.restoreSuccess {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 42))
+                        .foregroundColor(.green)
+                } else {
+                    ProgressView()
+                        .scaleEffect(1.3)
+                        .progressViewStyle(.circular)
+                }
+
+                VStack(spacing: 6) {
+                    Text(appState.restoreSuccess ? "復元完了" : "スナップショットを復元中...")
+                        .font(.headline)
+
+                    Text(appState.restoreStage)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .padding(24)
+            .frame(width: 280)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color(NSColor.windowBackgroundColor)))
+            .shadow(color: .black.opacity(0.2), radius: 15)
+        }
     }
 
     private func formatDate(_ date: Date) -> String {

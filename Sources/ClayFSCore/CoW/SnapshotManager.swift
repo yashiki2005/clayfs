@@ -140,7 +140,10 @@ public final class SnapshotManager: Sendable {
                     userInfo: [NSLocalizedDescriptionKey: "APFS full clonefile restore failed: \(String(cString: strerror(err)))"]
                 )
             }
-            try? FileManager.default.removeItem(at: tempBackup)
+            // Clean up old temporary directory in background so restore finishes instantly
+            DispatchQueue.global(qos: .utility).async {
+                try? FileManager.default.removeItem(at: tempBackup)
+            }
         }
     }
 

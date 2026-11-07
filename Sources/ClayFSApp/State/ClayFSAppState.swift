@@ -12,6 +12,12 @@ public final class ClayFSAppState: ObservableObject {
     @Published public var isCreatingDrive: Bool = false
     @Published public var statusMessage: String?
 
+    // Restore state
+    @Published public var isRestoring: Bool = false
+    @Published public var restoreStage: String = ""
+    @Published public var restoreSuccess: Bool = false
+    @Published public var pendingRestoreSnapshot: Snapshot? = nil
+
     private var pollTimer: AnyCancellable?
     private var monitor: FSEventsMonitor?
 
@@ -139,16 +145,40 @@ public final class ClayFSAppState: ObservableObject {
         }
     }
 
-    public func restore(snapshotID: String) {
+    public func executeRestore(snapshot: Snapshot) {
         guard let mountURL = activeMountURL else { return }
-        statusMessage = "復元中..."
+        isRestoring = true
+        restoreSuccess = false
+        restoreStage = "現在の状態を安全スナップショットとして退避中..."
+
         Task {
+            // Short delay so the user clearly sees the transition
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            await MainActor.run {
+                self.restoreStage = "スナップショットを展開中..."
+            }
+
             do {
-                try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshotID)
+                try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshot.id)
                 loadSnapshots(mountURL: mountURL)
-                self.statusMessage = "復元完了"
+                await MainActor.run {
+                    self.restoreStage = "復元が完了しました！"
+                    self.restoreSuccess = true
+                    self.statusMessage = "[\(snapshot.id)] へ復元完了"
+                }
+
+                // Show success feedback before closing modal
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                await MainActor.run {
+                    self.isRestoring = false
+                    self.pendingRestoreSnapshot = nil
+                }
             } catch {
-                self.statusMessage = "復元失敗: \(error.localizedDescription)"
+                await MainActor.run {
+                    self.isRestoring = false
+                    self.statusMessage = "復元失敗: \(error.localizedDescription)"
+                }
             }
         }
     }
