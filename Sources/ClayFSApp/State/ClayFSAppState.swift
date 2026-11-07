@@ -229,8 +229,7 @@ public final class ClayFSAppState: ObservableObject {
 
     public func openInFinder() {
         guard let mountURL = activeMountURL else { return }
-        let ws = mountURL.appendingPathComponent("Workspace")
-        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: ws.path)
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: mountURL.path)
     }
 
     private func startPolling() {
@@ -243,8 +242,7 @@ public final class ClayFSAppState: ObservableObject {
 
     private func startWatching(mountURL: URL) {
         stopWatching()
-        let ws = mountURL.appendingPathComponent("Workspace")
-        monitor = FSEventsMonitor(watchURL: ws, debounceSeconds: 5.0) { [weak self] in
+        monitor = FSEventsMonitor(watchURL: mountURL, debounceSeconds: 5.0) { [weak self] in
             Task.detached(priority: .utility) { [weak self] in
                 guard let self = self else { return }
                 do {

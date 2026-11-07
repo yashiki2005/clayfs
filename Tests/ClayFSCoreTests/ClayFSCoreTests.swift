@@ -65,11 +65,8 @@ import Foundation
         try? FileManager.default.removeItem(at: bundleURL)
     }
 
-    let workspaceURL = mountURL.appendingPathComponent("Workspace")
-    #expect(FileManager.default.fileExists(atPath: workspaceURL.path))
-
-    // 3. Write file into Workspace
-    let docURL = workspaceURL.appendingPathComponent("document.txt")
+    // 3. Write file directly into Volume root
+    let docURL = mountURL.appendingPathComponent("document.txt")
     try "Version 1 content".write(to: docURL, atomically: true, encoding: .utf8)
 
     // 4. Create snapshot 1
@@ -78,7 +75,7 @@ import Foundation
 
     // 5. Modify file and add another file
     try "Version 2 modified content".write(to: docURL, atomically: true, encoding: .utf8)
-    let newDocURL = workspaceURL.appendingPathComponent("notes.md")
+    let newDocURL = mountURL.appendingPathComponent("notes.md")
     try "# Notes".write(to: newDocURL, atomically: true, encoding: .utf8)
 
     // 6. Check diff

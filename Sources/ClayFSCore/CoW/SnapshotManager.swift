@@ -4,6 +4,17 @@ import Darwin
 public final class SnapshotManager: Sendable {
     public static let shared = SnapshotManager()
 
+    public static let ignoredRootNames: Set<String> = [
+        ".clayfs",
+        ".fseventsd",
+        ".Trashes",
+        ".Spotlight-V100",
+        ".DocumentRevisions-V100",
+        ".TemporaryItems",
+        ".VolumeIcon.icns",
+        ".com.apple.timemachine.donotpresent"
+    ]
+
     public init() {}
 
     public func createSnapshot(
@@ -11,16 +22,15 @@ public final class SnapshotManager: Sendable {
         message: String = "Manual snapshot",
         author: String = NSUserName()
     ) throws -> Snapshot {
-        let workspaceURL = volumeMountURL.appendingPathComponent("Workspace")
         let metadataURL = volumeMountURL.appendingPathComponent(".clayfs")
         let snapshotsURL = metadataURL.appendingPathComponent("snapshots")
         let dbURL = metadataURL.appendingPathComponent("timeline.sqlite3")
 
-        guard FileManager.default.fileExists(atPath: workspaceURL.path) else {
+        guard FileManager.default.fileExists(atPath: volumeMountURL.path) else {
             throw NSError(
                 domain: "ClayFSSnapshot",
                 code: 20,
-                userInfo: [NSLocalizedDescriptionKey: "Workspace directory does not exist at \(workspaceURL.path)"]
+                userInfo: [NSLocalizedDescriptionKey: "Volume mount path does not exist at \(volumeMountURL.path)"]
             )
         }
 
@@ -39,15 +49,25 @@ public final class SnapshotManager: Sendable {
             counter += 1
         }
 
-        // Atomic APFS CoW clone of the entire Workspace directory
-        let rc = clonefile(workspaceURL.path, snapshotDestURL.path, 0)
-        guard rc == 0 else {
-            let err = errno
-            throw NSError(
-                domain: "ClayFSSnapshot",
-                code: 21,
-                userInfo: [NSLocalizedDescriptionKey: "APFS clonefile failed with errno \(err): \(String(cString: strerror(err)))"]
-            )
+        try FileManager.default.createDirectory(at: snapshotDestURL, withIntermediateDirectories: true)
+
+        // Clone all user items at the volume root into the snapshot directory
+        let items = try FileManager.default.contentsOfDirectory(at: volumeMountURL, includingPropertiesForKeys: nil, options: [])
+        for item in items {
+            let name = item.lastPathComponent
+            if Self.ignoredRootNames.contains(name) {
+                continue
+            }
+            let destItem = snapshotDestURL.appendingPathComponent(name)
+            let rc = clonefile(item.path, destItem.path, 0)
+            guard rc == 0 else {
+                let err = errno
+                throw NSError(
+                    domain: "ClayFSSnapshot",
+                    code: 21,
+                    userInfo: [NSLocalizedDescriptionKey: "APFS clonefile failed for \(name) with errno \(err): \(String(cString: strerror(err)))"]
+                )
+            }
         }
 
         // Count files and compute logical size (quick limit so large directories never block)
@@ -95,7 +115,6 @@ public final class SnapshotManager: Sendable {
         snapshotID: String,
         subpath: String? = nil
     ) throws {
-        let workspaceURL = volumeMountURL.appendingPathComponent("Workspace")
         let snapshotSourceURL = volumeMountURL
             .appendingPathComponent(".clayfs/snapshots")
             .appendingPathComponent(snapshotID)
@@ -108,12 +127,12 @@ public final class SnapshotManager: Sendable {
             )
         }
 
-        // Take a safety snapshot first if workspace has content
+        // Take a safety snapshot first if volume has content
         _ = try? createSnapshot(volumeMountURL: volumeMountURL, message: "Safety snapshot before restoring to \(snapshotID)")
 
         if let subpath = subpath, !subpath.isEmpty {
             let sourceItem = snapshotSourceURL.appendingPathComponent(subpath)
-            let destItem = workspaceURL.appendingPathComponent(subpath)
+            let destItem = volumeMountURL.appendingPathComponent(subpath)
 
             guard FileManager.default.fileExists(atPath: sourceItem.path) else {
                 throw NSError(
@@ -138,21 +157,36 @@ public final class SnapshotManager: Sendable {
                 )
             }
         } else {
-            // Full restore of Workspace
+            // Full restore:
             let tempBackup = volumeMountURL.appendingPathComponent(".clayfs/temp_restore_\(UUID().uuidString)")
-            try FileManager.default.moveItem(at: workspaceURL, to: tempBackup)
+            try FileManager.default.createDirectory(at: tempBackup, withIntermediateDirectories: true)
 
-            let rc = clonefile(snapshotSourceURL.path, workspaceURL.path, 0)
-            if rc != 0 {
-                // Rollback if failed
-                try? FileManager.default.moveItem(at: tempBackup, to: workspaceURL)
-                let err = errno
-                throw NSError(
-                    domain: "ClayFSSnapshot",
-                    code: 25,
-                    userInfo: [NSLocalizedDescriptionKey: "APFS full clonefile restore failed: \(String(cString: strerror(err)))"]
-                )
+            // Move current top-level user items into tempBackup
+            let currentItems = (try? FileManager.default.contentsOfDirectory(at: volumeMountURL, includingPropertiesForKeys: nil, options: [])) ?? []
+            for item in currentItems {
+                let name = item.lastPathComponent
+                if Self.ignoredRootNames.contains(name) {
+                    continue
+                }
+                let targetURL = tempBackup.appendingPathComponent(name)
+                try? FileManager.default.moveItem(at: item, to: targetURL)
             }
+
+            // Clone all items from snapshotSourceURL to volumeMountURL
+            let snapItems = (try? FileManager.default.contentsOfDirectory(at: snapshotSourceURL, includingPropertiesForKeys: nil, options: [])) ?? []
+            for item in snapItems {
+                let destItem = volumeMountURL.appendingPathComponent(item.lastPathComponent)
+                let rc = clonefile(item.path, destItem.path, 0)
+                if rc != 0 {
+                    let err = errno
+                    throw NSError(
+                        domain: "ClayFSSnapshot",
+                        code: 25,
+                        userInfo: [NSLocalizedDescriptionKey: "APFS clonefile restore failed for \(item.lastPathComponent): \(String(cString: strerror(err)))"]
+                    )
+                }
+            }
+
             // Clean up old temporary directory in background so restore finishes instantly
             DispatchQueue.global(qos: .utility).async {
                 try? FileManager.default.removeItem(at: tempBackup)
@@ -164,7 +198,6 @@ public final class SnapshotManager: Sendable {
         volumeMountURL: URL,
         snapshotID: String? = nil
     ) throws -> [FileDiff] {
-        let workspaceURL = volumeMountURL.appendingPathComponent("Workspace")
         let targetSnapshotID: String
 
         if let snapshotID = snapshotID {
@@ -184,7 +217,7 @@ public final class SnapshotManager: Sendable {
             return []
         }
 
-        return computeDiff(between: snapshotURL, and: workspaceURL)
+        return computeDiff(between: snapshotURL, and: volumeMountURL)
     }
 
     private func calculateMetrics(for directoryURL: URL, maxItems: Int = 500) -> (fileCount: Int, totalBytes: Int64, isComplete: Bool) {
@@ -278,9 +311,13 @@ public final class SnapshotManager: Sendable {
         var map: [String: FileMeta] = [:]
 
         for case let fileURL as URL in enumerator {
+            let rel = fileURL.path.replacingOccurrences(of: rootPath + "/", with: "")
+            let rootComp = rel.split(separator: "/").first.map(String.init) ?? rel
+            if Self.ignoredRootNames.contains(rootComp) {
+                continue
+            }
             guard let values = try? fileURL.resourceValues(forKeys: Set(keys)),
                   values.isRegularFile == true else { continue }
-            let rel = fileURL.path.replacingOccurrences(of: rootPath + "/", with: "")
             map[rel] = FileMeta(
                 size: Int64(values.fileSize ?? 0),
                 mtime: values.contentModificationDate ?? Date()

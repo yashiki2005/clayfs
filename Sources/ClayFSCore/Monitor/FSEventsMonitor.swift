@@ -47,10 +47,22 @@ public final class FSEventsMonitor: @unchecked Sendable {
 
         streamRef = FSEventStreamCreate(
             kCFAllocatorDefault,
-            { (_, clientCallBackInfo, numEvents, _, _, _) in
+            { (_, clientCallBackInfo, numEvents, eventPaths, _, _) in
                 guard let info = clientCallBackInfo else { return }
                 let monitor = Unmanaged<FSEventsMonitor>.fromOpaque(info).takeUnretainedValue()
-                monitor.handleChangeDetected()
+                if let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] {
+                    let hasUserChange = paths.contains {
+                        !$0.contains("/.clayfs") &&
+                        !$0.contains("/.fseventsd") &&
+                        !$0.contains("/.Trashes") &&
+                        !$0.contains("/.Spotlight-V100")
+                    }
+                    if hasUserChange {
+                        monitor.handleChangeDetected()
+                    }
+                } else {
+                    monitor.handleChangeDetected()
+                }
             },
             &context,
             pathsToWatch,

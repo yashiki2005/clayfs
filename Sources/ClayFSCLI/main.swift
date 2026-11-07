@@ -117,7 +117,7 @@ struct ClayFSCLIApp {
         print("マウント中: \(targetDrive.name)...")
         let mounted = try StorageManager.shared.mountDrive(bundleURL: targetDrive.bundleURL, showInFinder: true)
         print("マウント完了: \(mounted.mountURL?.path ?? "")")
-        print("Finder に表示されました。作業ディレクトリ: \(mounted.mountURL?.appendingPathComponent("Workspace").path ?? "")")
+        print("Finder に表示されました。作業ディレクトリ: \(mounted.mountURL?.path ?? "")")
     }
 
     static func handleUnmount(_ args: [String]) throws {
@@ -249,16 +249,20 @@ struct ClayFSCLIApp {
             exit(1)
         }
 
-        guard let snapshotID = args.first(where: { !$0.starts(with: "-") }) else {
-            print("使い方: clayfs restore <SNAPSHOT_ID> [FILE_PATH]")
+        let drives = DriveRegistry.shared.loadDrives()
+        let nonOptions = args.filter { !$0.starts(with: "-") }
+        let remaining = nonOptions.filter { arg in !drives.contains(where: { $0.name == arg }) }
+
+        guard let snapshotID = remaining.first else {
+            print("使い方: clayfs restore [DRIVE_NAME] <SNAPSHOT_ID> [FILE_PATH]")
             exit(1)
         }
 
-        let subpath = args.count > 1 ? args[1] : nil
+        let subpath = remaining.count > 1 ? remaining[1] : nil
         if let subpath = subpath {
             print("復元中: [\(snapshotID)] から '\(subpath)' を復元します...")
         } else {
-            print("復元中: Workspace 全体を [\(snapshotID)] の状態に復元します...")
+            print("復元中: ドライブ全体を [\(snapshotID)] の状態に復元します...")
         }
 
         try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshotID, subpath: subpath)
@@ -284,12 +288,11 @@ struct ClayFSCLIApp {
             exit(1)
         }
 
-        let workspaceURL = mountURL.appendingPathComponent("Workspace")
         print("=== ClayFS 自動監視デーモン ===")
-        print("監視フォルダ: \(workspaceURL.path)")
+        print("監視フォルダ: \(mountURL.path)")
         print("変更後 5 秒間静穏が続くと、自動スナップショットを作成します。(Ctrl+C で停止)")
 
-        let monitor = FSEventsMonitor(watchURL: workspaceURL, debounceSeconds: 5.0) {
+        let monitor = FSEventsMonitor(watchURL: mountURL, debounceSeconds: 5.0) {
             do {
                 let diffs = try SnapshotManager.shared.diff(volumeMountURL: mountURL)
                 guard !diffs.isEmpty else { return }

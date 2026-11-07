@@ -197,12 +197,10 @@ public final class StorageManager: Sendable {
     }
 
     private func initializeVolumeStructure(at mountURL: URL) throws {
-        let workspaceURL = mountURL.appendingPathComponent("Workspace")
         let metadataURL = mountURL.appendingPathComponent(".clayfs")
         let snapshotsURL = metadataURL.appendingPathComponent("snapshots")
         let noIndexURL = metadataURL.appendingPathComponent(".metadata_never_index")
 
-        try FileManager.default.createDirectory(at: workspaceURL, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: snapshotsURL, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: noIndexURL.path) {
             FileManager.default.createFile(atPath: noIndexURL.path, contents: nil)
