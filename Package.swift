@@ -13,9 +13,15 @@ var products: [Product] = [
 ]
 
 var targets: [Target] = [
+    .systemLibrary(
+        name: "CSQLite",
+        path: "Sources/CSQLite"
+    ),
     .target(
         name: "ClayFSCore",
-        dependencies: [],
+        dependencies: [
+            .target(name: "CSQLite", condition: .when(platforms: [.linux]))
+        ],
         path: "Sources/ClayFSCore",
         linkerSettings: [
             .linkedLibrary("sqlite3", .when(platforms: [.linux]))

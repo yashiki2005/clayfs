@@ -368,7 +368,7 @@ public final class StorageManager: Sendable {
 
         try FileManager.default.createDirectory(at: snapshotsURL, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: noIndexURL.path) {
-            FileManager.default.createFile(atPath: noIndexURL.path, contents: nil)
+            _ = FileManager.default.createFile(atPath: noIndexURL.path, contents: nil)
         }
     }
 

@@ -1,7 +1,7 @@
 import Foundation
-#if canImport(SQLite3)
+#if os(macOS)
 import SQLite3
-#elseif canImport(CSQLite)
+#elseif os(Linux)
 import CSQLite
 #endif
 
