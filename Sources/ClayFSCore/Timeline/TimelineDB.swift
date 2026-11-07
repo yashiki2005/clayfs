@@ -77,6 +77,26 @@ public final class TimelineDB: @unchecked Sendable {
         }
     }
 
+    public func updateMetrics(id: String, fileCount: Int, totalBytes: Int64) throws {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let sql = "UPDATE snapshots SET file_count = ?, total_bytes = ? WHERE id = ?;"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
+            throw NSError(domain: "ClayFSTimelineDB", code: 7, userInfo: [NSLocalizedDescriptionKey: "Failed to prepare update metrics statement"])
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(fileCount))
+        sqlite3_bind_int64(stmt, 2, totalBytes)
+        sqlite3_bind_text(stmt, 3, (id as NSString).utf8String, -1, nil)
+
+        if sqlite3_step(stmt) != SQLITE_DONE {
+            throw NSError(domain: "ClayFSTimelineDB", code: 8, userInfo: [NSLocalizedDescriptionKey: "Failed to update snapshot metrics row"])
+        }
+    }
+
     public func getSnapshots(limit: Int = 100) -> [Snapshot] {
         lock.lock()
         defer { lock.unlock() }

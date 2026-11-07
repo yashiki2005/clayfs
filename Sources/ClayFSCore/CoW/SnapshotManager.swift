@@ -50,8 +50,8 @@ public final class SnapshotManager: Sendable {
             )
         }
 
-        // Count files and compute logical size
-        let (fileCount, totalBytes) = calculateMetrics(for: snapshotDestURL)
+        // Count files and compute logical size (quick limit so large directories never block)
+        let (fileCount, totalBytes, isComplete) = calculateMetrics(for: snapshotDestURL, maxItems: 500)
 
         let snapshot = Snapshot(
             id: id,
@@ -64,6 +64,19 @@ public final class SnapshotManager: Sendable {
 
         let db = try TimelineDB(fileURL: dbURL)
         try db.insertSnapshot(snapshot)
+
+        // If directory has more than 500 items, finish computing full metrics in background queue
+        if !isComplete {
+            let snapID = id
+            let targetURL = snapshotDestURL
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+                let (fullCount, fullBytes) = self.calculateFullMetrics(for: targetURL)
+                if let db = try? TimelineDB(fileURL: dbURL) {
+                    try? db.updateMetrics(id: snapID, fileCount: fullCount, totalBytes: fullBytes)
+                }
+            }
+        }
 
         return snapshot
     }
@@ -174,7 +187,31 @@ public final class SnapshotManager: Sendable {
         return computeDiff(between: snapshotURL, and: workspaceURL)
     }
 
-    private func calculateMetrics(for directoryURL: URL) -> (Int, Int64) {
+    private func calculateMetrics(for directoryURL: URL, maxItems: Int = 500) -> (fileCount: Int, totalBytes: Int64, isComplete: Bool) {
+        let keys: [URLResourceKey] = [.fileSizeKey, .isRegularFileKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: directoryURL,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return (0, 0, true)
+        }
+
+        var count = 0
+        var totalBytes: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true else { continue }
+            count += 1
+            totalBytes += Int64(values.fileSize ?? 0)
+            if count >= maxItems {
+                return (count, totalBytes, false)
+            }
+        }
+        return (count, totalBytes, true)
+    }
+
+    private func calculateFullMetrics(for directoryURL: URL) -> (fileCount: Int, totalBytes: Int64) {
         let keys: [URLResourceKey] = [.fileSizeKey, .isRegularFileKey]
         guard let enumerator = FileManager.default.enumerator(
             at: directoryURL,

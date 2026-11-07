@@ -103,17 +103,24 @@ public final class ClayFSAppState: ObservableObject {
         statusMessage = L10n.mounting
         Task {
             do {
-                let info = try StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: true)
-                self.activeMountURL = info.mountURL
-                self.isMounted = true
-                self.statusMessage = nil
-                refreshDrives()
-                if let m = info.mountURL {
-                    loadSnapshots(mountURL: m)
-                    startWatching(mountURL: m)
+                let info = try await Task.detached(priority: .userInitiated) {
+                    try StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: true)
+                }.value
+
+                await MainActor.run {
+                    self.activeMountURL = info.mountURL
+                    self.isMounted = true
+                    self.statusMessage = nil
+                    self.refreshDrives()
+                    if let m = info.mountURL {
+                        self.loadSnapshots(mountURL: m)
+                        self.startWatching(mountURL: m)
+                    }
                 }
             } catch {
-                self.statusMessage = L10n.mountFailed(error.localizedDescription)
+                await MainActor.run {
+                    self.statusMessage = L10n.mountFailed(error.localizedDescription)
+                }
             }
         }
     }
@@ -124,14 +131,21 @@ public final class ClayFSAppState: ObservableObject {
         statusMessage = L10n.unmounting
         Task {
             do {
-                try StorageManager.shared.unmountDrive(mountURL: mountURL)
-                self.activeMountURL = nil
-                self.isMounted = false
-                self.snapshots = []
-                self.statusMessage = nil
-                refreshDrives()
+                try await Task.detached(priority: .userInitiated) {
+                    try StorageManager.shared.unmountDrive(mountURL: mountURL)
+                }.value
+
+                await MainActor.run {
+                    self.activeMountURL = nil
+                    self.isMounted = false
+                    self.snapshots = []
+                    self.statusMessage = nil
+                    self.refreshDrives()
+                }
             } catch {
-                self.statusMessage = L10n.unmountFailed(error.localizedDescription)
+                await MainActor.run {
+                    self.statusMessage = L10n.unmountFailed(error.localizedDescription)
+                }
             }
         }
     }
@@ -143,20 +157,25 @@ public final class ClayFSAppState: ObservableObject {
         saveStage = L10n.recordingCowStage
 
         Task {
-            // Short delay for smooth animation visibility
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            // Keep animation visible smoothly for at least 800ms
+            async let minDelay: () = Task.sleep(nanoseconds: 800_000_000)
 
             do {
-                let snap = try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: message)
-                loadSnapshots(mountURL: mountURL)
+                let snap = try await Task.detached(priority: .userInitiated) {
+                    try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: message)
+                }.value
+
+                _ = try? await minDelay
+
                 await MainActor.run {
+                    self.loadSnapshots(mountURL: mountURL)
                     self.saveStage = L10n.saveDoneStage(snap.id)
                     self.saveSuccess = true
                     self.statusMessage = L10n.saveDoneStage(snap.id)
                 }
 
                 // Show success feedback before closing modal
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                try? await Task.sleep(nanoseconds: 900_000_000)
                 await MainActor.run {
                     self.isSavingSnapshot = false
                 }
@@ -176,20 +195,25 @@ public final class ClayFSAppState: ObservableObject {
         restoreStage = L10n.restoringStage
 
         Task {
-            // Short delay so the user clearly sees the clock animation
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            // Keep reverse clock animation visible for at least 1000ms
+            async let minDelay: () = Task.sleep(nanoseconds: 1_000_000_000)
 
             do {
-                try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshot.id)
-                loadSnapshots(mountURL: mountURL)
+                try await Task.detached(priority: .userInitiated) {
+                    try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshot.id)
+                }.value
+
+                _ = try? await minDelay
+
                 await MainActor.run {
+                    self.loadSnapshots(mountURL: mountURL)
                     self.restoreStage = L10n.restoreDoneStage(snapshot.id)
                     self.restoreSuccess = true
                     self.statusMessage = L10n.restoredMessage(snapshot.id)
                 }
 
                 // Show success feedback before closing modal
-                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
                 await MainActor.run {
                     self.isRestoring = false
                     self.pendingRestoreSnapshot = nil
@@ -221,16 +245,15 @@ public final class ClayFSAppState: ObservableObject {
         stopWatching()
         let ws = mountURL.appendingPathComponent("Workspace")
         monitor = FSEventsMonitor(watchURL: ws, debounceSeconds: 5.0) { [weak self] in
-            Task { @MainActor in
-                guard let self = self, let m = self.activeMountURL else { return }
+            Task.detached(priority: .utility) { [weak self] in
+                guard let self = self else { return }
                 do {
-                    let diffs = try SnapshotManager.shared.diff(volumeMountURL: m)
-                    if !diffs.isEmpty {
-                        _ = try SnapshotManager.shared.createSnapshot(
-                            volumeMountURL: m,
-                            message: L10n.autoSaveMessage(diffs.count)
-                        )
-                        self.loadSnapshots(mountURL: m)
+                    _ = try SnapshotManager.shared.createSnapshot(
+                        volumeMountURL: mountURL,
+                        message: L10n.autoSaveMessage(1)
+                    )
+                    await MainActor.run {
+                        self.loadSnapshots(mountURL: mountURL)
                     }
                 } catch {}
             }

@@ -577,48 +577,52 @@ public struct ClayFSMenuView: View {
 
 struct AnimatedClockView: View {
     let isReverse: Bool
-    @State private var rotation: Double = 0
 
     var body: some View {
-        ZStack {
-            // Outer Dial Ring
-            Circle()
-                .stroke(isReverse ? Color.orange : Color.accentColor, lineWidth: 3)
-                .frame(width: 52, height: 52)
+        TimelineView(.animation) { timeline in
+            let elapsed = timeline.date.timeIntervalSinceReferenceDate
+            let speed: Double = 240.0 // degrees per second
+            let minuteAngle = (elapsed * speed).truncatingRemainder(dividingBy: 360.0)
+            let hourAngle = minuteAngle / 12.0
 
-            // 12 Hour tick marks
-            ForEach(0..<12) { i in
-                Rectangle()
-                    .fill((i % 3 == 0) ? (isReverse ? Color.orange : Color.accentColor) : Color.secondary.opacity(0.4))
-                    .frame(width: 2, height: (i % 3 == 0) ? 6 : 3)
-                    .offset(y: -22)
-                    .rotationEffect(.degrees(Double(i) * 30))
+            let effectiveMin = isReverse ? -minuteAngle : minuteAngle
+            let effectiveHour = isReverse ? -hourAngle : hourAngle
+
+            ZStack {
+                // Outer Dial Ring
+                Circle()
+                    .stroke(isReverse ? Color.orange : Color.accentColor, lineWidth: 3)
+                    .frame(width: 52, height: 52)
+
+                // 12 Hour tick marks
+                ForEach(0..<12) { i in
+                    Rectangle()
+                        .fill((i % 3 == 0) ? (isReverse ? Color.orange : Color.accentColor) : Color.secondary.opacity(0.4))
+                        .frame(width: 2, height: (i % 3 == 0) ? 6 : 3)
+                        .offset(y: -22)
+                        .rotationEffect(.degrees(Double(i) * 30))
+                }
+
+                // Hour Hand (slower)
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color.primary)
+                    .frame(width: 3, height: 14)
+                    .offset(y: -7)
+                    .rotationEffect(.degrees(effectiveHour))
+
+                // Minute Hand (faster)
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(isReverse ? Color.orange : Color.accentColor)
+                    .frame(width: 2, height: 20)
+                    .offset(y: -10)
+                    .rotationEffect(.degrees(effectiveMin))
+
+                // Center Pin
+                Circle()
+                    .fill(isReverse ? Color.orange : Color.accentColor)
+                    .frame(width: 6, height: 6)
             }
-
-            // Hour Hand (slower)
-            RoundedRectangle(cornerRadius: 1.5)
-                .fill(Color.primary)
-                .frame(width: 3, height: 14)
-                .offset(y: -7)
-                .rotationEffect(.degrees(isReverse ? -rotation / 12 : rotation / 12))
-
-            // Minute Hand (faster)
-            RoundedRectangle(cornerRadius: 1)
-                .fill(isReverse ? Color.orange : Color.accentColor)
-                .frame(width: 2, height: 20)
-                .offset(y: -10)
-                .rotationEffect(.degrees(isReverse ? -rotation : rotation))
-
-            // Center Pin
-            Circle()
-                .fill(isReverse ? Color.orange : Color.accentColor)
-                .frame(width: 6, height: 6)
-        }
-        .frame(width: 60, height: 60)
-        .onAppear {
-            withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) {
-                rotation = 360
-            }
+            .frame(width: 60, height: 60)
         }
     }
 }
