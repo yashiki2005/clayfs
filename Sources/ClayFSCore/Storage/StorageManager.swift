@@ -332,9 +332,22 @@ public final class StorageManager: Sendable {
             return [:]
         }
         #elseif os(Linux)
-        // Parse /proc/mounts and inspect loop devices
-        guard let mountsContent = try? String(contentsOfFile: "/proc/mounts", encoding: .utf8) else {
+        // Parse /proc/mounts safely using getline (avoids Foundation 4KB truncation on procfs)
+        guard let fp = fopen("/proc/mounts", "r") else {
             return [:]
+        }
+        defer { fclose(fp) }
+
+        var lines: [String] = []
+        var lineBuffer: UnsafeMutablePointer<CChar>? = nil
+        var lineCap: Int = 0
+        while getline(&lineBuffer, &lineCap, fp) > 0 {
+            if let linePtr = lineBuffer {
+                lines.append(String(cString: linePtr).trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        if let linePtr = lineBuffer {
+            free(linePtr)
         }
 
         // Loop device to backing file map
@@ -350,7 +363,6 @@ public final class StorageManager: Sendable {
         }
 
         var map: [String: URL] = [:]
-        let lines = mountsContent.split(separator: "\n")
         for line in lines {
             let parts = line.split(separator: " ")
             guard parts.count >= 2 else { continue }
