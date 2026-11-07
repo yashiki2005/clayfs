@@ -56,6 +56,8 @@ public struct ClayFSMenuView: View {
 
     // MARK: - Left Sidebar
 
+    @State private var hoveredDriveName: String?
+
     private var sidebarView: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Sidebar Header
@@ -92,6 +94,7 @@ public struct ClayFSMenuView: View {
                     LazyVStack(spacing: 4) {
                         ForEach(appState.drives) { drive in
                             let isSelected = drive.name == appState.selectedDrive?.name
+                            let isHovered = drive.name == hoveredDriveName
                             Button(action: {
                                 appState.selectDrive(drive)
                             }) {
@@ -111,14 +114,22 @@ public struct ClayFSMenuView: View {
                                             .foregroundColor(.secondary)
                                     }
 
-                                    Spacer()
+                                    Spacer(minLength: 0)
                                 }
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 6)
-                                .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
-                                .cornerRadius(6)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .fill(isSelected ? Color.accentColor.opacity(0.18) : (isHovered ? Color.secondary.opacity(0.1) : Color(NSColor.textColor).opacity(0.001)))
+                                )
                             }
                             .buttonStyle(.plain)
+                            .contentShape(Rectangle())
+                            .onHover { hovering in
+                                hoveredDriveName = hovering ? drive.name : nil
+                            }
                             .contextMenu {
                                 if drive.isMounted {
                                     Button("Finder で開く") {
@@ -158,8 +169,10 @@ public struct ClayFSMenuView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .contentShape(Rectangle())
         }
     }
 
