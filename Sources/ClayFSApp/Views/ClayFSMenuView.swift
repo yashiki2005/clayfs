@@ -8,9 +8,21 @@ public struct ClayFSMenuView: View {
     @State private var newDriveName: String = ""
     @State private var newDriveSize: String = "50g"
     @State private var newDrivePath: String = ""
+    @State private var scrubberIndex: Double = 0.0
 
     public init(appState: ClayFSAppState) {
         self.appState = appState
+    }
+
+    private var selectedScrubberSnapshot: Snapshot? {
+        guard !appState.snapshots.isEmpty else { return nil }
+        let count = appState.snapshots.count
+        let pos = min(max(0, Int(scrubberIndex.rounded())), count - 1)
+        let targetIdx = count - 1 - pos
+        if targetIdx >= 0 && targetIdx < count {
+            return appState.snapshots[targetIdx]
+        }
+        return appState.snapshots.first
     }
 
     public var body: some View {
@@ -298,8 +310,8 @@ public struct ClayFSMenuView: View {
                     }
                     .padding(.horizontal, 12)
 
-                    // Timeline
-                    VStack(alignment: .leading, spacing: 4) {
+                    // Timeline & Scrubber
+                    VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 6) {
                             Text(L10n.timelineHistory)
                                 .font(.caption.bold())
@@ -333,36 +345,148 @@ public struct ClayFSMenuView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .padding(.horizontal, 16)
                         } else {
-                            ScrollView {
-                                LazyVStack(spacing: 6) {
-                                    ForEach(appState.snapshots) { snap in
-                                        HStack {
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(snap.message)
-                                                    .font(.system(size: 11, weight: .medium))
+                            // Timeline Scrubber Bar
+                            VStack(spacing: 4) {
+                                HStack(spacing: 6) {
+                                    HStack(spacing: 2) {
+                                        Image(systemName: "clock.arrow.circlepath")
+                                            .font(.system(size: 8))
+                                        Text(L10n.past)
+                                            .font(.system(size: 8, weight: .semibold))
+                                    }
+                                    .foregroundColor(.secondary)
+
+                                    Slider(
+                                        value: $scrubberIndex,
+                                        in: 0...Double(max(0, appState.snapshots.count - 1)),
+                                        step: 1.0
+                                    )
+                                    .controlSize(.mini)
+                                    .accentColor(.accentColor)
+
+                                    HStack(spacing: 2) {
+                                        Text(L10n.latest)
+                                            .font(.system(size: 8, weight: .semibold))
+                                        Image(systemName: "sparkles")
+                                            .font(.system(size: 8))
+                                    }
+                                    .foregroundColor(scrubberIndex >= Double(appState.snapshots.count - 1) ? .accentColor : .secondary)
+                                }
+                                .padding(.horizontal, 12)
+
+                                // Selected Snapshot Preview & Quick Restore Card
+                                if let selectedSnap = selectedScrubberSnapshot {
+                                    HStack(alignment: .center, spacing: 6) {
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            HStack(spacing: 4) {
+                                                Text(selectedSnap.message)
+                                                    .font(.system(size: 11, weight: .bold))
                                                     .lineLimit(1)
-                                                Text("\(formatDate(snap.timestamp)) • \(snap.id)")
+                                                if selectedSnap.id == appState.snapshots.first?.id {
+                                                    Text(L10n.latest)
+                                                        .font(.system(size: 8, weight: .heavy))
+                                                        .padding(.horizontal, 3)
+                                                        .padding(.vertical, 1)
+                                                        .background(Color.accentColor.opacity(0.15))
+                                                        .foregroundColor(.accentColor)
+                                                        .cornerRadius(3)
+                                                }
+                                            }
+                                            HStack(spacing: 4) {
+                                                Text(formatDate(selectedSnap.timestamp))
                                                     .font(.system(size: 9))
                                                     .foregroundColor(.secondary)
+                                                Text("•")
+                                                    .font(.system(size: 9))
+                                                    .foregroundColor(.secondary.opacity(0.5))
+                                                Text(selectedSnap.id)
+                                                    .font(.system(size: 9, design: .monospaced))
+                                                    .foregroundColor(.secondary)
                                             }
-
-                                            Spacer()
-
-                                            Button(L10n.restore) {
-                                                appState.pendingRestoreSnapshot = snap
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .font(.caption2)
-                                            .foregroundColor(.red)
                                         }
-                                        .padding(.vertical, 4)
-                                        .padding(.horizontal, 8)
-                                        .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
-                                        .cornerRadius(6)
+
+                                        Spacer()
+
+                                        Button(action: {
+                                            appState.pendingRestoreSnapshot = selectedSnap
+                                        }) {
+                                            HStack(spacing: 3) {
+                                                Image(systemName: "arrow.counterclockwise")
+                                                    .font(.system(size: 9))
+                                                Text(L10n.restore)
+                                                    .font(.system(size: 10, weight: .semibold))
+                                            }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .tint(.red)
+                                        .controlSize(.mini)
+                                        .help(L10n.restoreToSelected)
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(Color(NSColor.controlBackgroundColor))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .stroke(Color.accentColor.opacity(0.4), lineWidth: 1)
+                                    )
+                                    .cornerRadius(6)
+                                    .padding(.horizontal, 12)
+                                }
+                            }
+
+                            // Synchronized Snapshot List
+                            ScrollView {
+                                LazyVStack(spacing: 4) {
+                                    ForEach(Array(appState.snapshots.enumerated()), id: \.element.id) { index, snap in
+                                        let isCurrentSelected = (snap.id == selectedScrubberSnapshot?.id)
+                                        let pos = appState.snapshots.count - 1 - index
+
+                                        Button(action: {
+                                            scrubberIndex = Double(pos)
+                                        }) {
+                                            HStack(spacing: 6) {
+                                                Circle()
+                                                    .fill(isCurrentSelected ? Color.accentColor : Color.secondary.opacity(0.4))
+                                                    .frame(width: 5, height: 5)
+
+                                                VStack(alignment: .leading, spacing: 1) {
+                                                    Text(snap.message)
+                                                        .font(.system(size: 10, weight: isCurrentSelected ? .bold : .regular))
+                                                        .lineLimit(1)
+                                                        .foregroundColor(isCurrentSelected ? .primary : .primary.opacity(0.85))
+                                                    Text("\(formatDate(snap.timestamp)) • \(snap.id)")
+                                                        .font(.system(size: 8))
+                                                        .foregroundColor(.secondary)
+                                                }
+
+                                                Spacer()
+
+                                                if isCurrentSelected {
+                                                    Text("●")
+                                                        .font(.system(size: 7))
+                                                        .foregroundColor(.accentColor)
+                                                }
+                                            }
+                                            .padding(.vertical, 3)
+                                            .padding(.horizontal, 6)
+                                            .background(isCurrentSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+                                            .cornerRadius(4)
+                                        }
+                                        .buttonStyle(.plain)
                                     }
                                 }
                                 .padding(.horizontal, 12)
                             }
+                        }
+                    }
+                    .onAppear {
+                        if !appState.snapshots.isEmpty {
+                            scrubberIndex = Double(appState.snapshots.count - 1)
+                        }
+                    }
+                    .onChange(of: appState.snapshots.count) { _, newCount in
+                        if newCount > 0 {
+                            scrubberIndex = Double(newCount - 1)
                         }
                     }
                 } else {

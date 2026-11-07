@@ -224,6 +224,58 @@ public enum L10n {
         }
     }
 
+    public static var timelineScrubber: String {
+        switch currentLanguage {
+        case .japanese: return "タイムライン・スクラバー"
+        case .simplifiedChinese: return "时间线滑块"
+        case .traditionalChinese: return "時間線滑桿"
+        case .spanish: return "Desplazador de línea de tiempo"
+        case .french: return "Curseur temporel"
+        case .german: return "Zeitachsen-Schieberegler"
+        case .korean: return "타임라인 스크러버"
+        case .english: return "Timeline Scrubber"
+        }
+    }
+
+    public static var past: String {
+        switch currentLanguage {
+        case .japanese: return "過去"
+        case .simplifiedChinese: return "过去"
+        case .traditionalChinese: return "過去"
+        case .spanish: return "Pasado"
+        case .french: return "Passé"
+        case .german: return "Vergangenheit"
+        case .korean: return "과거"
+        case .english: return "Past"
+        }
+    }
+
+    public static var latest: String {
+        switch currentLanguage {
+        case .japanese: return "最新"
+        case .simplifiedChinese: return "最新"
+        case .traditionalChinese: return "最新"
+        case .spanish: return "Más reciente"
+        case .french: return "Plus récent"
+        case .german: return "Aktuell"
+        case .korean: return "최신"
+        case .english: return "Latest"
+        }
+    }
+
+    public static var restoreToSelected: String {
+        switch currentLanguage {
+        case .japanese: return "この時点に復元"
+        case .simplifiedChinese: return "恢复至此快照"
+        case .traditionalChinese: return "還原至此快照"
+        case .spanish: return "Restaurar a este punto"
+        case .french: return "Restaurer à ce point"
+        case .german: return "Auf diesen Stand wiederherstellen"
+        case .korean: return "이 시점으로 복원"
+        case .english: return "Restore to This Point"
+        }
+    }
+
     public static func itemCount(_ count: Int) -> String {
         switch currentLanguage {
         case .japanese: return "\(count) 件"
