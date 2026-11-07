@@ -165,11 +165,16 @@ struct ClayFSCLIApp {
             exit(1)
         }
 
+        let drives = DriveRegistry.shared.loadDrives()
         var message = "Manual snapshot"
         if let mIdx = args.firstIndex(of: "-m"), mIdx + 1 < args.count {
             message = args[mIdx + 1]
-        } else if let first = args.first(where: { !$0.starts(with: "-") }) {
-            message = first
+        } else {
+            let nonOptions = args.filter { !$0.starts(with: "-") }
+            let remaining = nonOptions.filter { arg in !drives.contains(where: { $0.name == arg }) }
+            if let first = remaining.first {
+                message = first
+            }
         }
 
         print("スナップショット作成中...")
@@ -208,7 +213,11 @@ struct ClayFSCLIApp {
             exit(1)
         }
 
-        let snapshotID = args.first(where: { !$0.starts(with: "-") })
+        let drives = DriveRegistry.shared.loadDrives()
+        let nonOptions = args.filter { !$0.starts(with: "-") }
+        let remaining = nonOptions.filter { arg in !drives.contains(where: { $0.name == arg }) }
+        let snapshotID = remaining.first
+
         let diffs = try SnapshotManager.shared.diff(volumeMountURL: mountURL, snapshotID: snapshotID)
 
         if diffs.isEmpty {
@@ -296,6 +305,37 @@ struct ClayFSCLIApp {
 
     static func resolveActiveMount(args: [String]) -> URL? {
         let drives = DriveRegistry.shared.loadDrives()
+        let cwd = FileManager.default.currentDirectoryPath
+
+        // 1. Check if current working directory is inside a mounted volume
+        for drive in drives {
+            if let m = StorageManager.shared.findMountPoint(for: drive.bundleURL) {
+                if cwd == m.path || cwd.hasPrefix(m.path + "/") {
+                    return m
+                }
+            }
+        }
+
+        // 2. Check --drive <name> or -d <name>
+        for opt in ["--drive", "-d"] {
+            if let dIdx = args.firstIndex(of: opt), dIdx + 1 < args.count {
+                let targetName = args[dIdx + 1]
+                if let drive = drives.first(where: { $0.name == targetName }),
+                   let m = StorageManager.shared.findMountPoint(for: drive.bundleURL) {
+                    return m
+                }
+            }
+        }
+
+        // 3. Check if any positional argument matches a drive name
+        for arg in args where !arg.starts(with: "-") {
+            if let drive = drives.first(where: { $0.name == arg }),
+               let m = StorageManager.shared.findMountPoint(for: drive.bundleURL) {
+                return m
+            }
+        }
+
+        // 4. Fallback to first mounted drive
         for drive in drives {
             if let m = StorageManager.shared.findMountPoint(for: drive.bundleURL) {
                 return m
