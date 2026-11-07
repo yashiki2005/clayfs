@@ -21,14 +21,30 @@ public final class ClayFSAppState: ObservableObject {
     }
 
     public func refreshDrives() {
-        let list = DriveRegistry.shared.loadDrives(cleanMissing: true)
+        var list = DriveRegistry.shared.loadDrives(cleanMissing: true)
+        for i in 0..<list.count {
+            if let mount = StorageManager.shared.findMountPoint(for: list[i].bundleURL) {
+                list[i].isMounted = true
+                list[i].mountURL = mount
+                if let values = try? mount.resourceValues(forKeys: [.volumeAvailableCapacityKey, .volumeTotalCapacityKey]) {
+                    list[i].freeBytes = Int64(values.volumeAvailableCapacity ?? 0)
+                    list[i].totalBytes = Int64(values.volumeTotalCapacity ?? 0)
+                }
+            } else {
+                list[i].isMounted = false
+                list[i].mountURL = nil
+            }
+        }
         self.drives = list
+
         if selectedDrive == nil || !list.contains(where: { $0.name == selectedDrive?.name }) {
-            if let mounted = list.first(where: { StorageManager.shared.findMountPoint(for: $0.bundleURL) != nil }) {
+            if let mounted = list.first(where: { $0.isMounted }) {
                 self.selectedDrive = mounted
             } else {
                 self.selectedDrive = list.first
             }
+        } else if let sel = selectedDrive, let updated = list.first(where: { $0.name == sel.name }) {
+            self.selectedDrive = updated
         }
         checkMountStatus()
     }
@@ -80,6 +96,7 @@ public final class ClayFSAppState: ObservableObject {
                 self.activeMountURL = info.mountURL
                 self.isMounted = true
                 self.statusMessage = nil
+                refreshDrives()
                 if let m = info.mountURL {
                     loadSnapshots(mountURL: m)
                     startWatching(mountURL: m)
@@ -101,6 +118,7 @@ public final class ClayFSAppState: ObservableObject {
                 self.isMounted = false
                 self.snapshots = []
                 self.statusMessage = nil
+                refreshDrives()
             } catch {
                 self.statusMessage = "アンマウント失敗: \(error.localizedDescription)"
             }
@@ -142,10 +160,10 @@ public final class ClayFSAppState: ObservableObject {
     }
 
     private func startPolling() {
-        pollTimer = Timer.publish(every: 3.0, on: .main, in: .common)
+        pollTimer = Timer.publish(every: 2.0, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
-                self?.checkMountStatus()
+                self?.refreshDrives()
             }
     }
 
