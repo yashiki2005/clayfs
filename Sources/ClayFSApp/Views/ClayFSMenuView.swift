@@ -40,7 +40,12 @@ public struct ClayFSMenuView: View {
                     .background(Color(NSColor.windowBackgroundColor))
             }
 
-            // Restore Modal Progress Overlay
+            // Save Progress Overlay (Clockwise Clock)
+            if appState.isSavingSnapshot {
+                saveProgressOverlay
+            }
+
+            // Restore Modal Progress Overlay (Counter-Clockwise Clock)
             if appState.isRestoring {
                 restoreProgressOverlay
             }
@@ -499,6 +504,37 @@ public struct ClayFSMenuView: View {
         .frame(width: 320)
     }
 
+    private var saveProgressOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.35)
+                .edgesIgnoringSafeArea(.all)
+
+            VStack(spacing: 16) {
+                if appState.saveSuccess {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 42))
+                        .foregroundColor(.green)
+                } else {
+                    AnimatedClockView(isReverse: false)
+                }
+
+                VStack(spacing: 6) {
+                    Text(appState.saveSuccess ? "スナップショット保存完了" : "スナップショットを保存中...")
+                        .font(.headline)
+
+                    Text(appState.saveStage)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .padding(24)
+            .frame(width: 290)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color(NSColor.windowBackgroundColor)))
+            .shadow(color: .black.opacity(0.2), radius: 15)
+        }
+    }
+
     private var restoreProgressOverlay: some View {
         ZStack {
             Color.black.opacity(0.35)
@@ -510,13 +546,11 @@ public struct ClayFSMenuView: View {
                         .font(.system(size: 42))
                         .foregroundColor(.green)
                 } else {
-                    ProgressView()
-                        .scaleEffect(1.3)
-                        .progressViewStyle(.circular)
+                    AnimatedClockView(isReverse: true)
                 }
 
                 VStack(spacing: 6) {
-                    Text(appState.restoreSuccess ? "復元完了" : "スナップショットを復元中...")
+                    Text(appState.restoreSuccess ? "復元完了" : "過去の状態に復元中 (タイムトラベル)...")
                         .font(.headline)
 
                     Text(appState.restoreStage)
@@ -526,7 +560,7 @@ public struct ClayFSMenuView: View {
                 }
             }
             .padding(24)
-            .frame(width: 280)
+            .frame(width: 290)
             .background(RoundedRectangle(cornerRadius: 12).fill(Color(NSColor.windowBackgroundColor)))
             .shadow(color: .black.opacity(0.2), radius: 15)
         }
@@ -536,5 +570,55 @@ public struct ClayFSMenuView: View {
         let df = DateFormatter()
         df.dateFormat = "MM/dd HH:mm"
         return df.string(from: date)
+    }
+}
+
+// MARK: - Animated Clock (Clockwise for Save, Counter-Clockwise for Restore)
+
+struct AnimatedClockView: View {
+    let isReverse: Bool
+    @State private var rotation: Double = 0
+
+    var body: some View {
+        ZStack {
+            // Outer Dial Ring
+            Circle()
+                .stroke(isReverse ? Color.orange : Color.accentColor, lineWidth: 3)
+                .frame(width: 52, height: 52)
+
+            // 12 Hour tick marks
+            ForEach(0..<12) { i in
+                Rectangle()
+                    .fill((i % 3 == 0) ? (isReverse ? Color.orange : Color.accentColor) : Color.secondary.opacity(0.4))
+                    .frame(width: 2, height: (i % 3 == 0) ? 6 : 3)
+                    .offset(y: -22)
+                    .rotationEffect(.degrees(Double(i) * 30))
+            }
+
+            // Hour Hand (slower)
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(Color.primary)
+                .frame(width: 3, height: 14)
+                .offset(y: -7)
+                .rotationEffect(.degrees(isReverse ? -rotation / 12 : rotation / 12))
+
+            // Minute Hand (faster)
+            RoundedRectangle(cornerRadius: 1)
+                .fill(isReverse ? Color.orange : Color.accentColor)
+                .frame(width: 2, height: 20)
+                .offset(y: -10)
+                .rotationEffect(.degrees(isReverse ? -rotation : rotation))
+
+            // Center Pin
+            Circle()
+                .fill(isReverse ? Color.orange : Color.accentColor)
+                .frame(width: 6, height: 6)
+        }
+        .frame(width: 60, height: 60)
+        .onAppear {
+            withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) {
+                rotation = 360
+            }
+        }
     }
 }

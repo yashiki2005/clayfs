@@ -12,6 +12,11 @@ public final class ClayFSAppState: ObservableObject {
     @Published public var isCreatingDrive: Bool = false
     @Published public var statusMessage: String?
 
+    // Save state
+    @Published public var isSavingSnapshot: Bool = false
+    @Published public var saveStage: String = ""
+    @Published public var saveSuccess: Bool = false
+
     // Restore state
     @Published public var isRestoring: Bool = false
     @Published public var restoreStage: String = ""
@@ -133,14 +138,33 @@ public final class ClayFSAppState: ObservableObject {
 
     public func takeSnapshot(message: String) {
         guard let mountURL = activeMountURL else { return }
-        statusMessage = "スナップショット作成中..."
+        isSavingSnapshot = true
+        saveSuccess = false
+        saveStage = "APFS CoW で現在の状態を記録中..."
+
         Task {
+            // Short delay for smooth animation visibility
+            try? await Task.sleep(nanoseconds: 300_000_000)
+
             do {
                 let snap = try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: message)
                 loadSnapshots(mountURL: mountURL)
-                self.statusMessage = "保存完了: [\(snap.id)]"
+                await MainActor.run {
+                    self.saveStage = "保存完了: [\(snap.id)]"
+                    self.saveSuccess = true
+                    self.statusMessage = "保存完了: [\(snap.id)]"
+                }
+
+                // Show success feedback before closing modal
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                await MainActor.run {
+                    self.isSavingSnapshot = false
+                }
             } catch {
-                self.statusMessage = "スナップショット失敗: \(error.localizedDescription)"
+                await MainActor.run {
+                    self.isSavingSnapshot = false
+                    self.statusMessage = "スナップショット失敗: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -149,21 +173,17 @@ public final class ClayFSAppState: ObservableObject {
         guard let mountURL = activeMountURL else { return }
         isRestoring = true
         restoreSuccess = false
-        restoreStage = "現在の状態を安全スナップショットとして退避中..."
+        restoreStage = "過去のスナップショットを展開中 (タイムトラベル)..."
 
         Task {
-            // Short delay so the user clearly sees the transition
-            try? await Task.sleep(nanoseconds: 200_000_000)
-
-            await MainActor.run {
-                self.restoreStage = "スナップショットを展開中..."
-            }
+            // Short delay so the user clearly sees the clock animation
+            try? await Task.sleep(nanoseconds: 300_000_000)
 
             do {
                 try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshot.id)
                 loadSnapshots(mountURL: mountURL)
                 await MainActor.run {
-                    self.restoreStage = "復元が完了しました！"
+                    self.restoreStage = "[\(snapshot.id)] の状態に復元完了！"
                     self.restoreSuccess = true
                     self.statusMessage = "[\(snapshot.id)] へ復元完了"
                 }
