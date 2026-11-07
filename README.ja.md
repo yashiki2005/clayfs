@@ -49,7 +49,7 @@ ClayFS は、macOS の **APFS Copy-on-Write (`clonefile(2)`)** を活用した�
 ### インストール (Build & Install)
 
 ```bash
-git clone https://github.com/yourname/clayfs.git
+git clone https://github.com/yashiki2005/clayfs.git
 cd clayfs
 
 # ビルドおよびインストール (CLI: ~/build/bin/clayfs, GUI: ~/Applications/ClayFS.app)

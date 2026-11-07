@@ -50,7 +50,7 @@ It allows developers to explore radical code refactoring, test breaking changes,
 ### Installation (Build & Install)
 
 ```bash
-git clone https://github.com/yourname/clayfs.git
+git clone https://github.com/yashiki2005/clayfs.git
 cd clayfs
 
 # Build and install (CLI: ~/build/bin/clayfs, GUI: ~/Applications/ClayFS.app)
