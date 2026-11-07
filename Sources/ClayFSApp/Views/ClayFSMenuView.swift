@@ -57,6 +57,9 @@ public struct ClayFSMenuView: View {
         .sheet(item: $appState.pendingRestoreSnapshot) { snap in
             confirmRestoreSheet(snapshot: snap)
         }
+        .sheet(isPresented: $appState.showRetentionSheet) {
+            retentionPolicySheet
+        }
     }
 
     // MARK: - Left Sidebar
@@ -154,6 +157,10 @@ public struct ClayFSMenuView: View {
                                 Button(L10n.compact) {
                                     appState.selectDrive(drive)
                                     appState.compactSelectedDrive()
+                                }
+                                Button(L10n.retentionPolicyMenu) {
+                                    appState.selectDrive(drive)
+                                    appState.showRetentionSheet = true
                                 }
                                 Divider()
                                 Button(L10n.removeFromList, role: .destructive) {
@@ -280,10 +287,19 @@ public struct ClayFSMenuView: View {
 
                     // Timeline
                     VStack(alignment: .leading, spacing: 4) {
-                        HStack {
+                        HStack(spacing: 6) {
                             Text(L10n.timelineHistory)
                                 .font(.caption.bold())
                                 .foregroundColor(.secondary)
+
+                            Button(action: { appState.showRetentionSheet = true }) {
+                                Image(systemName: "slider.horizontal.3")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help(L10n.retentionPolicyTitle)
+
                             Spacer()
                             Text(L10n.itemCount(appState.snapshots.count))
                                 .font(.caption2)
@@ -421,6 +437,111 @@ public struct ClayFSMenuView: View {
         }
         .padding(20)
         .frame(width: 320)
+    }
+
+    // MARK: - Retention Policy Sheet
+
+    @State private var retentionMaxCount: Int = 50
+    @State private var retentionMaxDays: Int = 30
+    @State private var isUnlimitedCount: Bool = false
+    @State private var isUnlimitedDays: Bool = false
+
+    private var retentionPolicySheet: some View {
+        VStack(spacing: 16) {
+            HStack {
+                Image(systemName: "clock.badge.checkmark")
+                    .font(.title2)
+                    .foregroundColor(.accentColor)
+                Text(L10n.retentionPolicyTitle)
+                    .font(.headline)
+            }
+
+            VStack(alignment: .leading, spacing: 14) {
+                // Max Snapshots Count
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L10n.maxSnapshotsLabel)
+                        .font(.caption.bold())
+                        .foregroundColor(.secondary)
+
+                    HStack {
+                        Toggle(L10n.unlimited, isOn: $isUnlimitedCount)
+                            .toggleStyle(.checkbox)
+                        Spacer()
+                        if !isUnlimitedCount {
+                            Picker("", selection: $retentionMaxCount) {
+                                Text(L10n.snapshotsFormat(10)).tag(10)
+                                Text(L10n.snapshotsFormat(25)).tag(25)
+                                Text(L10n.snapshotsFormat(50)).tag(50)
+                                Text(L10n.snapshotsFormat(100)).tag(100)
+                                Text(L10n.snapshotsFormat(200)).tag(200)
+                            }
+                            .frame(width: 140)
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Max Age Days
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L10n.maxDaysLabel)
+                        .font(.caption.bold())
+                        .foregroundColor(.secondary)
+
+                    HStack {
+                        Toggle(L10n.unlimited, isOn: $isUnlimitedDays)
+                            .toggleStyle(.checkbox)
+                        Spacer()
+                        if !isUnlimitedDays {
+                            Picker("", selection: $retentionMaxDays) {
+                                Text(L10n.daysFormat(3)).tag(3)
+                                Text(L10n.daysFormat(7)).tag(7)
+                                Text(L10n.daysFormat(14)).tag(14)
+                                Text(L10n.daysFormat(30)).tag(30)
+                                Text(L10n.daysFormat(90)).tag(90)
+                                Text(L10n.daysFormat(180)).tag(180)
+                            }
+                            .frame(width: 140)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+            .cornerRadius(8)
+
+            HStack {
+                Button(L10n.cancel) {
+                    appState.showRetentionSheet = false
+                }
+                Spacer()
+                Button(L10n.saveSettings) {
+                    let count = isUnlimitedCount ? nil : retentionMaxCount
+                    let days = isUnlimitedDays ? nil : retentionMaxDays
+                    appState.updateRetentionPolicy(maxSnapshots: count, maxAgeDays: days)
+                    appState.showRetentionSheet = false
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 340)
+        .onAppear {
+            if let policy = appState.selectedDrive?.retentionPolicy {
+                if let count = policy.maxSnapshots {
+                    isUnlimitedCount = false
+                    retentionMaxCount = count
+                } else {
+                    isUnlimitedCount = true
+                }
+                if let days = policy.maxAgeDays {
+                    isUnlimitedDays = false
+                    retentionMaxDays = days
+                } else {
+                    isUnlimitedDays = true
+                }
+            }
+        }
     }
 
     private func takeSnapshot() {

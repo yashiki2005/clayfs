@@ -20,7 +20,8 @@ public final class SnapshotManager: Sendable {
     public func createSnapshot(
         volumeMountURL: URL,
         message: String = "Manual snapshot",
-        author: String = NSUserName()
+        author: String = NSUserName(),
+        policy: RetentionPolicy? = nil
     ) throws -> Snapshot {
         let metadataURL = volumeMountURL.appendingPathComponent(".clayfs")
         let snapshotsURL = metadataURL.appendingPathComponent("snapshots")
@@ -98,7 +99,79 @@ public final class SnapshotManager: Sendable {
             }
         }
 
+        // Automatic pruning in background if policy is provided
+        if let policy = policy {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                _ = try? self?.pruneSnapshots(volumeMountURL: volumeMountURL, policy: policy)
+            }
+        }
+
         return snapshot
+    }
+
+    @discardableResult
+    public func pruneSnapshots(
+        volumeMountURL: URL,
+        policy: RetentionPolicy
+    ) throws -> [Snapshot] {
+        let snapshotsURL = volumeMountURL.appendingPathComponent(".clayfs/snapshots")
+        let dbURL = volumeMountURL.appendingPathComponent(".clayfs/timeline.sqlite3")
+        guard FileManager.default.fileExists(atPath: dbURL.path) else { return [] }
+
+        let db = try TimelineDB(fileURL: dbURL)
+        let allSnapshots = db.getSnapshots(limit: 10_000)
+
+        guard allSnapshots.count > 1 else { return [] }
+
+        var toPruneIDs = Set<String>()
+        var toPrune: [Snapshot] = []
+        let now = Date()
+
+        // 1. Prune by max age days (never prune the most recent snapshot)
+        if let maxDays = policy.maxAgeDays, maxDays > 0 {
+            let cutoff = now.addingTimeInterval(-Double(maxDays) * 86400)
+            for snap in allSnapshots.dropFirst() {
+                if snap.timestamp < cutoff {
+                    if toPruneIDs.insert(snap.id).inserted {
+                        toPrune.append(snap)
+                    }
+                }
+            }
+        }
+
+        // 2. Prune by max count
+        if let maxCount = policy.maxSnapshots, maxCount > 0 {
+            let allowed = max(1, maxCount)
+            if allSnapshots.count > allowed {
+                let overflow = allSnapshots.suffix(from: allowed)
+                for snap in overflow {
+                    if toPruneIDs.insert(snap.id).inserted {
+                        toPrune.append(snap)
+                    }
+                }
+            }
+        }
+
+        guard !toPrune.isEmpty else { return [] }
+
+        for snap in toPrune {
+            try? db.deleteSnapshot(id: snap.id)
+            let snapDir = snapshotsURL.appendingPathComponent(snap.id)
+            if FileManager.default.fileExists(atPath: snapDir.path) {
+                let tempTrash = volumeMountURL.appendingPathComponent(".clayfs/trash_\(UUID().uuidString)")
+                if (try? FileManager.default.moveItem(at: snapDir, to: tempTrash)) != nil {
+                    DispatchQueue.global(qos: .utility).async {
+                        try? FileManager.default.removeItem(at: tempTrash)
+                    }
+                } else {
+                    DispatchQueue.global(qos: .utility).async {
+                        try? FileManager.default.removeItem(at: snapDir)
+                    }
+                }
+            }
+        }
+
+        return toPrune
     }
 
     public func listSnapshots(volumeMountURL: URL, limit: Int = 100) throws -> [Snapshot] {

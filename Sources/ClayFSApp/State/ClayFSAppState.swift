@@ -23,6 +23,9 @@ public final class ClayFSAppState: ObservableObject {
     @Published public var restoreSuccess: Bool = false
     @Published public var pendingRestoreSnapshot: Snapshot? = nil
 
+    // Retention Policy sheet
+    @Published public var showRetentionSheet: Bool = false
+
     private var pollTimer: AnyCancellable?
     private var monitor: FSEventsMonitor?
 
@@ -173,6 +176,7 @@ public final class ClayFSAppState: ObservableObject {
 
     public func takeSnapshot(message: String) {
         guard let mountURL = activeMountURL else { return }
+        let policy = selectedDrive?.retentionPolicy ?? .default
         isSavingSnapshot = true
         saveSuccess = false
         saveStage = L10n.recordingCowStage
@@ -183,7 +187,7 @@ public final class ClayFSAppState: ObservableObject {
 
             do {
                 let snap = try await Task.detached(priority: .userInitiated) {
-                    try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: message)
+                    try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: message, policy: policy)
                 }.value
 
                 _ = try? await minDelay
@@ -204,6 +208,34 @@ public final class ClayFSAppState: ObservableObject {
                 await MainActor.run {
                     self.isSavingSnapshot = false
                     self.statusMessage = L10n.saveFailed(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    public func updateRetentionPolicy(maxSnapshots: Int?, maxAgeDays: Int?) {
+        guard let drive = selectedDrive else { return }
+        let newPolicy = RetentionPolicy(maxSnapshots: maxSnapshots, maxAgeDays: maxAgeDays)
+        var updated = drive
+        updated.retentionPolicy = newPolicy
+        self.selectedDrive = updated
+
+        if let idx = drives.firstIndex(where: { $0.name == drive.name }) {
+            drives[idx] = updated
+        }
+
+        try? DriveRegistry.shared.registerDrive(updated)
+
+        // Run pruning immediately if mounted
+        if let mount = activeMountURL {
+            Task.detached(priority: .utility) { [weak self] in
+                guard let self = self else { return }
+                let pruned = (try? SnapshotManager.shared.pruneSnapshots(volumeMountURL: mount, policy: newPolicy)) ?? []
+                await MainActor.run {
+                    self.loadSnapshots(mountURL: mount)
+                    if !pruned.isEmpty {
+                        self.statusMessage = L10n.prunedSnapshotsCount(pruned.count)
+                    }
                 }
             }
         }

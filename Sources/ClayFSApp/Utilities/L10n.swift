@@ -737,4 +737,123 @@ public enum L10n {
         case .english: return "Compact failed: \(err)"
         }
     }
+
+    // MARK: - Retention Policy
+
+    public static var retentionPolicyTitle: String {
+        switch currentLanguage {
+        case .japanese: return "スナップショット履歴の保持設定"
+        case .simplifiedChinese: return "快照历史保留设置"
+        case .traditionalChinese: return "快照歷史保留設定"
+        case .spanish: return "Configuración de retención de instantáneas"
+        case .french: return "Paramètres de rétention des instantanés"
+        case .german: return "Aufbewahrungsrichtlinie für Schnappschüsse"
+        case .korean: return "스냅샷 기록 보존 설정"
+        case .english: return "Snapshot Retention Policy"
+        }
+    }
+
+    public static var retentionPolicyMenu: String {
+        switch currentLanguage {
+        case .japanese: return "保持設定..."
+        case .simplifiedChinese: return "保留设置..."
+        case .traditionalChinese: return "保留設定..."
+        case .spanish: return "Política de retención..."
+        case .french: return "Rétention..."
+        case .german: return "Aufbewahrung..."
+        case .korean: return "보존 설정..."
+        case .english: return "Retention Policy..."
+        }
+    }
+
+    public static var maxSnapshotsLabel: String {
+        switch currentLanguage {
+        case .japanese: return "最大保持件数"
+        case .simplifiedChinese: return "最多保留快照数量"
+        case .traditionalChinese: return "最多保留快照數量"
+        case .spanish: return "Instantáneas máximas"
+        case .french: return "Nombre max d'instantanés"
+        case .german: return "Max. Schnappschüsse"
+        case .korean: return "최대 보존 개수"
+        case .english: return "Max Snapshots"
+        }
+    }
+
+    public static var maxDaysLabel: String {
+        switch currentLanguage {
+        case .japanese: return "最大保持日数"
+        case .simplifiedChinese: return "最长保留天数"
+        case .traditionalChinese: return "最長保留天數"
+        case .spanish: return "Días máximos de antigüedad"
+        case .french: return "Âge maximal (jours)"
+        case .german: return "Max. Alter (Tage)"
+        case .korean: return "최대 보존 일수"
+        case .english: return "Max Age (Days)"
+        }
+    }
+
+    public static var unlimited: String {
+        switch currentLanguage {
+        case .japanese: return "無制限"
+        case .simplifiedChinese: return "无限制"
+        case .traditionalChinese: return "無限制"
+        case .spanish: return "Ilimitado"
+        case .french: return "Illimité"
+        case .german: return "Unbegrenzt"
+        case .korean: return "무제한"
+        case .english: return "Unlimited"
+        }
+    }
+
+    public static func daysFormat(_ days: Int) -> String {
+        switch currentLanguage {
+        case .japanese: return "\(days) 日間"
+        case .simplifiedChinese: return "\(days) 天"
+        case .traditionalChinese: return "\(days) 天"
+        case .spanish: return "\(days) días"
+        case .french: return "\(days) jours"
+        case .german: return "\(days) Tage"
+        case .korean: return "\(days)일"
+        case .english: return "\(days) days"
+        }
+    }
+
+    public static func snapshotsFormat(_ count: Int) -> String {
+        switch currentLanguage {
+        case .japanese: return "\(count) 件"
+        case .simplifiedChinese: return "\(count) 个"
+        case .traditionalChinese: return "\(count) 個"
+        case .spanish: return "\(count) instantáneas"
+        case .french: return "\(count) instantanés"
+        case .german: return "\(count) Schnappschüsse"
+        case .korean: return "\(count)개"
+        case .english: return "\(count) snapshots"
+        }
+    }
+
+    public static func prunedSnapshotsCount(_ count: Int) -> String {
+        switch currentLanguage {
+        case .japanese: return "\(count) 件の期限切れ履歴を整理しました"
+        case .simplifiedChinese: return "已清理 \(count) 个过期快照"
+        case .traditionalChinese: return "已清理 \(count) 個過期快照"
+        case .spanish: return "Se eliminaron \(count) instantáneas expiradas"
+        case .french: return "\(count) instantanés expirés nettoyés"
+        case .german: return "\(count) abgelaufene Schnappschüsse bereinigt"
+        case .korean: return "\(count)개의 만료된 스냅샷을 정리했습니다"
+        case .english: return "Pruned \(count) expired snapshots"
+        }
+    }
+
+    public static var saveSettings: String {
+        switch currentLanguage {
+        case .japanese: return "設定を保存"
+        case .simplifiedChinese: return "保存设置"
+        case .traditionalChinese: return "儲存設定"
+        case .spanish: return "Guardar configuración"
+        case .french: return "Enregistrer les paramètres"
+        case .german: return "Einstellungen speichern"
+        case .korean: return "설정 저장"
+        case .english: return "Save Settings"
+        }
+    }
 }

@@ -35,6 +35,8 @@ struct ClayFSCLIApp {
                 try handleRestore(cmdArgs)
             case "compact":
                 try handleCompact(cmdArgs)
+            case "prune":
+                try handlePrune(cmdArgs)
             case "watch":
                 try handleWatch(cmdArgs)
             case "--version", "-v":
@@ -197,7 +199,13 @@ struct ClayFSCLIApp {
         }
 
         print("スナップショット作成中...")
-        let snap = try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: message)
+        let targetName = args.first(where: { !$0.starts(with: "-") && $0 != message })
+        let targetDrive = targetName != nil ? drives.first(where: { $0.name == targetName }) : drives.first
+        let snap = try SnapshotManager.shared.createSnapshot(
+            volumeMountURL: mountURL,
+            message: message,
+            policy: targetDrive?.retentionPolicy ?? .default
+        )
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss"
         print("保存完了: [\(snap.id)] \(snap.message)")
@@ -295,6 +303,56 @@ struct ClayFSCLIApp {
         print("回収完了。")
     }
 
+    static func handlePrune(_ args: [String]) throws {
+        guard let mountURL = resolveActiveMount(args: args) else {
+            print("エラー: ドライブがマウントされていません。")
+            exit(1)
+        }
+
+        var maxSnapshots: Int? = 50
+        var maxAgeDays: Int? = 30
+
+        for (i, arg) in args.enumerated() {
+            if (arg == "--keep" || arg == "--count" || arg == "-k") && i + 1 < args.count {
+                maxSnapshots = Int(args[i + 1])
+            }
+            if arg.starts(with: "--keep=") {
+                maxSnapshots = Int(arg.dropFirst(7))
+            }
+            if (arg == "--days" || arg == "-d") && i + 1 < args.count {
+                maxAgeDays = Int(args[i + 1])
+            }
+            if arg.starts(with: "--days=") {
+                maxAgeDays = Int(arg.dropFirst(7))
+            }
+            if arg == "--unlimited-count" { maxSnapshots = nil }
+            if arg == "--unlimited-days" { maxAgeDays = nil }
+        }
+
+        let policy = RetentionPolicy(maxSnapshots: maxSnapshots, maxAgeDays: maxAgeDays)
+        let drives = DriveRegistry.shared.loadDrives()
+        let targetName = args.first(where: { !$0.starts(with: "-") })
+        if let target = (targetName != nil ? drives.first(where: { $0.name == targetName }) : drives.first) {
+            var updated = target
+            updated.retentionPolicy = policy
+            try? DriveRegistry.shared.registerDrive(updated)
+        }
+
+        let countDesc = maxSnapshots.map { "\($0) 件" } ?? "無制限"
+        let daysDesc = maxAgeDays.map { "\($0) 日" } ?? "無制限"
+        print("スナップショット履歴の整理を実行中 (上限: \(countDesc), 期限: \(daysDesc))...")
+
+        let pruned = try SnapshotManager.shared.pruneSnapshots(volumeMountURL: mountURL, policy: policy)
+        if pruned.isEmpty {
+            print("整理対象の古いスナップショットはありませんでした。")
+        } else {
+            print("整理完了: \(pruned.count) 件の古いスナップショットを削除しました。")
+            for p in pruned {
+                print("  - [削除] \(p.id): \(p.message)")
+            }
+        }
+    }
+
     static func handleWatch(_ args: [String]) throws {
         guard let mountURL = resolveActiveMount(args: args) else {
             print("エラー: ドライブがマウントされていません。")
@@ -389,6 +447,7 @@ struct ClayFSCLIApp {
               clayfs diff [NAME] [SNAPSHOT_ID]                  変更差分を表示
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        指定スナップショットの状態に復元
               clayfs compact [NAME]                             未使用バンドルブロックを回収
+              clayfs prune [NAME] [--keep N] [--days N]         古いスナップショット履歴を整理
               clayfs watch [NAME]                               バックグラウンド自動スナップショット
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       多言語ヘルプ表示
             """)
@@ -406,6 +465,7 @@ struct ClayFSCLIApp {
               clayfs diff [NAME] [SNAPSHOT_ID]                  显示文件变更差异
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        恢复到指定快照状态
               clayfs compact [NAME]                             压缩并回收未使用的存储空间
+              clayfs prune [NAME] [--keep N] [--days N]         清理过期的快照历史
               clayfs watch [NAME]                               后台自动快照监控
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       显示多语言帮助
             """)
@@ -423,6 +483,7 @@ struct ClayFSCLIApp {
               clayfs diff [NAME] [SNAPSHOT_ID]                  顯示檔案變更差異
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        還原至指定快照狀態
               clayfs compact [NAME]                             壓縮並回收未使用的儲存空間
+              clayfs prune [NAME] [--keep N] [--days N]         清理過期的快照歷史
               clayfs watch [NAME]                               背景自動快照監控
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       顯示多語言說明
             """)
@@ -440,6 +501,7 @@ struct ClayFSCLIApp {
               clayfs diff [NAME] [SNAPSHOT_ID]                  Mostrar diferencias de archivos
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restaurar al estado de una instantánea
               clayfs compact [NAME]                             Recuperar espacio no utilizado
+              clayfs prune [NAME] [--keep N] [--days N]         Purgar historial de instantáneas antiguas
               clayfs watch [NAME]                               Monitor de instantáneas automáticas
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Mostrar ayuda en varios idiomas
             """)
@@ -457,6 +519,7 @@ struct ClayFSCLIApp {
               clayfs diff [NAME] [SNAPSHOT_ID]                  Afficher les différences de fichiers
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restaurer à l'état d'un instantané
               clayfs compact [NAME]                             Récupérer l'espace disque inutilisé
+              clayfs prune [NAME] [--keep N] [--days N]         Purger les anciens instantanés
               clayfs watch [NAME]                               Surveillance automatique en arrière-plan
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Afficher l'aide multilingue
             """)
@@ -474,6 +537,7 @@ struct ClayFSCLIApp {
               clayfs diff [NAME] [SNAPSHOT_ID]                  Dateiänderungen anzeigen
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Auf bestimmten Schnappschuss wiederherstellen
               clayfs compact [NAME]                             Ungenutzten Speicherplatz freigeben
+              clayfs prune [NAME] [--keep N] [--days N]         Alte Schnappschüsse bereinigen
               clayfs watch [NAME]                               Automatische Hintergrundüberwachung
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Mehrsprachige Hilfe anzeigen
             """)
@@ -491,6 +555,7 @@ struct ClayFSCLIApp {
               clayfs diff [NAME] [SNAPSHOT_ID]                  파일 변경 차이 표시
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        특정 스냅샷 상태로 복원
               clayfs compact [NAME]                             미사용 디스크 공간 회수
+              clayfs prune [NAME] [--keep N] [--days N]         오래된 스냅샷 기록 정리
               clayfs watch [NAME]                               백그라운드 자동 스냅샷 감시
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       다국어 도움말 표시
             """)
@@ -508,6 +573,7 @@ struct ClayFSCLIApp {
               clayfs diff [NAME] [SNAPSHOT_ID]                  Display file change diffs
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restore to a specific snapshot state
               clayfs compact [NAME]                             Reclaim unused sparse bundle blocks
+              clayfs prune [NAME] [--keep N] [--days N]         Prune old snapshot history
               clayfs watch [NAME]                               Run background auto-snapshot monitor
               clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Show help in multiple languages
             """)
