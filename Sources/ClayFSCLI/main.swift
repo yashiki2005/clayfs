@@ -112,8 +112,7 @@ struct ClayFSCLIApp {
             #if os(macOS)
             bundleURL = home.appendingPathComponent("\(name).dmg.sparsebundle")
             #elseif os(Linux)
-            let disksDir = home.appendingPathComponent(".clayfs/disks")
-            bundleURL = disksDir.appendingPathComponent("\(name).img")
+            bundleURL = home.appendingPathComponent("\(name).img")
             #endif
         }
 
