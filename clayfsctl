@@ -6,8 +6,11 @@
 #            イメージは CLAYFS_MNT (~/.src.clayfs) にマウントする。クローンはボリュームをまたげないので、
 #            コミットは作業ツリーと同じイメージの中に置く必要があり、CLAYFS_DIR の外に出すためにリンクを使う。
 #
-#   clayfsctl init [SIZE]     CLAYFS_DIR の中身を入れたイメージを作る (既定 30g。使った分だけ大きくなる)。
-#                             CLAYFS_DIR には触れない。切り替えは、その後の switch で行う
+#   clayfsctl [-d DIR] init [SIZE] [PATH] [BACKEND]
+#                             PATH (既定 ~/src) の中身を入れたイメージを BACKEND (省略時は ~/PATH名.dmg.sparsebundle) に
+#                             作る (既定 30g。使った分だけ大きくなる)。
+#                             PATH には触れない。切り替えは、その後の switch で行う
+#   clayfsctl [-d DIR] ...    対象ディレクトリを指定して実行 (既定は config または ~/src)
 #   clayfsctl switch          CLAYFS_DIR を CLAYFS_DIR.orig に改名し、イメージの work/ へのリンクに置き換える
 #   clayfsctl up              イメージを CLAYFS_MNT にマウントする
 #   clayfsctl down [--force]  マウントを外す (--force: 使用中でも強制)。外している間、CLAYFS_DIR は切れたリンクになる
@@ -24,9 +27,10 @@
 #   clayfsctl gc --keep N     新しい N 個を残して、古いコミットの中身を消す (一覧と変更内容は残る)
 #   clayfsctl dedup [--dry-run]
 #                             中身が同じファイルをクローンにまとめる (--dry-run: 数えるだけ)
-#   clayfsctl scrub [--layers [--budget-mb N] [--seed]]
-#                             記録したハッシュと中身を照合し、壊れたファイルを報告する。--layers は、コミットの中にしか
-#                             無い古い版を検査する (N MB だけ検査して終わる。自動実行 (run) が暇なときに行う)
+#   clayfsctl scrub [--offline] [--fsck] [--repair] [--layers [--budget-mb N] [--seed]]
+#                             記録したハッシュと中身を照合し、壊れたファイルを報告する。マウントされていない状態でも
+#                             自動でオフライン検査を行う (--offline で強制)。--fsck は APFS コンテナを検査、
+#                             --repair は修復を試みる。--layers は、コミットの中にしか無い古い版を検査する
 #   clayfsctl compress [--dry-run] [PATH...]
 #                             7 日以上更新のないファイルと、圧縮を保つパスを透過圧縮する
 #   clayfsctl keep [PATH...]
@@ -59,24 +63,51 @@
 # 読めないファイル (開けない、壊れている) は、警告を出して飛ばす。
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
+CLAYFS_CONFIG="${CLAYFS_CONFIG:-$HOME/.config/clayfs/config}"
+_ENV_DIR="${CLAYFS_DIR:-}"
+_ENV_IMAGE="${CLAYFS_IMAGE:-}"
+_ENV_MNT="${CLAYFS_MNT:-}"
 set -a
-[ -f "$HOME/.config/clayfs/config" ] && . "$HOME/.config/clayfs/config"
+[ -f "$CLAYFS_CONFIG" ] && . "$CLAYFS_CONFIG"
 set +a
+[ -n "$_ENV_DIR" ] && CLAYFS_DIR="$_ENV_DIR"
+[ -n "$_ENV_IMAGE" ] && CLAYFS_IMAGE="$_ENV_IMAGE"
+[ -n "$_ENV_MNT" ] && CLAYFS_MNT="$_ENV_MNT"
 [ "$(uname -s)" = Darwin ] || { echo "エラー: macOS 専用です (APFS のクローンを使います)" >&2; exit 1; }
+
+_CONFIG_IMAGE="${CLAYFS_IMAGE:-}"
+_CONFIG_MNT="${CLAYFS_MNT:-}"
+
+set_paths() {
+  if [ -n "${1:-}" ]; then
+    CLAYFS_DIR="$1"
+  fi
+  case "$CLAYFS_DIR" in
+    "~"/*) CLAYFS_DIR="$HOME/${CLAYFS_DIR#\~/}" ;;
+    "~")   CLAYFS_DIR="$HOME" ;;
+  esac
+  case "$CLAYFS_DIR" in
+    /*) ;;
+    *)  CLAYFS_DIR="$(pwd)/$CLAYFS_DIR" ;;
+  esac
+  _base="$(basename "$CLAYFS_DIR")"
+  CLAYFS_IMAGE="${_CONFIG_IMAGE:-$HOME/${_base}.dmg.sparsebundle}"
+  CLAYFS_MNT="${_CONFIG_MNT:-$HOME/.${_base}.clayfs}"
+  WORK="$CLAYFS_MNT/work"
+  STORE="$CLAYFS_MNT/store"
+  LOCK="$STORE/lock"
+  UPLOCK="$CLAYFS_MNT.uplock"
+  OFFLINE="$CLAYFS_MNT.offline"   # オフライン作業 (shrink など) の印。イメージの外にあるので、外している間も見える
+  ORIG="$CLAYFS_DIR.orig"
+}
+
 CLAYFS_DIR="${CLAYFS_DIR:-$HOME/src}"
-CLAYFS_IMAGE="${CLAYFS_IMAGE:-$HOME/$(basename "$CLAYFS_DIR").dmg.sparsebundle}"
-CLAYFS_MNT="${CLAYFS_MNT:-$HOME/.$(basename "$CLAYFS_DIR").clayfs}"
+set_paths "$CLAYFS_DIR"
 CLAYFS_COMMIT_INTERVAL="${CLAYFS_COMMIT_INTERVAL:-3600}"
 CLAYFS_LOG="${CLAYFS_LOG:-$HOME/Library/Logs/clayfs.log}"
 CLAYFS_TOOL="${CLAYFS_TOOL:-$HERE/clayfs_tool}"
 LABEL="top.yashiki.clayfs"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-WORK="$CLAYFS_MNT/work"
-STORE="$CLAYFS_MNT/store"
-LOCK="$STORE/lock"
-UPLOCK="$CLAYFS_MNT.uplock"
-OFFLINE="$CLAYFS_MNT.offline"   # オフライン作業 (shrink など) の印。イメージの外にあるので、外している間も見える
-ORIG="$CLAYFS_DIR.orig"
 
 die() { echo "エラー: $*" >&2; exit 1; }
 
@@ -178,10 +209,63 @@ offline_begin() {
 offline_end() { [ "$(offline_owner)" = "$(proc_id $$)" ] && rm -rf "$OFFLINE"; return 0; }
 
 cmd_init() {
-  size="${1:-30g}"
-  [ -e "$CLAYFS_IMAGE" ] && die "すでにあります: $CLAYFS_IMAGE"
+  size="30g"
+  target_dir=""
+  backend=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      [0-9]*[kmgtKMGT]|[0-9]*[kmgtKMGT][bB])
+        size="$arg"
+        ;;
+      *)
+        if [ -z "$target_dir" ]; then
+          target_dir="$arg"
+        elif [ -z "$backend" ]; then
+          backend="$arg"
+        else
+          die "引数が多すぎます: $arg (使い方: clayfsctl init [SIZE] [PATH] [BACKEND])"
+        fi
+        ;;
+    esac
+  done
+
+  if [ -n "$target_dir" ]; then
+    _CONFIG_IMAGE=""
+    _CONFIG_MNT=""
+    set_paths "$target_dir"
+  fi
+
+  if [ -n "$backend" ]; then
+    case "$backend" in
+      "~"/*) backend="$HOME/${backend#\~/}" ;;
+      "~")   backend="$HOME" ;;
+    esac
+    case "$backend" in
+      /*) ;;
+      *)  backend="$(pwd)/$backend" ;;
+    esac
+    if [ -d "$backend" ]; then
+      backend="${backend%/}/$(basename "$CLAYFS_DIR").dmg.sparsebundle"
+    elif [ "${backend%*.sparsebundle}" = "$backend" ]; then
+      backend="${backend}.sparsebundle"
+    fi
+    CLAYFS_IMAGE="$backend"
+  elif [ -n "$target_dir" ]; then
+    # backend 省略時: ホームディレクトリに作成
+    CLAYFS_IMAGE="$HOME/$(basename "$CLAYFS_DIR").dmg.sparsebundle"
+  fi
+
+  if [ -L "$CLAYFS_DIR" ]; then
+    _target="$(readlink "$CLAYFS_DIR")"
+    if [ "$_target" = "$WORK" ] || [ "$_target" = "${WORK}/" ]; then
+      die "$CLAYFS_DIR はすでに clayfs の work/ へのリンクです (切り替え済み)"
+    else
+      die "$CLAYFS_DIR はシンボリックリンクです (-> $_target)。\n実体のディレクトリを指定してください:\n  clayfsctl init $size $_target${backend:+ $backend}"
+    fi
+  fi
   [ -d "$CLAYFS_DIR" ] || die "ディレクトリがありません: $CLAYFS_DIR"
-  [ -L "$CLAYFS_DIR" ] && die "$CLAYFS_DIR はすでにリンクです (切り替え済み)"
+  [ -e "$CLAYFS_IMAGE" ] && die "すでにあります: $CLAYFS_IMAGE"
   mkdir -p "$(dirname "$CLAYFS_IMAGE")"
   quiet hdiutil create -size "$size" -type SPARSEBUNDLE -fs APFS -volname "$(basename "$CLAYFS_DIR")" "$CLAYFS_IMAGE" || die "作成に失敗"
   echo "作成しました: $CLAYFS_IMAGE (APFS、$size まで)"
@@ -196,6 +280,14 @@ cmd_init() {
   quiet hdiutil detach "$tmp" || echo "警告: 外せませんでした: $tmp" >&2
   rmdir "$tmp" 2>/dev/null
   [ $rc = 0 ] || die "取り込みに失敗"
+  STORE="$CLAYFS_MNT/store"; WORK="$CLAYFS_MNT/work"
+  mkdir -p "$(dirname "$CLAYFS_CONFIG")"
+  cat > "$CLAYFS_CONFIG" << EOF
+CLAYFS_DIR=$CLAYFS_DIR
+CLAYFS_IMAGE=$CLAYFS_IMAGE
+CLAYFS_MNT=$CLAYFS_MNT
+EOF
+  echo "設定を保存しました: $CLAYFS_CONFIG"
   echo "できました。切り替えるには: clayfsctl switch"
   echo "  (init の後に $CLAYFS_DIR へ加えた変更はイメージに入らないので、続けて実行してください)"
 }
@@ -278,7 +370,93 @@ cmd_show() { need_up; tool show "$@"; }
 cmd_commit() { need_up; lock; tool commit "$@"; }
 cmd_gc() { need_up; lock; tool gc "$@"; }
 cmd_dedup() { need_up; lock; tool dedup "$@"; }
-cmd_scrub() { need_up; lock; tool scrub "$@"; }
+cmd_scrub() {
+  offline=0
+  do_fsck=0
+  fsck_repair=0
+  tool_args=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --offline) offline=1; shift ;;
+      --fsck) do_fsck=1; shift ;;
+      --repair) fsck_repair=1; do_fsck=1; shift ;;
+      *) tool_args="$tool_args \"$1\""; shift ;;
+    esac
+  done
+
+  # 未マウント時は自動でオフライン検査にする
+  if ! is_mounted "$CLAYFS_MNT"; then
+    offline=1
+  fi
+
+  if [ $offline = 0 ]; then
+    need_up
+    lock
+    if [ $do_fsck = 1 ]; then
+      dev="$(stat -f '%Sd' "$CLAYFS_MNT" 2>/dev/null)"
+      if [ -n "$dev" ]; then
+        echo "APFS ファイルシステムの検査 (live)..."
+        fsck_apfs -n -l "/dev/r$dev" 2>&1 | grep -v "warning:" || true
+      fi
+    fi
+    eval "tool scrub $tool_args"
+    return $?
+  fi
+
+  [ -e "$CLAYFS_IMAGE" ] || die "イメージがありません: $CLAYFS_IMAGE"
+  offline_begin
+  remount=0
+  scrub_tmp=""
+
+  cleanup_scrub() {
+    [ -n "$scrub_tmp" ] && is_mounted "$scrub_tmp" && quiet hdiutil detach "$scrub_tmp" 2>/dev/null
+    [ -n "$scrub_tmp" ] && rmdir "$scrub_tmp" 2>/dev/null
+    offline_end
+    if [ $remount = 1 ] && ! is_mounted "$CLAYFS_MNT"; then
+      echo "マウントを元に戻します..."
+      cmd_up >/dev/null 2>&1 || echo "警告: 再マウントに失敗しました。clayfsctl up で手動マウントしてください" >&2
+    fi
+  }
+  trap 'cleanup_scrub' EXIT INT TERM
+
+  if is_mounted "$CLAYFS_MNT"; then
+    echo "オフライン検査のため、一時的にマウントを解除します..."
+    cmd_down || die "マウントを解除できません。使用中のプログラムを終了してください"
+    remount=1
+  fi
+
+  if [ $do_fsck = 1 ]; then
+    echo "ディスクイメージの APFS コンテナを検査しています..."
+    dev_out="$(hdiutil attach -nomount "$CLAYFS_IMAGE" 2>/dev/null)"
+    raw_disk="$(printf '%s\n' "$dev_out" | awk '/Apple_APFS/ {print $1; exit}')"
+    base_disk="$(printf '%s\n' "$dev_out" | head -1 | awk '{print $1}')"
+    if [ -n "$raw_disk" ]; then
+      rdev="/dev/r$(basename "$raw_disk")"
+      if [ $fsck_repair = 1 ]; then
+        fsck_apfs -y "$rdev" || echo "警告: fsck で修復できない箇所があります" >&2
+      else
+        fsck_apfs -q "$rdev" || echo "警告: ファイルシステムに問題が見つかりました (--repair で修復を試せます)" >&2
+      fi
+    fi
+    [ -n "$base_disk" ] && quiet hdiutil detach "$base_disk" 2>/dev/null || true
+  fi
+
+  scrub_tmp="$(mktemp -d "$HOME/.clayfs-scrub.XXXXXX")" || die "作業用の場所を作れません"
+  quiet hdiutil attach -nobrowse -owners on -mountpoint "$scrub_tmp" "$CLAYFS_IMAGE" || {
+    rmdir "$scrub_tmp" 2>/dev/null
+    scrub_tmp=""
+    die "イメージをつなげません: $CLAYFS_IMAGE (破損の疑いがあります。clayfsctl scrub --fsck --repair を試してください)"
+  }
+
+  echo "オフライン検査を実行中 ($scrub_tmp)..."
+  eval "\"$CLAYFS_TOOL\" -s \"$scrub_tmp/store\" -C \"$scrub_tmp/work\" scrub $tool_args"
+  rc=$?
+
+  cleanup_scrub
+  trap - EXIT INT TERM
+  return $rc
+}
 cmd_compress() { need_up; lock; tool compress "$@"; }
 cmd_keep() { need_up; lock; tool keep "$@"; }
 cmd_unkeep() { need_up; lock; tool unkeep "$@"; }
@@ -470,6 +648,29 @@ cmd_uninstall_agent() {
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
   if [ -f "$PLIST" ]; then rm -f "$PLIST"; echo "外しました: $PLIST"; else echo "入っていません"; fi
 }
+
+# Parse global options: -d DIR, --dir DIR, -C DIR
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--dir|-C)
+      [ $# -ge 2 ] || die "$1 にはディレクトリの指定が必要です"
+      _CONFIG_IMAGE=""
+      _CONFIG_MNT=""
+      set_paths "$2"
+      shift 2
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+if [ ${#ARGS[@]} -gt 0 ]; then
+  set -- "${ARGS[@]}"
+else
+  set --
+fi
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in

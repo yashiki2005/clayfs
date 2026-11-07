@@ -9,7 +9,7 @@ bad() { fail=$((fail+1)); echo "  FAIL: $1"; }
 chk() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 T="$(mktemp -d /tmp/clayctl-test.XXXXXX)"; T="$(cd "$T" && pwd -P)"
-export CLAYFS_DIR="$T/dir" CLAYFS_IMAGE="$T/img.sparsebundle" CLAYFS_MNT="$T/mnt" CLAYFS_COMMIT_INTERVAL=3600 CLAYFS_LOG="$T/log"
+export CLAYFS_DIR="$T/dir" CLAYFS_IMAGE="$T/img.sparsebundle" CLAYFS_MNT="$T/mnt" CLAYFS_CONFIG="$T/config" CLAYFS_COMMIT_INTERVAL=3600 CLAYFS_LOG="$T/log"
 export CLAYFS_TOOL="$HERE/../clayfs_tool" SHRINK_MARGIN_KB=0
 mkdir -p "$CLAYFS_DIR"; echo hello >"$CLAYFS_DIR/a.txt"
 cleanup() {
