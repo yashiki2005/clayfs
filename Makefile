@@ -15,6 +15,7 @@ app: build
 	cp Sources/ClayFSApp/Info.plist build/ClayFS.app/Contents/Info.plist
 	echo "APPL????" > build/ClayFS.app/Contents/PkgInfo
 	cp $$(swift build -c release --show-bin-path)/ClayFSApp build/ClayFS.app/Contents/MacOS/ClayFSApp
+	[ -f Sources/ClayFSApp/Resources/AppIcon.icns ] && cp Sources/ClayFSApp/Resources/AppIcon.icns build/ClayFS.app/Contents/Resources/AppIcon.icns || true
 
 install: app
 	mkdir -p $(BINDIR)

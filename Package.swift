@@ -35,7 +35,7 @@ let package = Package(
             name: "ClayFSApp",
             dependencies: ["ClayFSCore"],
             path: "Sources/ClayFSApp",
-            exclude: ["Info.plist"]
+            exclude: ["Info.plist", "Resources"]
         ),
         .testTarget(
             name: "ClayFSCoreTests",
