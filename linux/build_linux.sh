@@ -6,7 +6,15 @@ echo "=== ClayFS v2 CLI - Linux Build & Install ==="
 # Check swift compiler
 if ! command -v swift &> /dev/null; then
     echo "エラー: Swift コンパイラが見つかりません。Swift 6.0 以上をインストールしてください。"
-    echo "参考: https://www.swift.org/install/linux/"
+    echo ""
+    echo "【インストール方法 (Ubuntu / Debian)】"
+    echo "  Ubuntu 24.04+: sudo apt-get update && sudo apt-get install -y swiftlang"
+    echo "  または公式リポジトリ:"
+    echo "    curl -s https://archive.swiftlang.xyz/install.sh | sudo bash"
+    echo "    sudo apt-get install -y swiftlang"
+    echo ""
+    echo "【その他ディストリビューション】"
+    echo "  公式ガイド: https://www.swift.org/install/linux/"
     exit 1
 fi
 

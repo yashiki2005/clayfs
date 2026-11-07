@@ -65,8 +65,14 @@ make install
 git clone https://github.com/yashiki2005/clayfs.git
 cd clayfs
 
-# Install dependencies (Ubuntu/Debian example)
-sudo apt-get install -y btrfs-progs libsqlite3-dev
+# Install dependencies and Swift compiler (Ubuntu/Debian example)
+# On Ubuntu 24.04+, swiftlang is available directly via apt:
+sudo apt-get update
+sudo apt-get install -y swiftlang btrfs-progs libsqlite3-dev
+
+# (For Ubuntu 22.04 or other distributions, use the official Swift repository)
+# curl -s https://archive.swiftlang.xyz/install.sh | sudo bash
+# sudo apt-get install -y swiftlang btrfs-progs libsqlite3-dev
 
 # Build and install (/usr/local/bin/clayfs)
 ./linux/build_linux.sh
