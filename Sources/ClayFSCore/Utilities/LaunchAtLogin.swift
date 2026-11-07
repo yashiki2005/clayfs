@@ -1,21 +1,21 @@
 import Foundation
+#if os(macOS)
 import ServiceManagement
+#endif
 
 public enum LaunchAtLogin {
+    #if os(macOS)
     public static var appURL: URL {
-        // 1. If currently running inside ClayFS.app
         if Bundle.main.bundleURL.path.hasSuffix(".app") {
             return Bundle.main.bundleURL
         }
 
-        // 2. User Applications
         let homeApp = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Applications/ClayFS.app")
         if FileManager.default.fileExists(atPath: homeApp.path) {
             return homeApp
         }
 
-        // 3. System Applications
         let systemApp = URL(fileURLWithPath: "/Applications/ClayFS.app")
         if FileManager.default.fileExists(atPath: systemApp.path) {
             return systemApp
@@ -30,7 +30,6 @@ public enum LaunchAtLogin {
     }
 
     public static var isEnabled: Bool {
-        // 1. Check SMAppService if inside app
         if Bundle.main.bundleURL.path.hasSuffix(".app") {
             if #available(macOS 13.0, *) {
                 if SMAppService.mainApp.status == .enabled {
@@ -38,8 +37,6 @@ public enum LaunchAtLogin {
                 }
             }
         }
-
-        // 2. Check LaunchAgent plist
         return FileManager.default.fileExists(atPath: launchAgentPlistURL.path)
     }
 
@@ -54,7 +51,6 @@ public enum LaunchAtLogin {
                         }
                         registeredViaSM = true
                     } catch {
-                        // Fallback to LaunchAgent if SMAppService fails (e.g., ad-hoc signature outside /Applications)
                         registeredViaSM = false
                     }
                 }
@@ -64,7 +60,6 @@ public enum LaunchAtLogin {
                 try installLaunchAgent()
             }
         } else {
-            // Disable both SMAppService and LaunchAgent
             if Bundle.main.bundleURL.path.hasSuffix(".app") {
                 if #available(macOS 13.0, *) {
                     if SMAppService.mainApp.status == .enabled {
@@ -112,4 +107,58 @@ public enum LaunchAtLogin {
             try FileManager.default.removeItem(at: plistURL)
         }
     }
+
+    #elseif os(Linux)
+    public static var systemdServiceURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/systemd/user/clayfs-automount.service")
+    }
+
+    public static var isEnabled: Bool {
+        FileManager.default.fileExists(atPath: systemdServiceURL.path)
+    }
+
+    public static func setEnabled(_ enable: Bool) throws {
+        if enable {
+            try installSystemdService()
+        } else {
+            try removeSystemdService()
+        }
+    }
+
+    private static func installSystemdService() throws {
+        let serviceURL = systemdServiceURL
+        let fm = FileManager.default
+
+        let content = """
+        [Unit]
+        Description=ClayFS Virtual Drives Auto-Mount Service
+        After=default.target
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/bin/clayfs mount --all
+        RemainAfterExit=yes
+
+        [Install]
+        WantedBy=default.target
+        """
+
+        try fm.createDirectory(at: serviceURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try content.write(to: serviceURL, atomically: true, encoding: .utf8)
+
+        // systemctl --user daemon-reload && systemctl --user enable clayfs-automount.service
+        _ = try? ProcessRunner.run(executable: "/bin/systemctl", arguments: ["--user", "daemon-reload"])
+        _ = try? ProcessRunner.run(executable: "/bin/systemctl", arguments: ["--user", "enable", "clayfs-automount.service"])
+    }
+
+    private static func removeSystemdService() throws {
+        let serviceURL = systemdServiceURL
+        _ = try? ProcessRunner.run(executable: "/bin/systemctl", arguments: ["--user", "disable", "clayfs-automount.service"])
+        if FileManager.default.fileExists(atPath: serviceURL.path) {
+            try FileManager.default.removeItem(at: serviceURL)
+        }
+        _ = try? ProcessRunner.run(executable: "/bin/systemctl", arguments: ["--user", "daemon-reload"])
+    }
+    #endif
 }

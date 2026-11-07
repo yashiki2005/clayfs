@@ -16,27 +16,29 @@ It allows developers to explore radical code refactoring, test breaking changes,
 
 ## ✨ Features
 
-1. **Zero-Cost APFS CoW Snapshots**
-   - Millisecond-fast snapshot creation via `clonefile(2)` without consuming additional disk space until files are modified.
-2. **Git-Like Volume Root Rollback**
-   - Directly snapshot and roll back your entire mounted workspace root (e.g. `/Volumes/src`).
+1. **Zero-Cost APFS & Btrfs CoW Snapshots**
+   - Millisecond-fast snapshot creation via CoW reflink (`clonefile(2)` on macOS, `reflink` / `FICLONE` on Linux) without consuming additional disk space until files are modified.
+2. **Cross-Platform Support (macOS & Linux)**
+   - Unified `clayfs` CLI workflow across macOS (APFS sparsebundle) and Linux (Btrfs sparse image / loopback).
+3. **Git-Like Volume Root Rollback**
+   - Directly snapshot and roll back your entire mounted workspace root.
    - Automatically protects and ignores internal system directories (`.clayfs`, `.fseventsd`, `.Spotlight-V100`, etc.).
    - Includes subpath traversal protection (`../`) and safe atomic rollback if any restoration step fails.
-3. **Native macOS Menu Bar App (`ClayFS.app`)**
-   - Interactive timeline scrubber to preview past states and file changes.
+4. **Native macOS Menu Bar App (`ClayFS.app`)**
+   - Interactive timeline scrubber slider to preview past states and file changes.
    - 1-click snapshot creation, visual rollback confirmation with modified file counter, and customizable retention.
    - Fully asynchronous background polling ensures the UI thread never freezes.
-4. **Seamless Online Volume Compaction (`compact`)**
-   - Automatically reclaims unused blocks from sparse bundles (Sync → unmount → `hdiutil compact` → instant remount).
-5. **Configurable Retention Policy & Pruning (`prune`)**
+5. **Seamless Online Volume Compaction (`compact`)**
+   - Automatically reclaims unused blocks from virtual disk (macOS: `hdiutil compact`, Linux: `btrfs defragment` & `fstrim`).
+6. **Configurable Retention Policy & Pruning (`prune`)**
    - Configure retention limits by snapshot count (`--keep N`) or snapshot age (`--days N`).
    - Automatically prunes expired snapshots in the background on snapshot creation.
-6. **Automatic FSEvents Watcher (`watch`)**
-   - Monitors file system events with debouncing and automatically snapshots when changes are detected.
-7. **Launch at Login & Drive Auto-Mount**
-   - Modern macOS 14+ `SMAppService` and LaunchAgent integration for automatic background startup at login.
-   - Per-drive auto-mount configuration via CLI and GUI.
-8. **Native 8-Language Localization (i18n)**
+7. **Automatic Change Monitoring Daemon (`watch`)**
+   - Monitors file changes with debouncing and automatically snapshots when changes are detected (macOS: FSEvents, Linux: polling / inotify).
+8. **Launch at Login & Drive Auto-Mount**
+   - macOS: Modern `SMAppService` / LaunchAgents
+   - Linux: `systemd --user` unit (`clayfs-automount.service`)
+9. **Native 8-Language Localization (i18n)**
    - Fully localized in English, Japanese (日本語), Simplified Chinese (简体中文), Traditional Chinese (繁體中文), Spanish (Español), French (Français), German (Deutsch), and Korean (한국어). Auto-detects system language.
 
 ---
@@ -44,17 +46,30 @@ It allows developers to explore radical code refactoring, test breaking changes,
 ## 🚀 Quick Start
 
 ### Prerequisites
-- macOS 14.0 (Sonoma) or later
-- Xcode 16 or Command Line Tools (Swift 6.0)
+- **macOS**: macOS 14.0 (Sonoma) or later, Xcode 16 or Command Line Tools (Swift 6.0)
+- **Linux**: Linux Kernel 4.5+ (Btrfs support), Swift 6.0, `btrfs-progs`, `libsqlite3-dev`
 
 ### Installation (Build & Install)
 
+#### On macOS
 ```bash
 git clone https://github.com/yashiki2005/clayfs.git
 cd clayfs
 
 # Build and install (CLI: ~/build/bin/clayfs, GUI: ~/Applications/ClayFS.app)
 make install
+```
+
+#### On Linux (CLI Only)
+```bash
+git clone https://github.com/yashiki2005/clayfs.git
+cd clayfs
+
+# Install dependencies (Ubuntu/Debian example)
+sudo apt-get install -y btrfs-progs libsqlite3-dev
+
+# Build and install (/usr/local/bin/clayfs)
+./linux/build_linux.sh
 ```
 
 > **Note**: Ensure `~/build/bin` is in your `$PATH` (e.g. `export PATH="$HOME/build/bin:$PATH"`).

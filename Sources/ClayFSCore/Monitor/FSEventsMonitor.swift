@@ -1,6 +1,9 @@
 import Foundation
+#if canImport(CoreServices)
 import CoreServices
+#endif
 
+#if canImport(CoreServices)
 public final class FSEventsMonitor: @unchecked Sendable {
     public let watchURL: URL
     private let debounceSeconds: TimeInterval
@@ -49,25 +52,21 @@ public final class FSEventsMonitor: @unchecked Sendable {
             )
 
             let pathsToWatch = [watchURL.path] as CFArray
+            let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
 
-            let flags: FSEventStreamCreateFlags = UInt32(
-                kFSEventStreamCreateFlagUseCFTypes |
-                kFSEventStreamCreateFlagFileEvents |
-                kFSEventStreamCreateFlagNoDefer
-            )
-
-            streamRef = FSEventStreamCreate(
+            guard let stream = FSEventStreamCreate(
                 kCFAllocatorDefault,
-                { (_, clientCallBackInfo, numEvents, eventPaths, _, _) in
+                { _, clientCallBackInfo, numEvents, eventPaths, _, _ in
                     guard let info = clientCallBackInfo else { return }
                     let monitor = Unmanaged<FSEventsMonitor>.fromOpaque(info).takeUnretainedValue()
-                    if let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] {
-                        let hasUserChange = paths.contains { !FSEventsMonitor.isIgnoredPath($0) }
-                        if hasUserChange {
-                            monitor.handleChangeDetected()
-                        }
-                    } else {
-                        monitor.handleChangeDetected()
+
+                    guard let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] else { return }
+                    let hasRelevantChange = paths.contains { path in
+                        !FSEventsMonitor.isIgnoredPath(path)
+                    }
+
+                    if hasRelevantChange {
+                        monitor.scheduleDebouncedTrigger()
                     }
                 },
                 &context,
@@ -75,12 +74,13 @@ public final class FSEventsMonitor: @unchecked Sendable {
                 FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
                 1.0,
                 flags
-            )
-
-            if let stream = streamRef {
-                FSEventStreamSetDispatchQueue(stream, queue)
-                FSEventStreamStart(stream)
+            ) else {
+                return
             }
+
+            self.streamRef = stream
+            FSEventStreamSetDispatchQueue(stream, queue)
+            FSEventStreamStart(stream)
         }
     }
 
@@ -103,20 +103,67 @@ public final class FSEventsMonitor: @unchecked Sendable {
         }
     }
 
-    private func handleChangeDetected() {
-        queue.async { [weak self] in
-            guard let self = self, self.isRunning else { return }
-            self.debounceTimer?.cancel()
+    private func scheduleDebouncedTrigger() {
+        debounceTimer?.cancel()
 
-            let timer = DispatchSource.makeTimerSource(queue: self.queue)
-            timer.schedule(deadline: .now() + self.debounceSeconds)
-            timer.setEventHandler { [weak self] in
-                guard let self = self, self.isRunning else { return }
-                self.debounceTimer = nil
-                self.onDebouncedChange()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + debounceSeconds)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.onDebouncedChange()
+            self.debounceTimer = nil
+        }
+        timer.resume()
+        debounceTimer = timer
+    }
+}
+#endif
+
+/// Cross-platform polling monitor (used on Linux or fallback)
+public final class PollingMonitor: @unchecked Sendable {
+    public let watchURL: URL
+    private let interval: TimeInterval
+    private let onChange: @Sendable () -> Void
+    private var timer: DispatchSourceTimer?
+    private let queue = DispatchQueue(label: "top.yashiki.clayfs.polling", qos: .utility)
+    private var isRunning = false
+
+    public init(
+        watchURL: URL,
+        interval: TimeInterval = 5.0,
+        onChange: @escaping @Sendable () -> Void
+    ) {
+        self.watchURL = watchURL
+        self.interval = interval
+        self.onChange = onChange
+    }
+
+    deinit {
+        stop()
+    }
+
+    public func start() {
+        queue.sync {
+            guard !isRunning else { return }
+            isRunning = true
+
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .now() + interval, repeating: interval)
+            t.setEventHandler { [weak self] in
+                guard let self = self else { return }
+                self.onChange()
             }
-            timer.resume()
-            self.debounceTimer = timer
+            t.resume()
+            self.timer = t
+        }
+    }
+
+    public func stop() {
+        queue.sync {
+            guard isRunning else { return }
+            isRunning = false
+            timer?.cancel()
+            timer = nil
         }
     }
 }

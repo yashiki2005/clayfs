@@ -16,44 +16,59 @@ ClayFS は、macOS の **APFS Copy-on-Write (`clonefile(2)`)** を活用した�
 
 ## ✨ 主な特長 (Features)
 
-1. **APFS CoW によるゼロコスト・スナップショット**
-   - 変更があるまで追加ストレージを一切消費しない `clonefile(2)` によるミリ秒単位のスナップショット作成。
-2. **Git 感覚のボリューム直接巻き戻し**
-   - ドライブ（例: `/Volumes/src`）のルート全体を直感的にスナップショット＆ロールバック。
+1. **APFS & Btrfs CoW によるゼロコスト・スナップショット**
+   - 変更があるまで追加ストレージを一切消費しないミリ秒単位のスナップショット作成（macOS: `clonefile(2)`、Linux: `reflink` / `FICLONE`）。
+2. **クロスプラットフォーム対応 (macOS & Linux)**
+   - macOS（APFS sparsebundle）と Linux（Btrfs スパースイメージ / ループバック）で、完全に同一の `clayfs` CLI コマンド体系を実現。
+3. **Git 感覚のボリューム直接巻き戻し**
+   - ドライブのルート全体を直感的にスナップショット＆ロールバック。
    - `.clayfs`、`.fseventsd`、`.Spotlight-V100` などのシステムディレクトリは自動除外され安全に保護。
    - サブパス指定時のパストラバーサル防止および `.clayfs` 内部メタデータの完全保護。
-3. **美しい常駐メニューバーアプリ (`ClayFS.app`)**
+4. **美しい常駐メニューバーアプリ (`ClayFS.app` ※macOS)**
    - スライダーで直感的に時間をさかのぼれるタイムライン・スクラバー。
    - 変更ファイル数の可視化、1クリックでのロールバック確認シート、保持設定。
    - メインスレッドを一切ブロックしない完全非同期バックグラウンドスキャン。
-4. **シームレスな空き容量回収 (`compact`)**
-   - ドライブ使用中に肥大化したスパースバンドルブロックを安全かつ瞬時に回収（同期 → 解除 → `hdiutil compact` → 再マウントを自動一括実行）。
-5. **スナップショット保持ポリシー＆自動整理 (`prune`)**
+5. **シームレスな空き容量回収 (`compact`)**
+   - ドライブ使用中に肥大化したブロックを安全かつ瞬時に回収（macOS: `hdiutil compact`、Linux: `btrfs defragment` & `fstrim`）。
+6. **スナップショット保持ポリシー＆自動整理 (`prune`)**
    - 「最大保持件数」や「最大保持日数」を設定可能。スナップショット作成時にも自動プルーニング。
-6. **FSEvents による自動監視 (`watch`)**
-   - ファイル変更を監視し、指定時間の静穏（debounce）後に差分がある場合のみ自動でスナップショットを生成。
-7. **ログイン時自動起動＆ドライブ自動マウント**
-   - macOS 14+ のモダンな `SMAppService` / LaunchAgent によるログイン時自動起動。
-   - ドライブ単位での起動時自動マウント設定（CLI / GUI）。
-8. **8言語のネイティブ多言語対応 (i18n)**
-   - CLI および GUI ともに、macOS の主要 8 言語（日本語、英語、簡体字中国語、繁体字中国語、スペイン語、フランス語、ドイツ語、韓国語）に完全対応。OS の言語設定を自動検出します。
+7. **ファイル変更監視デーモン (`watch`)**
+   - ファイル変更を監視し、指定時間の静穏（debounce）後に差分がある場合のみ自動でスナップショットを生成（macOS: FSEvents、Linux: ポーリング / inotify）。
+8. **ログイン時自動起動＆ドライブ自動マウント**
+   - macOS: `SMAppService` / LaunchAgents
+   - Linux: `systemd --user`
+9. **8言語のネイティブ多言語対応 (i18n)**
+   - 主要 8 言語（日本語、英語、簡体字中国語、繁体字中国語、スペイン語、フランス語、ドイツ語、韓国語）に完全対応。OS の言語設定を自動検出します。
 
 ---
 
 ## 🚀 クイックスタート (Quick Start)
 
 ### 必須環境
-- macOS 14.0 (Sonoma) 以降
-- Xcode 16 または Command Line Tools (Swift 6.0)
+- **macOS**: macOS 14.0 (Sonoma) 以降、Xcode 16 または Command Line Tools (Swift 6.0)
+- **Linux**: Linux カーネル 4.5 以降 (Btrfs サポート)、Swift 6.0、`btrfs-progs`、`libsqlite3-dev`
 
 ### インストール (Build & Install)
 
+#### macOS の場合
 ```bash
 git clone https://github.com/yashiki2005/clayfs.git
 cd clayfs
 
 # ビルドおよびインストール (CLI: ~/build/bin/clayfs, GUI: ~/Applications/ClayFS.app)
 make install
+```
+
+#### Linux の場合 (CLI のみ)
+```bash
+git clone https://github.com/yashiki2005/clayfs.git
+cd clayfs
+
+# 依存パッケージのインストール (Ubuntu/Debian の例)
+sudo apt-get install -y btrfs-progs libsqlite3-dev
+
+# ビルドとインストール (/usr/local/bin/clayfs)
+./linux/build_linux.sh
 ```
 
 > **Note**: `~/build/bin` に PATH が通っていることを確認してください（例: `export PATH="$HOME/build/bin:$PATH"`）。

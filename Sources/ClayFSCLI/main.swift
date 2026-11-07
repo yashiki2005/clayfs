@@ -1,5 +1,8 @@
 import Foundation
 import ClayFSCore
+#if os(Linux)
+import Dispatch
+#endif
 
 @main
 struct ClayFSCLIApp {
@@ -106,7 +109,12 @@ struct ClayFSCLIApp {
             bundleURL = URL(fileURLWithPath: expanded)
         } else {
             let home = FileManager.default.homeDirectoryForCurrentUser
+            #if os(macOS)
             bundleURL = home.appendingPathComponent("\(name).dmg.sparsebundle")
+            #elseif os(Linux)
+            let disksDir = home.appendingPathComponent(".clayfs/disks")
+            bundleURL = disksDir.appendingPathComponent("\(name).img")
+            #endif
         }
 
         print("仮想ドライブを作成中: \(name) (上限: \(size))...")
@@ -136,7 +144,11 @@ struct ClayFSCLIApp {
         print("マウント中: \(targetDrive.name)...")
         let mounted = try StorageManager.shared.mountDrive(bundleURL: targetDrive.bundleURL, showInFinder: true)
         print("マウント完了: \(mounted.mountURL?.path ?? "")")
+        #if os(macOS)
         print("Finder に表示されました。作業ディレクトリ: \(mounted.mountURL?.path ?? "")")
+        #elseif os(Linux)
+        print("作業ディレクトリ: \(mounted.mountURL?.path ?? "")")
+        #endif
     }
 
     static func handleUnmount(_ args: [String]) throws {
@@ -457,6 +469,7 @@ struct ClayFSCLIApp {
         print("監視フォルダ: \(mountURL.path)")
         print("変更後 5 秒間静穏が続くと、自動スナップショットを作成します。(Ctrl+C で停止)")
 
+        #if canImport(CoreServices)
         let monitor = FSEventsMonitor(watchURL: mountURL, debounceSeconds: 5.0) {
             do {
                 let diffs = try SnapshotManager.shared.diff(volumeMountURL: mountURL)
@@ -471,8 +484,24 @@ struct ClayFSCLIApp {
                 print("自動スナップショット失敗: \(error.localizedDescription)")
             }
         }
-
         monitor.start()
+        #else
+        let monitor = PollingMonitor(watchURL: mountURL, interval: 5.0) {
+            do {
+                let diffs = try SnapshotManager.shared.diff(volumeMountURL: mountURL)
+                guard !diffs.isEmpty else { return }
+                let snap = try SnapshotManager.shared.createSnapshot(
+                    volumeMountURL: mountURL,
+                    message: "Auto snapshot (\(diffs.count) files modified)",
+                    policy: policy
+                )
+                print("[\(snap.id)] 自動スナップショット作成: \(snap.message)")
+            } catch {
+                print("自動スナップショット失敗: \(error.localizedDescription)")
+            }
+        }
+        monitor.start()
+        #endif
         dispatchMain()
     }
 

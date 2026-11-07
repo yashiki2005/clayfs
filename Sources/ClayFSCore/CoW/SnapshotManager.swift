@@ -1,5 +1,9 @@
 import Foundation
+#if os(macOS)
 import Darwin
+#elseif os(Linux)
+import Glibc
+#endif
 
 public final class SnapshotManager: Sendable {
     public static let shared = SnapshotManager()
@@ -80,14 +84,14 @@ public final class SnapshotManager: Sendable {
                 continue
             }
             let destItem = snapshotDestURL.appendingPathComponent(name)
-            let rc = clonefile(item.path, destItem.path, 0)
-            guard rc == 0 else {
-                let err = errno
+            do {
+                try CoWCloner.clone(from: item, to: destItem)
+            } catch {
                 try? FileManager.default.removeItem(at: snapshotDestURL)
                 throw NSError(
                     domain: "ClayFSSnapshot",
                     code: 21,
-                    userInfo: [NSLocalizedDescriptionKey: "APFS clonefile failed for \(name) with errno \(err): \(String(cString: strerror(err)))"]
+                    userInfo: [NSLocalizedDescriptionKey: "CoW clone failed for \(name): \(error.localizedDescription)"]
                 )
             }
         }
@@ -296,9 +300,9 @@ public final class SnapshotManager: Sendable {
             }
             try FileManager.default.createDirectory(at: destItem.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-            let rc = clonefile(sourceItem.path, destItem.path, 0)
-            if rc != 0 {
-                let err = errno
+            do {
+                try CoWCloner.clone(from: sourceItem, to: destItem)
+            } catch {
                 // Rollback destItem from backup
                 if movedToBackup {
                     try? FileManager.default.removeItem(at: destItem)
@@ -307,7 +311,7 @@ public final class SnapshotManager: Sendable {
                 throw NSError(
                     domain: "ClayFSSnapshot",
                     code: 24,
-                    userInfo: [NSLocalizedDescriptionKey: "APFS clonefile restore failed: \(String(cString: strerror(err)))"]
+                    userInfo: [NSLocalizedDescriptionKey: "CoW restore failed: \(error.localizedDescription)"]
                 )
             }
             if movedToBackup {
@@ -346,9 +350,9 @@ public final class SnapshotManager: Sendable {
             let snapItems = (try? FileManager.default.contentsOfDirectory(at: snapshotSourceURL, includingPropertiesForKeys: nil, options: [])) ?? []
             for item in snapItems {
                 let destItem = volumeMountURL.appendingPathComponent(item.lastPathComponent)
-                let rc = clonefile(item.path, destItem.path, 0)
-                if rc != 0 {
-                    let err = errno
+                do {
+                    try CoWCloner.clone(from: item, to: destItem)
+                } catch {
                     // Rollback: delete cloned items
                     for clonedName in clonedItems {
                         let toDelete = volumeMountURL.appendingPathComponent(clonedName)
@@ -364,7 +368,7 @@ public final class SnapshotManager: Sendable {
                     throw NSError(
                         domain: "ClayFSSnapshot",
                         code: 25,
-                        userInfo: [NSLocalizedDescriptionKey: "APFS clonefile restore failed for \(item.lastPathComponent): \(String(cString: strerror(err)))"]
+                        userInfo: [NSLocalizedDescriptionKey: "CoW restore failed for \(item.lastPathComponent): \(error.localizedDescription)"]
                     )
                 }
                 clonedItems.append(item.lastPathComponent)
