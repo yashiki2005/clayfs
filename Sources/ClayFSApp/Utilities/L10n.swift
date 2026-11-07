@@ -685,4 +685,56 @@ public enum L10n {
         case .english: return "Auto-save (\(count) changes)"
         }
     }
+
+    public static var compact: String {
+        switch currentLanguage {
+        case .japanese: return "容量を回収 (Compact)"
+        case .simplifiedChinese: return "压缩容量 (Compact)"
+        case .traditionalChinese: return "壓縮容量 (Compact)"
+        case .spanish: return "Compactar espacio"
+        case .french: return "Compacter l'espace"
+        case .german: return "Speicherplatz komprimieren"
+        case .korean: return "디스크 공간 회수 (Compact)"
+        case .english: return "Compact Storage"
+        }
+    }
+
+    public static var compacting: String {
+        switch currentLanguage {
+        case .japanese: return "空き容量を回収中 (Compact)..."
+        case .simplifiedChinese: return "正在压缩回收存储空间..."
+        case .traditionalChinese: return "正在壓縮回收儲存空間..."
+        case .spanish: return "Compactando almacenamiento..."
+        case .french: return "Compactage de l'espace en cours..."
+        case .german: return "Speicherplatz wird komprimiert..."
+        case .korean: return "디스크 공간 회수 중..."
+        case .english: return "Compacting storage..."
+        }
+    }
+
+    public static var compactSuccess: String {
+        switch currentLanguage {
+        case .japanese: return "容量の回収が完了しました"
+        case .simplifiedChinese: return "存储空间回收完成"
+        case .traditionalChinese: return "儲存空間回收完成"
+        case .spanish: return "Almacenamiento compactado con éxito"
+        case .french: return "Espace compacté avec succès"
+        case .german: return "Speicherplatz erfolgreich komprimiert"
+        case .korean: return "디스크 공간 회수 완료"
+        case .english: return "Storage successfully compacted"
+        }
+    }
+
+    public static func compactFailed(_ err: String) -> String {
+        switch currentLanguage {
+        case .japanese: return "容量回収エラー: \(err)"
+        case .simplifiedChinese: return "压缩失败: \(err)"
+        case .traditionalChinese: return "壓縮失敗: \(err)"
+        case .spanish: return "Error al compactar: \(err)"
+        case .french: return "Échec du compactage : \(err)"
+        case .german: return "Komprimierungsfehler: \(err)"
+        case .korean: return "공간 회수 실패: \(err)"
+        case .english: return "Compact failed: \(err)"
+        }
+    }
 }

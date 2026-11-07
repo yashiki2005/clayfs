@@ -138,7 +138,26 @@ public final class StorageManager: Sendable {
     }
 
     public func compactDrive(bundleURL: URL) throws {
-        let res = try ProcessRunner.hdiutil("compact", bundleURL.path)
+        var finalBundleURL = bundleURL
+        if !finalBundleURL.path.hasSuffix(".sparsebundle") && !FileManager.default.fileExists(atPath: finalBundleURL.path) {
+            finalBundleURL = finalBundleURL.appendingPathExtension("sparsebundle")
+        }
+
+        let mountPoint = findMountPoint(for: finalBundleURL)
+        let wasMounted = (mountPoint != nil)
+
+        if let mp = mountPoint {
+            Darwin.sync()
+            try unmountDrive(mountURL: mp)
+        }
+
+        defer {
+            if wasMounted {
+                _ = try? mountDrive(bundleURL: finalBundleURL, showInFinder: false)
+            }
+        }
+
+        let res = try ProcessRunner.hdiutil("compact", "-batteryallowed", finalBundleURL.path)
         guard res.isSuccess else {
             throw NSError(
                 domain: "ClayFSStorage",

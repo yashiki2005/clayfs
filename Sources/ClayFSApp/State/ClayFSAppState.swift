@@ -150,6 +150,27 @@ public final class ClayFSAppState: ObservableObject {
         }
     }
 
+    public func compactSelectedDrive() {
+        guard let drive = selectedDrive else { return }
+        statusMessage = L10n.compacting
+        Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try StorageManager.shared.compactDrive(bundleURL: drive.bundleURL)
+                }.value
+
+                await MainActor.run {
+                    self.statusMessage = L10n.compactSuccess
+                    self.refreshDrives()
+                }
+            } catch {
+                await MainActor.run {
+                    self.statusMessage = L10n.compactFailed(error.localizedDescription)
+                }
+            }
+        }
+    }
+
     public func takeSnapshot(message: String) {
         guard let mountURL = activeMountURL else { return }
         isSavingSnapshot = true

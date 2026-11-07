@@ -151,6 +151,10 @@ public struct ClayFSMenuView: View {
                                         appState.mountSelectedDrive()
                                     }
                                 }
+                                Button(L10n.compact) {
+                                    appState.selectDrive(drive)
+                                    appState.compactSelectedDrive()
+                                }
                                 Divider()
                                 Button(L10n.removeFromList, role: .destructive) {
                                     appState.removeDrive(drive)
