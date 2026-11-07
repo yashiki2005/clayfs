@@ -9,7 +9,7 @@ struct ClayFSCLIApp {
         let args = Array(CommandLine.arguments.dropFirst())
 
         guard let command = args.first else {
-            printHelp(locale: CLILocale.detect(args: []))
+            printHelp(language: AppLanguage.detect(cliArgs: []))
             exit(0)
         }
 
@@ -40,13 +40,26 @@ struct ClayFSCLIApp {
             case "--version", "-v":
                 print("clayfs version \(version)")
             case "help", "--help", "-h":
-                let locale = CLILocale.detect(args: cmdArgs)
-                printHelp(locale: locale)
+                let lang = AppLanguage.detect(cliArgs: cmdArgs)
+                printHelp(language: lang)
             default:
-                let locale = CLILocale.detect(args: args)
-                if locale == .japanese {
+                let lang = AppLanguage.detect(cliArgs: args)
+                switch lang {
+                case .japanese:
                     print("エラー: 不明なコマンド '\(command)' です。'clayfs help' で使い方を表示します。")
-                } else {
+                case .simplifiedChinese:
+                    print("错误: 未知命令 '\(command)'。运行 'clayfs help' 查看用法。")
+                case .traditionalChinese:
+                    print("錯誤: 未知命令 '\(command)'。執行 'clayfs help' 檢視用法。")
+                case .spanish:
+                    print("Error: Comando desconocido '\(command)'. Ejecute 'clayfs help' para ver el uso.")
+                case .french:
+                    print("Erreur : Commande inconnue '\(command)'. Exécutez 'clayfs help' pour voir l'utilisation.")
+                case .german:
+                    print("Fehler: Unbekannter Befehl '\(command)'. Führen Sie 'clayfs help' aus, um die Hilfe anzuzeigen.")
+                case .korean:
+                    print("오류: 알 수 없는 명령 '\(command)'입니다. 'clayfs help'를 실행하여 사용법을 확인하십시오.")
+                case .english:
                     print("Error: Unknown command '\(command)'. Run 'clayfs help' for usage.")
                 }
                 exit(1)
@@ -360,45 +373,9 @@ struct ClayFSCLIApp {
         return formatter.string(fromByteCount: bytes)
     }
 
-    enum CLILocale: Equatable {
-        case japanese
-        case english
-
-        static func detect(args: [String]) -> CLILocale {
-            // 1. Explicit CLI arguments
-            if args.contains("--ja") || args.contains("-ja") || args.contains("ja") { return .japanese }
-            if args.contains("--en") || args.contains("-en") || args.contains("en") { return .english }
-            if let idx = args.firstIndex(of: "--lang"), idx + 1 < args.count {
-                let val = args[idx + 1].lowercased()
-                if val.starts(with: "ja") { return .japanese }
-                if val.starts(with: "en") { return .english }
-            }
-            for arg in args {
-                if arg.starts(with: "--lang=") {
-                    let val = String(arg.dropFirst(7)).lowercased()
-                    if val.starts(with: "ja") { return .japanese }
-                    if val.starts(with: "en") { return .english }
-                }
-            }
-
-            // 2. Environment variables (LC_ALL, LC_MESSAGES, LANG)
-            let env = ProcessInfo.processInfo.environment
-            let envLang = env["LC_ALL"] ?? env["LC_MESSAGES"] ?? env["LANG"] ?? ""
-            let lower = envLang.lowercased()
-            if lower.starts(with: "ja") { return .japanese }
-            if lower.starts(with: "en") || envLang == "C" || envLang == "POSIX" { return .english }
-
-            // 3. System Preferred Languages
-            if let preferred = Locale.preferredLanguages.first?.lowercased() {
-                if preferred.starts(with: "ja") { return .japanese }
-            }
-
-            return .english
-        }
-    }
-
-    static func printHelp(locale: CLILocale = .japanese) {
-        if locale == .japanese {
+    static func printHelp(language: AppLanguage = AppLanguage.detect()) {
+        switch language {
+        case .japanese:
             print("""
             clayfs - 次世代 APFS 仮想ドライブ ＆ タイムマシン (v\(version))
 
@@ -413,9 +390,111 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        指定スナップショットの状態に復元
               clayfs compact [NAME]                             未使用バンドルブロックを回収
               clayfs watch [NAME]                               バックグラウンド自動スナップショット
-              clayfs help [--lang <en|ja>]                      ヘルプ表示 (日本語 / 英語)
+              clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       多言語ヘルプ表示
             """)
-        } else {
+        case .simplifiedChinese:
+            print("""
+            clayfs - 下一代 APFS 虚拟驱动器与即时时光机 (v\(version))
+
+            用法:
+              clayfs create <NAME> [--size SIZE] [--path PATH]  创建新的虚拟驱动器
+              clayfs mount [NAME]                               在访达 (Finder) 中挂载驱动器
+              clayfs unmount [NAME]                             安全卸载驱动器
+              clayfs status                                     列出已注册驱动器及挂载状态
+              clayfs snapshot [NAME] [-m MSG]                   即时创建快照
+              clayfs timeline [NAME]                            查看快照历史时间线
+              clayfs diff [NAME] [SNAPSHOT_ID]                  显示文件变更差异
+              clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        恢复到指定快照状态
+              clayfs compact [NAME]                             压缩并回收未使用的存储空间
+              clayfs watch [NAME]                               后台自动快照监控
+              clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       显示多语言帮助
+            """)
+        case .traditionalChinese:
+            print("""
+            clayfs - 下一代 APFS 虛擬磁碟與即時時光機 (v\(version))
+
+            用法:
+              clayfs create <NAME> [--size SIZE] [--path PATH]  建立新的虛擬磁碟
+              clayfs mount [NAME]                               在 Finder 中掛載磁碟
+              clayfs unmount [NAME]                             安全卸載磁碟
+              clayfs status                                     列出已註冊磁碟及掛載狀態
+              clayfs snapshot [NAME] [-m MSG]                   即時建立快照
+              clayfs timeline [NAME]                            檢視快照歷史時間線
+              clayfs diff [NAME] [SNAPSHOT_ID]                  顯示檔案變更差異
+              clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        還原至指定快照狀態
+              clayfs compact [NAME]                             壓縮並回收未使用的儲存空間
+              clayfs watch [NAME]                               背景自動快照監控
+              clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       顯示多語言說明
+            """)
+        case .spanish:
+            print("""
+            clayfs - Unidad virtual APFS de nueva generación y máquina del tiempo instantánea (v\(version))
+
+            Uso:
+              clayfs create <NAME> [--size SIZE] [--path PATH]  Crear una nueva unidad virtual
+              clayfs mount [NAME]                               Montar la unidad en Finder
+              clayfs unmount [NAME]                             Desmontar la unidad de forma segura
+              clayfs status                                     Listar unidades registradas y estados
+              clayfs snapshot [NAME] [-m MSG]                   Tomar una instantánea inmediata
+              clayfs timeline [NAME]                            Mostrar historial de instantáneas
+              clayfs diff [NAME] [SNAPSHOT_ID]                  Mostrar diferencias de archivos
+              clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restaurar al estado de una instantánea
+              clayfs compact [NAME]                             Recuperar espacio no utilizado
+              clayfs watch [NAME]                               Monitor de instantáneas automáticas
+              clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Mostrar ayuda en varios idiomas
+            """)
+        case .french:
+            print("""
+            clayfs - Disque virtuel APFS nouvelle génération et machine à remonter le temps instantanée (v\(version))
+
+            Utilisation:
+              clayfs create <NAME> [--size SIZE] [--path PATH]  Créer un nouveau disque virtuel
+              clayfs mount [NAME]                               Monter le disque dans le Finder
+              clayfs unmount [NAME]                             Démonter le disque en toute sécurité
+              clayfs status                                     Lister les disques enregistrés et leur état
+              clayfs snapshot [NAME] [-m MSG]                   Prendre un instantané immédiat
+              clayfs timeline [NAME]                            Afficher la chronologie des instantanés
+              clayfs diff [NAME] [SNAPSHOT_ID]                  Afficher les différences de fichiers
+              clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restaurer à l'état d'un instantané
+              clayfs compact [NAME]                             Récupérer l'espace disque inutilisé
+              clayfs watch [NAME]                               Surveillance automatique en arrière-plan
+              clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Afficher l'aide multilingue
+            """)
+        case .german:
+            print("""
+            clayfs - APFS-Virtuallaufwerk der nächsten Generation & Sofort-Zeitreise (v\(version))
+
+            Verwendung:
+              clayfs create <NAME> [--size SIZE] [--path PATH]  Neues virtuelles Laufwerk erstellen
+              clayfs mount [NAME]                               Laufwerk im Finder aktivieren
+              clayfs unmount [NAME]                             Laufwerk sicher deaktivieren
+              clayfs status                                     Registrierte Laufwerke und Status auflisten
+              clayfs snapshot [NAME] [-m MSG]                   Sofortigen Schnappschuss erstellen
+              clayfs timeline [NAME]                            Schnappschuss-Verlauf anzeigen
+              clayfs diff [NAME] [SNAPSHOT_ID]                  Dateiänderungen anzeigen
+              clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Auf bestimmten Schnappschuss wiederherstellen
+              clayfs compact [NAME]                             Ungenutzten Speicherplatz freigeben
+              clayfs watch [NAME]                               Automatische Hintergrundüberwachung
+              clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Mehrsprachige Hilfe anzeigen
+            """)
+        case .korean:
+            print("""
+            clayfs - 차세대 APFS 가상 드라이브 및 즉각적인 타임머신 (v\(version))
+
+            사용법:
+              clayfs create <NAME> [--size SIZE] [--path PATH]  새 가상 드라이브 생성
+              clayfs mount [NAME]                               Finder에 드라이브 마운트
+              clayfs unmount [NAME]                             안전하게 드라이브 마운트 해제
+              clayfs status                                     등록된 드라이브 및 마운트 상태 목록
+              clayfs snapshot [NAME] [-m MSG]                   즉시 스냅샷 생성
+              clayfs timeline [NAME]                            스냅샷 기록 타임라인 표시
+              clayfs diff [NAME] [SNAPSHOT_ID]                  파일 변경 차이 표시
+              clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        특정 스냅샷 상태로 복원
+              clayfs compact [NAME]                             미사용 디스크 공간 회수
+              clayfs watch [NAME]                               백그라운드 자동 스냅샷 감시
+              clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       다국어 도움말 표시
+            """)
+        case .english:
             print("""
             clayfs - Next-generation APFS virtual drive & instant time machine (v\(version))
 
@@ -430,7 +509,7 @@ struct ClayFSCLIApp {
               clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restore to a specific snapshot state
               clayfs compact [NAME]                             Reclaim unused sparse bundle blocks
               clayfs watch [NAME]                               Run background auto-snapshot monitor
-              clayfs help [--lang <en|ja>]                      Show help in English or Japanese
+              clayfs help [--lang <en|ja|zh|es|fr|de|ko>]       Show help in multiple languages
             """)
         }
     }
