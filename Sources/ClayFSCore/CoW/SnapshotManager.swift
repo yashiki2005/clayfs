@@ -17,12 +17,32 @@ public final class SnapshotManager: Sendable {
 
     public init() {}
 
+    public func sweepStaleTempFiles(volumeMountURL: URL) {
+        let clayfsDir = volumeMountURL.appendingPathComponent(".clayfs")
+        guard let items = try? FileManager.default.contentsOfDirectory(at: clayfsDir, includingPropertiesForKeys: [.contentModificationDateKey], options: []) else { return }
+        let now = Date()
+        for item in items {
+            let name = item.lastPathComponent
+            if name.hasPrefix("trash_") || name.hasPrefix("temp_restore_") || name.hasPrefix("temp_subpath_") {
+                if let mtime = (try? item.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate {
+                    if now.timeIntervalSince(mtime) > 60 {
+                        try? FileManager.default.removeItem(at: item)
+                    }
+                }
+            }
+        }
+    }
+
+    @discardableResult
     public func createSnapshot(
         volumeMountURL: URL,
         message: String = "Manual snapshot",
         author: String = NSUserName(),
-        policy: RetentionPolicy? = nil
+        policy: RetentionPolicy? = nil,
+        sync: Bool = false
     ) throws -> Snapshot {
+        sweepStaleTempFiles(volumeMountURL: volumeMountURL)
+
         let metadataURL = volumeMountURL.appendingPathComponent(".clayfs")
         let snapshotsURL = metadataURL.appendingPathComponent("snapshots")
         let dbURL = metadataURL.appendingPathComponent("timeline.sqlite3")
@@ -63,6 +83,7 @@ public final class SnapshotManager: Sendable {
             let rc = clonefile(item.path, destItem.path, 0)
             guard rc == 0 else {
                 let err = errno
+                try? FileManager.default.removeItem(at: snapshotDestURL)
                 throw NSError(
                     domain: "ClayFSSnapshot",
                     code: 21,
@@ -86,23 +107,34 @@ public final class SnapshotManager: Sendable {
         let db = try TimelineDB(fileURL: dbURL)
         try db.insertSnapshot(snapshot)
 
-        // If directory has more than 500 items, finish computing full metrics in background queue
+        // If directory has more than 500 items, finish computing full metrics
         if !isComplete {
             let snapID = id
             let targetURL = snapshotDestURL
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                guard let self = self else { return }
+            if sync {
                 let (fullCount, fullBytes) = self.calculateFullMetrics(for: targetURL)
                 if let db = try? TimelineDB(fileURL: dbURL) {
                     try? db.updateMetrics(id: snapID, fileCount: fullCount, totalBytes: fullBytes)
                 }
+            } else {
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    guard let self = self else { return }
+                    let (fullCount, fullBytes) = self.calculateFullMetrics(for: targetURL)
+                    if let db = try? TimelineDB(fileURL: dbURL) {
+                        try? db.updateMetrics(id: snapID, fileCount: fullCount, totalBytes: fullBytes)
+                    }
+                }
             }
         }
 
-        // Automatic pruning in background if policy is provided
+        // Automatic pruning if policy is provided
         if let policy = policy {
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                _ = try? self?.pruneSnapshots(volumeMountURL: volumeMountURL, policy: policy)
+            if sync {
+                _ = try? self.pruneSnapshots(volumeMountURL: volumeMountURL, policy: policy, sync: true)
+            } else {
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    _ = try? self?.pruneSnapshots(volumeMountURL: volumeMountURL, policy: policy, sync: false)
+                }
             }
         }
 
@@ -112,7 +144,8 @@ public final class SnapshotManager: Sendable {
     @discardableResult
     public func pruneSnapshots(
         volumeMountURL: URL,
-        policy: RetentionPolicy
+        policy: RetentionPolicy,
+        sync: Bool = false
     ) throws -> [Snapshot] {
         let snapshotsURL = volumeMountURL.appendingPathComponent(".clayfs/snapshots")
         let dbURL = volumeMountURL.appendingPathComponent(".clayfs/timeline.sqlite3")
@@ -159,13 +192,12 @@ public final class SnapshotManager: Sendable {
             let snapDir = snapshotsURL.appendingPathComponent(snap.id)
             if FileManager.default.fileExists(atPath: snapDir.path) {
                 let tempTrash = volumeMountURL.appendingPathComponent(".clayfs/trash_\(UUID().uuidString)")
-                if (try? FileManager.default.moveItem(at: snapDir, to: tempTrash)) != nil {
-                    DispatchQueue.global(qos: .utility).async {
-                        try? FileManager.default.removeItem(at: tempTrash)
-                    }
+                let targetURL = (try? FileManager.default.moveItem(at: snapDir, to: tempTrash)) != nil ? tempTrash : snapDir
+                if sync {
+                    try? FileManager.default.removeItem(at: targetURL)
                 } else {
                     DispatchQueue.global(qos: .utility).async {
-                        try? FileManager.default.removeItem(at: snapDir)
+                        try? FileManager.default.removeItem(at: targetURL)
                     }
                 }
             }
@@ -186,8 +218,11 @@ public final class SnapshotManager: Sendable {
     public func restore(
         volumeMountURL: URL,
         snapshotID: String,
-        subpath: String? = nil
+        subpath: String? = nil,
+        sync: Bool = false
     ) throws {
+        sweepStaleTempFiles(volumeMountURL: volumeMountURL)
+
         let snapshotSourceURL = volumeMountURL
             .appendingPathComponent(".clayfs/snapshots")
             .appendingPathComponent(snapshotID)
@@ -216,8 +251,33 @@ public final class SnapshotManager: Sendable {
         }
 
         if let subpath = subpath, !subpath.isEmpty {
-            let sourceItem = snapshotSourceURL.appendingPathComponent(subpath)
-            let destItem = volumeMountURL.appendingPathComponent(subpath)
+            let standardizedSubpath = (subpath as NSString).standardizingPath
+            let sourceItem = snapshotSourceURL.appendingPathComponent(standardizedSubpath).standardizedFileURL
+            let destItem = volumeMountURL.appendingPathComponent(standardizedSubpath).standardizedFileURL
+
+            // Security check: Must reside within volumeMountURL
+            let volumePrefix = volumeMountURL.standardizedFileURL.path.hasSuffix("/")
+                ? volumeMountURL.standardizedFileURL.path
+                : volumeMountURL.standardizedFileURL.path + "/"
+
+            guard destItem.path.hasPrefix(volumePrefix) else {
+                throw NSError(
+                    domain: "ClayFSSnapshot",
+                    code: 27,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid subpath: path traversal outside volume is prohibited: '\(subpath)'"]
+                )
+            }
+
+            // Security check: First component must not be in ignoredRootNames (.clayfs, .fseventsd, etc.)
+            let rel = String(destItem.path.dropFirst(volumePrefix.count))
+            let firstComp = rel.split(separator: "/").first.map(String.init) ?? rel
+            guard !Self.ignoredRootNames.contains(firstComp) else {
+                throw NSError(
+                    domain: "ClayFSSnapshot",
+                    code: 28,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid subpath: modifying system/metadata directory '\(firstComp)' is prohibited"]
+                )
+            }
 
             guard FileManager.default.fileExists(atPath: sourceItem.path) else {
                 throw NSError(
@@ -310,9 +370,13 @@ public final class SnapshotManager: Sendable {
                 clonedItems.append(item.lastPathComponent)
             }
 
-            // Clean up old temporary directory in background
-            DispatchQueue.global(qos: .utility).async {
+            // Clean up old temporary directory
+            if sync {
                 try? FileManager.default.removeItem(at: tempBackup)
+            } else {
+                DispatchQueue.global(qos: .utility).async {
+                    try? FileManager.default.removeItem(at: tempBackup)
+                }
             }
         }
     }
@@ -348,7 +412,7 @@ public final class SnapshotManager: Sendable {
         guard let enumerator = FileManager.default.enumerator(
             at: directoryURL,
             includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             return (0, 0, true)
         }
@@ -372,7 +436,7 @@ public final class SnapshotManager: Sendable {
         guard let enumerator = FileManager.default.enumerator(
             at: directoryURL,
             includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             return (0, 0)
         }
@@ -425,7 +489,7 @@ public final class SnapshotManager: Sendable {
         guard let enumerator = FileManager.default.enumerator(
             at: rootURL,
             includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             return [:]
         }
@@ -440,6 +504,7 @@ public final class SnapshotManager: Sendable {
             let rel = String(fullPath.dropFirst(prefix.count))
             let rootComp = rel.split(separator: "/").first.map(String.init) ?? rel
             if Self.ignoredRootNames.contains(rootComp) {
+                enumerator.skipDescendants()
                 continue
             }
             guard let values = try? fileURL.resourceValues(forKeys: Set(keys)),

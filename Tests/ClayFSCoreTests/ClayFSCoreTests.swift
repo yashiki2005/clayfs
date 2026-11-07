@@ -158,3 +158,111 @@ import Foundation
     #expect(restoredContent == "Version 1 content")
     #expect(!FileManager.default.fileExists(atPath: newDocURL.path))
 }
+
+@Test func testTimelineDBWALMode() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_wal_test_\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let dbURL = tempDir.appendingPathComponent("timeline.sqlite3")
+    let db = try TimelineDB(fileURL: dbURL)
+
+    // Inserting a snapshot should write in WAL mode
+    let snap = Snapshot(id: "snap_wal_1", message: "WAL Test", fileCount: 1, totalBytes: 100)
+    try db.insertSnapshot(snap)
+
+    let shmExists = FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("timeline.sqlite3-shm").path)
+    let walExists = FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("timeline.sqlite3-wal").path)
+    #expect(shmExists || walExists)
+}
+
+@Test func testRestoreSubpathTraversalSecurity() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_sec_test_\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let bundleURL = tempDir.appendingPathComponent("SecDrive.sparsebundle")
+    let driveName = "SecTest_\(UUID().uuidString.prefix(6))"
+
+    let drive = try StorageManager.shared.createDrive(name: driveName, size: "300m", bundleURL: bundleURL, register: false)
+    let mounted = try StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: false, register: false)
+    guard let mountURL = mounted.mountURL else {
+        Issue.record("Failed to mount security test drive")
+        return
+    }
+
+    defer {
+        try? StorageManager.shared.unmountDrive(mountURL: mountURL, force: true)
+        try? FileManager.default.removeItem(at: bundleURL)
+    }
+
+    // Write a normal file and take snapshot
+    let testDoc = mountURL.appendingPathComponent("safe.txt")
+    try "Safe content".write(to: testDoc, atomically: true, encoding: .utf8)
+    let snap = try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: "Sec commit")
+
+    // 1. Path traversal outside volume must throw
+    var didBlockTraversal = false
+    do {
+        try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snap.id, subpath: "../../../etc/passwd")
+    } catch {
+        didBlockTraversal = true
+    }
+    #expect(didBlockTraversal)
+
+    // 2. Modifying .clayfs must throw
+    var didBlockSystemDir = false
+    do {
+        try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snap.id, subpath: ".clayfs/timeline.sqlite3")
+    } catch {
+        didBlockSystemDir = true
+    }
+    #expect(didBlockSystemDir)
+}
+
+@Test func testDotfileDetectionInDiff() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_dot_test_\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let bundleURL = tempDir.appendingPathComponent("DotDrive.sparsebundle")
+    let driveName = "DotTest_\(UUID().uuidString.prefix(6))"
+
+    let drive = try StorageManager.shared.createDrive(name: driveName, size: "300m", bundleURL: bundleURL, register: false)
+    let mounted = try StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: false, register: false)
+    guard let mountURL = mounted.mountURL else {
+        Issue.record("Failed to mount dotfile test drive")
+        return
+    }
+
+    defer {
+        try? StorageManager.shared.unmountDrive(mountURL: mountURL, force: true)
+        try? FileManager.default.removeItem(at: bundleURL)
+    }
+
+    // 1. Initial snapshot with empty volume
+    let snap0 = try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: "Initial empty")
+
+    // 2. Add dotfiles: .gitignore, .env, .github/workflow.yml
+    let gitignoreURL = mountURL.appendingPathComponent(".gitignore")
+    try "*.tmp\n.DS_Store".write(to: gitignoreURL, atomically: true, encoding: .utf8)
+
+    let envURL = mountURL.appendingPathComponent(".env")
+    try "SECRET_KEY=12345".write(to: envURL, atomically: true, encoding: .utf8)
+
+    let githubDir = mountURL.appendingPathComponent(".github")
+    try FileManager.default.createDirectory(at: githubDir, withIntermediateDirectories: true)
+    let ciURL = githubDir.appendingPathComponent("ci.yml")
+    try "name: CI".write(to: ciURL, atomically: true, encoding: .utf8)
+
+    // 3. Diff must detect all 3 dotfiles!
+    let diffs = try SnapshotManager.shared.diff(volumeMountURL: mountURL, snapshotID: snap0.id)
+    let paths = diffs.map { $0.path }
+    #expect(paths.contains(".gitignore"))
+    #expect(paths.contains(".env"))
+    #expect(paths.contains(".github/ci.yml"))
+
+    // 4. Create snapshot with dotfiles and verify fileCount
+    let snap1 = try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: "Added dotfiles")
+    #expect(snap1.fileCount == 3)
+}

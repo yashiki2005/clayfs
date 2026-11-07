@@ -213,7 +213,8 @@ struct ClayFSCLIApp {
         let snap = try SnapshotManager.shared.createSnapshot(
             volumeMountURL: mountURL,
             message: message,
-            policy: targetDrive?.retentionPolicy ?? .default
+            policy: targetDrive?.retentionPolicy ?? .default,
+            sync: true
         )
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -297,7 +298,7 @@ struct ClayFSCLIApp {
             print("復元中: ドライブ全体を [\(snapshotID)] の状態に復元します...")
         }
 
-        try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshotID, subpath: subpath)
+        try SnapshotManager.shared.restore(volumeMountURL: mountURL, snapshotID: snapshotID, subpath: subpath, sync: true)
         print("復元完了。※復元直前の状態も安全用スナップショットとして自動保存されました。")
     }
 
@@ -375,7 +376,7 @@ struct ClayFSCLIApp {
         let daysDesc = maxAgeDays.map { "\($0) 日" } ?? "無制限"
         print("スナップショット履歴の整理を実行中 (上限: \(countDesc), 期限: \(daysDesc))...")
 
-        let pruned = try SnapshotManager.shared.pruneSnapshots(volumeMountURL: mountURL, policy: policy)
+        let pruned = try SnapshotManager.shared.pruneSnapshots(volumeMountURL: mountURL, policy: policy, sync: true)
         if pruned.isEmpty {
             print("整理対象の古いスナップショットはありませんでした。")
         } else {

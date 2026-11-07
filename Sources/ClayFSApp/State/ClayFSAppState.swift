@@ -88,8 +88,11 @@ public final class ClayFSAppState: ObservableObject {
             var list = DriveRegistry.shared.loadDrives(cleanMissing: true)
             var currentMountURL: URL?
 
+            let allMounts = StorageManager.shared.getAllMountPoints()
+
             for i in 0..<list.count {
-                if let mount = StorageManager.shared.findMountPoint(for: list[i].bundleURL) {
+                let standardBundlePath = list[i].bundleURL.resolvingSymlinksInPath().path
+                if let mount = allMounts[standardBundlePath] {
                     list[i].isMounted = true
                     list[i].mountURL = mount
                     if let values = try? mount.resourceValues(forKeys: [.volumeAvailableCapacityKey, .volumeTotalCapacityKey]) {

@@ -20,6 +20,9 @@ public final class TimelineDB: @unchecked Sendable {
             throw NSError(domain: "ClayFSTimelineDB", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to open SQLite database: \(errMsg)"])
         }
         self.db = handle
+        sqlite3_busy_timeout(handle, 5000)
+        try execute(sql: "PRAGMA journal_mode=WAL;")
+        try execute(sql: "PRAGMA synchronous=NORMAL;")
         try createTables()
     }
 

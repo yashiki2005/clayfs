@@ -144,15 +144,16 @@ public final class StorageManager: Sendable {
         }
 
         let mountPoint = findMountPoint(for: finalBundleURL)
-        let wasMounted = (mountPoint != nil)
+        var didUnmount = false
 
         if let mp = mountPoint {
             Darwin.sync()
             try unmountDrive(mountURL: mp)
+            didUnmount = true
         }
 
         defer {
-            if wasMounted {
+            if didUnmount {
                 _ = try? mountDrive(bundleURL: finalBundleURL, showInFinder: true)
             }
         }
@@ -167,34 +168,37 @@ public final class StorageManager: Sendable {
         }
     }
 
-    public func findMountPoint(for bundleURL: URL) -> URL? {
+    public func getAllMountPoints() -> [String: URL] {
         do {
             let res = try ProcessRunner.hdiutil("info", "-plist")
-            guard res.isSuccess, let data = res.stdout.data(using: .utf8) else { return nil }
+            guard res.isSuccess, let data = res.stdout.data(using: .utf8) else { return [:] }
             guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
                   let images = plist["images"] as? [[String: Any]] else {
-                return nil
+                return [:]
             }
 
-            let standardBundlePath = bundleURL.resolvingSymlinksInPath().path
+            var map: [String: URL] = [:]
             for img in images {
-                if let imgPath = img["image-path"] as? String {
-                    let standardImgPath = URL(fileURLWithPath: imgPath).resolvingSymlinksInPath().path
-                    if standardImgPath == standardBundlePath {
-                        if let entities = img["system-entities"] as? [[String: Any]] {
-                            for entity in entities {
-                                if let mp = entity["mount-point"] as? String {
-                                    return URL(fileURLWithPath: mp)
-                                }
-                            }
+                guard let imgPath = img["image-path"] as? String else { continue }
+                let standardImgPath = URL(fileURLWithPath: imgPath).resolvingSymlinksInPath().path
+                if let entities = img["system-entities"] as? [[String: Any]] {
+                    for entity in entities {
+                        if let mp = entity["mount-point"] as? String {
+                            map[standardImgPath] = URL(fileURLWithPath: mp)
+                            break
                         }
                     }
                 }
             }
+            return map
         } catch {
-            return nil
+            return [:]
         }
-        return nil
+    }
+
+    public func findMountPoint(for bundleURL: URL) -> URL? {
+        let standardBundlePath = bundleURL.resolvingSymlinksInPath().path
+        return getAllMountPoints()[standardBundlePath]
     }
 
     private func parseMountPoint(fromPlistOutput output: String) -> URL? {
@@ -246,6 +250,7 @@ public final class StorageManager: Sendable {
             bundleURL: bundleURL,
             mountURL: mountURL,
             isMounted: mountURL != nil,
+            sizeLimit: existing?.sizeLimit ?? "50g",
             freeBytes: freeBytes,
             totalBytes: totalBytes,
             autoSnapshot: existing?.autoSnapshot ?? true,
