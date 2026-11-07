@@ -15,7 +15,7 @@ public final class DriveRegistry: @unchecked Sendable {
         }
     }
 
-    public func loadDrives() -> [VolumeInfo] {
+    public func loadDrives(cleanMissing: Bool = false) -> [VolumeInfo] {
         lock.lock()
         defer { lock.unlock() }
 
@@ -24,7 +24,18 @@ public final class DriveRegistry: @unchecked Sendable {
         }
         do {
             let data = try Data(contentsOf: configURL)
-            let drives = try JSONDecoder().decode([VolumeInfo].self, from: data)
+            var drives = try JSONDecoder().decode([VolumeInfo].self, from: data)
+            if cleanMissing {
+                let existing = drives.filter { FileManager.default.fileExists(atPath: $0.bundleURL.path) }
+                if existing.count != drives.count {
+                    drives = existing
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    if let savedData = try? encoder.encode(existing) {
+                        try? savedData.write(to: configURL, options: .atomic)
+                    }
+                }
+            }
             return drives
         } catch {
             return []

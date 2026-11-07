@@ -49,12 +49,12 @@ import Foundation
     let bundleURL = tempDir.appendingPathComponent("E2EDrive.sparsebundle")
     let driveName = "E2ETest_\(UUID().uuidString.prefix(6))"
 
-    // 1. Create 500m drive
-    let drive = try StorageManager.shared.createDrive(name: driveName, size: "500m", bundleURL: bundleURL)
+    // 1. Create 500m drive (isolated from user registry)
+    let drive = try StorageManager.shared.createDrive(name: driveName, size: "500m", bundleURL: bundleURL, register: false)
     #expect(FileManager.default.fileExists(atPath: drive.bundleURL.path))
 
     // 2. Mount drive
-    let mounted = try StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: false)
+    let mounted = try StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: false, register: false)
     guard let mountURL = mounted.mountURL else {
         Issue.record("Failed to mount drive")
         return

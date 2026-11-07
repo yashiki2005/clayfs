@@ -8,7 +8,8 @@ public final class StorageManager: Sendable {
     public func createDrive(
         name: String,
         size: String = "50g",
-        bundleURL: URL
+        bundleURL: URL,
+        register: Bool = true
     ) throws -> VolumeInfo {
         let parentDir = bundleURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
@@ -52,13 +53,16 @@ public final class StorageManager: Sendable {
             sizeLimit: size
         )
 
-        try DriveRegistry.shared.registerDrive(drive)
+        if register {
+            try DriveRegistry.shared.registerDrive(drive)
+        }
         return drive
     }
 
     public func mountDrive(
         bundleURL: URL,
-        showInFinder: Bool = true
+        showInFinder: Bool = true,
+        register: Bool = true
     ) throws -> VolumeInfo {
         var finalBundleURL = bundleURL
         if !finalBundleURL.path.hasSuffix(".sparsebundle") && !FileManager.default.fileExists(atPath: finalBundleURL.path) {
@@ -109,7 +113,9 @@ public final class StorageManager: Sendable {
 
         try initializeVolumeStructure(at: mountURL)
         let info = buildVolumeInfo(bundleURL: finalBundleURL, mountURL: mountURL)
-        try DriveRegistry.shared.registerDrive(info)
+        if register {
+            try DriveRegistry.shared.registerDrive(info)
+        }
         return info
     }
 

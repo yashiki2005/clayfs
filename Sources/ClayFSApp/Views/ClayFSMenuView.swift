@@ -22,8 +22,32 @@ public struct ClayFSMenuView: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     if let drive = appState.selectedDrive {
-                        Text(drive.name)
-                            .font(.headline)
+                        if appState.drives.count > 1 {
+                            Menu {
+                                ForEach(appState.drives) { d in
+                                    Button(action: { appState.selectDrive(d) }) {
+                                        HStack {
+                                            Text(d.name)
+                                            if d.name == drive.name {
+                                                Image(systemName: "checkmark")
+                                            }
+                                        }
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(drive.name)
+                                        .font(.headline)
+                                    Image(systemName: "chevron.down")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .menuStyle(.borderlessButton)
+                        } else {
+                            Text(drive.name)
+                                .font(.headline)
+                        }
                         Text(appState.isMounted ? "マウント中 (保護有効)" : "未マウント")
                             .font(.caption)
                             .foregroundColor(appState.isMounted ? .green : .secondary)
@@ -207,8 +231,9 @@ public struct ClayFSMenuView: View {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let bundleURL = home.appendingPathComponent("\(newDriveName).dmg.sparsebundle")
         do {
-            _ = try StorageManager.shared.createDrive(name: newDriveName, size: newDriveSize, bundleURL: bundleURL)
+            let drive = try StorageManager.shared.createDrive(name: newDriveName, size: newDriveSize, bundleURL: bundleURL)
             appState.refreshDrives()
+            appState.selectDrive(drive)
             appState.mountSelectedDrive()
         } catch {
             appState.statusMessage = "作成エラー: \(error.localizedDescription)"

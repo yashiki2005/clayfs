@@ -21,12 +21,27 @@ public final class ClayFSAppState: ObservableObject {
     }
 
     public func refreshDrives() {
-        let list = DriveRegistry.shared.loadDrives()
+        let list = DriveRegistry.shared.loadDrives(cleanMissing: true)
         self.drives = list
         if selectedDrive == nil || !list.contains(where: { $0.name == selectedDrive?.name }) {
-            self.selectedDrive = list.first
+            if let mounted = list.first(where: { StorageManager.shared.findMountPoint(for: $0.bundleURL) != nil }) {
+                self.selectedDrive = mounted
+            } else {
+                self.selectedDrive = list.first
+            }
         }
         checkMountStatus()
+    }
+
+    public func selectDrive(_ drive: VolumeInfo) {
+        self.selectedDrive = drive
+        self.statusMessage = nil
+        checkMountStatus()
+    }
+
+    public func removeDrive(_ drive: VolumeInfo) {
+        try? DriveRegistry.shared.unregisterDrive(named: drive.name)
+        refreshDrives()
     }
 
     public func checkMountStatus() {
