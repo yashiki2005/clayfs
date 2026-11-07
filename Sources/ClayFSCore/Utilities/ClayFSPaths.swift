@@ -23,12 +23,22 @@ public enum ClayFSPaths {
         return FileManager.default.homeDirectoryForCurrentUser
     }
 
-    /// Fixes ownership of the mount point on Linux so the regular user can read/write without sudo.
-    public static func ensureUserOwnership(at url: URL) {
+    /// Fixes ownership of the mount point and metadata on Linux so the regular user can read/write without sudo.
+    public static func ensureUserOwnership(at url: URL, recursive: Bool = true) {
         #if os(Linux)
         if let sudoUser = ProcessInfo.processInfo.environment["SUDO_USER"], !sudoUser.isEmpty, let pw = getpwnam(sudoUser) {
-            chown(url.path, pw.pointee.pw_uid, pw.pointee.pw_gid)
+            let uid = pw.pointee.pw_uid
+            let gid = pw.pointee.pw_gid
+            chown(url.path, uid, gid)
             chmod(url.path, 0o755)
+
+            if recursive {
+                if let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil) {
+                    while let fileURL = enumerator.nextObject() as? URL {
+                        chown(fileURL.path, uid, gid)
+                    }
+                }
+            }
         }
         #endif
     }
