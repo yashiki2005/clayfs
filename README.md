@@ -1,156 +1,162 @@
 # ClayFS 🏺
 
 > **Next-Generation APFS Virtual Drive & Instant Time Machine for macOS**  
-> macOS 向けの次世代 APFS 仮想ドライブ ＆ 超高速タイムマシン
+> **English** | [日本語 (Japanese)](README.ja.md)
 
 [![macOS](https://img.shields.io/badge/macOS-14.0%2B-black?logo=apple)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange?logo=swift)](https://swift.org)
 [![APFS CoW](https://img.shields.io/badge/Filesystem-APFS%20CoW-blue)](https://developer.apple.com/documentation/foundation/filemanager)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-ClayFS は、macOS の **APFS Copy-on-Write (`clonefile(2)`)** を活用した、ストレージ消費ゼロで瞬時にスナップショットを作成・復元できる軽量仮想ドライブシステムです。
+ClayFS is a lightweight virtual drive and instant snapshot/rollback system for macOS that leverages **APFS Copy-on-Write (`clonefile(2)`)** to deliver zero-cost, millisecond-fast snapshots.
 
-開発作業中の試行錯誤、巨大なコードベースの変更、Git コミット前の実験的リファクタリングなどを、Finder / CLI の境界なくいつでも自由自在に巻き戻すことができます。
-
----
-
-## ✨ 主な特長 (Features)
-
-1. **APFS CoW によるゼロコスト・スナップショット**
-   - 変更があるまで追加ストレージを一切消費しない `clonefile(2)` によるミリ秒単位のスナップショット作成。
-2. **Git 感覚のボリューム直接巻き戻し**
-   - ドライブ（例: `/Volumes/src`）のルート全体を直感的にスナップショット＆ロールバック。
-   - `.clayfs`、`.fseventsd`、`.Spotlight-V100` などのシステムディレクトリは自動除外され安全に保護。
-3. **美しい常駐メニューバーアプリ (`ClayFS.app`)**
-   - スライダーで直感的に時間をさかのぼれるタイムライン・スクラバー。
-   - 変更ファイル数の可視化、1クリックでのロールバック確認シート、保持設定。
-4. **シームレスな空き容量回収 (`compact`)**
-   - ドライブ使用中に肥大化したスパースバンドルブロックを安全かつ瞬時に回収（同期 → 解除 → `hdiutil compact` → 再マウントを自動一括実行）。
-5. **スナップショット保持ポリシー＆自動整理 (`prune`)**
-   - 「最大保持件数」や「最大保持日数」を設定可能。スナップショット作成時にもバックグラウンドで自動プルーニング。
-6. **FSEvents による自動監視 (`watch`)**
-   - ファイル変更を監視し、指定時間の静穏（debounce）後に自動でスナップショットを生成。
-7. **8言語のネイティブ多言語対応 (i18n)**
-   - CLI および GUI ともに、macOS の主要 8 言語（日本語、英語、簡体字中国語、繁体字中国語、スペイン語、フランス語、ドイツ語、韓国語）に完全対応。OS の言語設定を自動検出します。
+It allows developers to explore radical code refactoring, test breaking changes, or experiment on huge codebases with the confidence of an instant, 1-click rollback across both Finder and the terminal.
 
 ---
 
-## 🚀 クイックスタート (Quick Start)
+## ✨ Features
 
-### 必須環境
-- macOS 14.0 (Sonoma) 以降
-- Xcode 16 または Command Line Tools (Swift 6.0)
+1. **Zero-Cost APFS CoW Snapshots**
+   - Millisecond-fast snapshot creation via `clonefile(2)` without consuming additional disk space until files are modified.
+2. **Git-Like Volume Root Rollback**
+   - Directly snapshot and roll back your entire mounted workspace root (e.g. `/Volumes/src`).
+   - Automatically protects and ignores internal system directories (`.clayfs`, `.fseventsd`, `.Spotlight-V100`, etc.).
+   - Includes subpath traversal protection (`../`) and safe atomic rollback if any restoration step fails.
+3. **Native macOS Menu Bar App (`ClayFS.app`)**
+   - Interactive timeline scrubber to preview past states and file changes.
+   - 1-click snapshot creation, visual rollback confirmation with modified file counter, and customizable retention.
+   - Fully asynchronous background polling ensures the UI thread never freezes.
+4. **Seamless Online Volume Compaction (`compact`)**
+   - Automatically reclaims unused blocks from sparse bundles (Sync → unmount → `hdiutil compact` → instant remount).
+5. **Configurable Retention Policy & Pruning (`prune`)**
+   - Configure retention limits by snapshot count (`--keep N`) or snapshot age (`--days N`).
+   - Automatically prunes expired snapshots in the background on snapshot creation.
+6. **Automatic FSEvents Watcher (`watch`)**
+   - Monitors file system events with debouncing and automatically snapshots when changes are detected.
+7. **Launch at Login & Drive Auto-Mount**
+   - Modern macOS 14+ `SMAppService` and LaunchAgent integration for automatic background startup at login.
+   - Per-drive auto-mount configuration via CLI and GUI.
+8. **Native 8-Language Localization (i18n)**
+   - Fully localized in English, Japanese (日本語), Simplified Chinese (简体中文), Traditional Chinese (繁體中文), Spanish (Español), French (Français), German (Deutsch), and Korean (한국어). Auto-detects system language.
 
-### インストール (Build & Install)
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+- macOS 14.0 (Sonoma) or later
+- Xcode 16 or Command Line Tools (Swift 6.0)
+
+### Installation (Build & Install)
 
 ```bash
 git clone https://github.com/yourname/clayfs.git
 cd clayfs
 
-# ビルドおよびインストール (CLI: ~/build/bin/clayfs, GUI: ~/Applications/ClayFS.app)
+# Build and install (CLI: ~/build/bin/clayfs, GUI: ~/Applications/ClayFS.app)
 make install
 ```
 
-> **Note**: `~/build/bin` に PATH が通っていることを確認してください（例: `export PATH="$HOME/build/bin:$PATH"`）。
+> **Note**: Ensure `~/build/bin` is in your `$PATH` (e.g. `export PATH="$HOME/build/bin:$PATH"`).
 
 ---
 
-## 💻 CLI 使い方 (Usage)
+## 💻 CLI Usage
 
-### 1. 新しい仮想ドライブを作成
+### 1. Create a New Virtual Drive
 ```bash
-# 64GB の仮想ドライブ「src」を作成
+# Create a 64GB sparse virtual drive named 'src'
 clayfs create src --size 64g
 ```
 
-### 2. マウントと状態確認
+### 2. Mount and Check Status
 ```bash
-# Finder にマウント (/Volumes/src に出現)
+# Mount drive into Finder (mounted at /Volumes/src)
 clayfs mount src
 
-# マウント状態とドライブ一覧を表示
+# List registered drives and mount states
 clayfs status
 ```
 
-### 3. スナップショットの作成とタイムライン
+### 3. Take Snapshots and View Timeline
 ```bash
-# 即座にスナップショットを作成 (メッセージ付き)
-clayfs snapshot src -m "大型リファクタリング直前"
+# Take an immediate snapshot with a memo
+clayfs snapshot src -m "Before major refactoring"
 
-# スナップショット履歴一覧
+# View snapshot history timeline
 clayfs timeline src
 ```
 
-### 4. 変更差分の確認と復元 (Restore)
+### 4. Diff Changes and Restore
 ```bash
-# 現在の作業状態とスナップショットとの差分を表示
+# Show diff between working files and last snapshot
 clayfs diff src
 
-# 指定スナップショットの状態に瞬時に巻き戻す (全体復元)
+# Roll back the entire drive to a snapshot
 clayfs restore src snap_20261108_052000
 
-# 特定のファイル/ディレクトリのみ復元
+# Restore only a specific file or directory
 clayfs restore src snap_20261108_052000 path/to/target.swift
 ```
 
-### 5. 空き容量の回収 (Compaction)
+### 5. Reclaim Disk Space (Compaction)
 ```bash
-# ファイル削除後にスパースバンドルの未使用ディスクブロックを回収
+# Reclaim unused blocks after deleting files
 clayfs compact src
 ```
 
-### 6. スナップショット履歴の整理 (Prune)
+### 6. Prune Old Snapshots
 ```bash
-# 最大30件、直近14日以内のスナップショットを残して古い履歴を整理
+# Keep at most 30 snapshots and prune anything older than 14 days
 clayfs prune src --keep 30 --days 14
 ```
 
-### 7. 自動スナップショット監視 (Watch)
+### 7. Background Auto-Snapshot Daemon (Watch)
 ```bash
-# 変更後5秒静穏で自動スナップショットを作成するデーモン
+# Automatically create snapshots after 5 seconds of file quiescence
 clayfs watch src
 ```
 
-### 8. 起動設定 (Startup & Auto-mount)
+### 8. Startup & Auto-Mount Settings
 ```bash
-# ログイン時の ClayFS 常駐アプリ自動起動を有効化/無効化
+# Enable or disable ClayFS launch at login
 clayfs autostart on
 clayfs autostart off
 
-# 特定ドライブの起動時自動マウントを設定
+# Enable or disable auto-mount on launch for a drive
 clayfs automount src on
 clayfs automount src off
 ```
 
-### 9. 多言語ヘルプ
+### 9. Multi-Language Help
 ```bash
-clayfs help                 # OSの言語設定に合わせて表示
-clayfs help --lang en       # 英語で表示
-clayfs help --lang ja       # 日本語で表示
+clayfs help                 # Display help in system language
+clayfs help --lang en       # Display in English
+clayfs help --lang ja       # Display in Japanese
 ```
 
 ---
 
-## 🖥️ メニューバーアプリ (ClayFS.app)
+## 🖥️ Menu Bar App (ClayFS.app)
 
-ClayFS にはネイティブ SwiftUI 製のメニューバーアプリケーションが付属しています。
+ClayFS includes a native SwiftUI menu bar application:
 
 ```bash
 open ~/Applications/ClayFS.app
 ```
 
-- **ステータスアイコン**: マウント状態やアクティビティをメニューバーに常時表示。
-- **タイムラインビュー**: 過去のスナップショットを直感的なスライダーで選択。
-- **クイックアクション**:
-  - 📸 **Snapshot**: 1クリックで即座に保存
-  - 🔄 **Compact**: ドライブの未使用領域を最適化
-  - ⚙️ **Retention**: 最大件数・最大日数の保持ポリシーを設定＆即時整理
-  - ⚙️ **Startup**: フッターの歯車アイコンからログイン時自動起動やドライブ自動マウントを一元管理
-  - ⏱️ **Restore**: 変更ファイル数を確認して安全にロールバック
+- **Status Bar Icon**: Shows mount status and active drive progress.
+- **Timeline View**: Scrub through snapshot history with an intuitive visual slider.
+- **Quick Actions**:
+  - 📸 **Snapshot**: 1-click immediate snapshot
+  - 🔄 **Compact**: Optimize and shrink drive image size
+  - ⚙️ **Retention**: Adjust maximum count / days policy and prune on demand
+  - ⚙️ **Startup**: Toggle launch at login and drive auto-mount from the footer settings
+  - ⏱️ **Restore**: Safely rollback with a visual diff confirmation modal
 
 ---
 
-## 🏛️ アーキテクチャ (Architecture)
+## 🏛️ Architecture
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -162,8 +168,10 @@ open ~/Applications/ClayFS.app
 │                   ClayFSCore Framework                 │
 │  - StorageManager (APFS Sparsebundle / hdiutil / CoW)  │
 │  - SnapshotManager (clonefile(2) / Diff / Prune)       │
-│  - TimelineDB (SQLite3 WAL for instant metadata query) │
+│  - TimelineDB (SQLite3 WAL mode with busy_timeout)     │
 │  - FSEventsMonitor (Low-overhead kernel event watch)   │
+│  - DriveRegistry (flock cross-process atomic registry) │
+│  - LaunchAtLogin (SMAppService & LaunchAgent)          │
 │  - AppLocale (System language detection / 8 langs)     │
 ├────────────────────────────────────────────────────────┤
 │                   macOS Kernel / APFS                  │
@@ -171,15 +179,16 @@ open ~/Applications/ClayFS.app
 └────────────────────────────────────────────────────────┘
 ```
 
-- **APFS Sparsebundle**: 容量上限を指定しつつ、実使用分のみディスクを消費する動的バンドル形式。
-- **SQLite3 WAL モード**: スナップショットのメタデータ、メッセージ、タイムスタンプを高速にクエリ・管理。
-- **Darwin FSEvents API**: カーネルレベルの低負荷なファイル変更通知を活用した自動監視。
+- **APFS Sparsebundle**: Dynamic virtual disk format that grows on demand and consumes space only as files are written.
+- **SQLite3 WAL Mode**: High concurrency write-ahead logging with `sqlite3_busy_timeout` preventing locks between GUI and CLI.
+- **Darwin FSEvents API**: Low-power, kernel-level file modification notifications.
+- **Cross-Process `flock(2)`**: Reliable concurrency control between CLI commands and the background menu bar application.
 
 ---
 
-## 🧪 テストの実行 (Testing)
+## 🧪 Testing
 
-ユニットテストおよび統合テスト（仮想ドライブの作成、マウント、スナップショット、復元、差分、回収のエンドツーエンドテスト）を実行します：
+Run comprehensive unit and integration tests (virtual drive creation, mounting, snapshotting, diffing, restoration rollback, security traversal checks, corruption recovery):
 
 ```bash
 swift test
@@ -187,6 +196,6 @@ swift test
 
 ---
 
-## 📄 ライセンス (License)
+## 📄 License
 
 MIT License
