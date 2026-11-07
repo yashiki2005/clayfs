@@ -9,7 +9,7 @@ struct ClayFSCLIApp {
         let args = Array(CommandLine.arguments.dropFirst())
 
         guard let command = args.first else {
-            printHelp()
+            printHelp(locale: CLILocale.detect(args: []))
             exit(0)
         }
 
@@ -40,13 +40,19 @@ struct ClayFSCLIApp {
             case "--version", "-v":
                 print("clayfs version \(version)")
             case "help", "--help", "-h":
-                printHelp()
+                let locale = CLILocale.detect(args: cmdArgs)
+                printHelp(locale: locale)
             default:
-                print("エラー: 不明なコマンド '\(command)' です。'clayfs help' で使い方を表示します。")
+                let locale = CLILocale.detect(args: args)
+                if locale == .japanese {
+                    print("エラー: 不明なコマンド '\(command)' です。'clayfs help' で使い方を表示します。")
+                } else {
+                    print("Error: Unknown command '\(command)'. Run 'clayfs help' for usage.")
+                }
                 exit(1)
             }
         } catch {
-            print("エラー: \(error.localizedDescription)")
+            print("Error: \(error.localizedDescription)")
             exit(1)
         }
     }
@@ -351,22 +357,78 @@ struct ClayFSCLIApp {
         return formatter.string(fromByteCount: bytes)
     }
 
-    static func printHelp() {
-        print("""
-        clayfs - 次世代 APFS 仮想ドライブ ＆ タイムマシーン (v\(version))
+    enum CLILocale: Equatable {
+        case japanese
+        case english
 
-        使い方:
-          clayfs create <NAME> [--size SIZE] [--path PATH]  新しい仮想ドライブを作成
-          clayfs mount [NAME]                               ドライブを Finder にマウント
-          clayfs unmount [NAME]                             ドライブを安全に解除
-          clayfs status                                     登録ドライブとマウント状態一覧
-          clayfs snapshot [-m MSG]                          即座にスナップショットを作成
-          clayfs timeline                                   過去のスナップショット履歴一覧
-          clayfs diff [SNAPSHOT_ID]                         変更差分を表示
-          clayfs restore <SNAPSHOT_ID> [PATH]               指定スナップショットの状態に復元
-          clayfs compact [NAME]                             未使用バンドルブロックを回収
-          clayfs watch [NAME]                               バックグラウンド自動スナップショット
-          clayfs help                                       ヘルプ表示
-        """)
+        static func detect(args: [String]) -> CLILocale {
+            // 1. Explicit CLI arguments
+            if args.contains("--ja") || args.contains("-ja") || args.contains("ja") { return .japanese }
+            if args.contains("--en") || args.contains("-en") || args.contains("en") { return .english }
+            if let idx = args.firstIndex(of: "--lang"), idx + 1 < args.count {
+                let val = args[idx + 1].lowercased()
+                if val.starts(with: "ja") { return .japanese }
+                if val.starts(with: "en") { return .english }
+            }
+            for arg in args {
+                if arg.starts(with: "--lang=") {
+                    let val = String(arg.dropFirst(7)).lowercased()
+                    if val.starts(with: "ja") { return .japanese }
+                    if val.starts(with: "en") { return .english }
+                }
+            }
+
+            // 2. Environment variables (LC_ALL, LC_MESSAGES, LANG)
+            let env = ProcessInfo.processInfo.environment
+            let envLang = env["LC_ALL"] ?? env["LC_MESSAGES"] ?? env["LANG"] ?? ""
+            let lower = envLang.lowercased()
+            if lower.starts(with: "ja") { return .japanese }
+            if lower.starts(with: "en") || envLang == "C" || envLang == "POSIX" { return .english }
+
+            // 3. System Preferred Languages
+            if let preferred = Locale.preferredLanguages.first?.lowercased() {
+                if preferred.starts(with: "ja") { return .japanese }
+            }
+
+            return .english
+        }
+    }
+
+    static func printHelp(locale: CLILocale = .japanese) {
+        if locale == .japanese {
+            print("""
+            clayfs - 次世代 APFS 仮想ドライブ ＆ タイムマシン (v\(version))
+
+            使い方:
+              clayfs create <NAME> [--size SIZE] [--path PATH]  新しい仮想ドライブを作成
+              clayfs mount [NAME]                               ドライブを Finder にマウント
+              clayfs unmount [NAME]                             ドライブを安全に解除
+              clayfs status                                     登録ドライブとマウント状態一覧
+              clayfs snapshot [NAME] [-m MSG]                   即座にスナップショットを作成
+              clayfs timeline [NAME]                            過去のスナップショット履歴一覧
+              clayfs diff [NAME] [SNAPSHOT_ID]                  変更差分を表示
+              clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        指定スナップショットの状態に復元
+              clayfs compact [NAME]                             未使用バンドルブロックを回収
+              clayfs watch [NAME]                               バックグラウンド自動スナップショット
+              clayfs help [--lang <en|ja>]                      ヘルプ表示 (日本語 / 英語)
+            """)
+        } else {
+            print("""
+            clayfs - Next-generation APFS virtual drive & instant time machine (v\(version))
+
+            Usage:
+              clayfs create <NAME> [--size SIZE] [--path PATH]  Create a new virtual drive
+              clayfs mount [NAME]                               Mount drive in Finder
+              clayfs unmount [NAME]                             Safely unmount drive
+              clayfs status                                     List registered drives & mount states
+              clayfs snapshot [NAME] [-m MSG]                   Take an instant snapshot
+              clayfs timeline [NAME]                            Show snapshot history timeline
+              clayfs diff [NAME] [SNAPSHOT_ID]                  Display file change diffs
+              clayfs restore [NAME] <SNAPSHOT_ID> [PATH]        Restore to a specific snapshot state
+              clayfs compact [NAME]                             Reclaim unused sparse bundle blocks
+              clayfs watch [NAME]                               Run background auto-snapshot monitor
+              clayfs help [--lang <en|ja>]                      Show help in English or Japanese
+            """)
+        }
     }
 }
