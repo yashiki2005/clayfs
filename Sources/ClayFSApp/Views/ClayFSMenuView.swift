@@ -17,6 +17,9 @@ public struct ClayFSMenuView: View {
     private var selectedScrubberSnapshot: Snapshot? {
         guard !appState.snapshots.isEmpty else { return nil }
         let count = appState.snapshots.count
+        if count <= 1 {
+            return appState.snapshots.first
+        }
         let pos = min(max(0, Int(scrubberIndex.rounded())), count - 1)
         let targetIdx = count - 1 - pos
         if targetIdx >= 0 && targetIdx < count {
@@ -347,32 +350,34 @@ public struct ClayFSMenuView: View {
                         } else {
                             // Timeline Scrubber Bar
                             VStack(spacing: 4) {
-                                HStack(spacing: 6) {
-                                    HStack(spacing: 2) {
-                                        Image(systemName: "clock.arrow.circlepath")
-                                            .font(.system(size: 8))
-                                        Text(L10n.past)
-                                            .font(.system(size: 8, weight: .semibold))
-                                    }
-                                    .foregroundColor(.secondary)
+                                if appState.snapshots.count > 1 {
+                                    HStack(spacing: 6) {
+                                        HStack(spacing: 2) {
+                                            Image(systemName: "clock.arrow.circlepath")
+                                                .font(.system(size: 8))
+                                            Text(L10n.past)
+                                                .font(.system(size: 8, weight: .semibold))
+                                        }
+                                        .foregroundColor(.secondary)
 
-                                    Slider(
-                                        value: $scrubberIndex,
-                                        in: 0...Double(max(0, appState.snapshots.count - 1)),
-                                        step: 1.0
-                                    )
-                                    .controlSize(.mini)
-                                    .accentColor(.accentColor)
+                                        Slider(
+                                            value: $scrubberIndex,
+                                            in: 0...Double(appState.snapshots.count - 1),
+                                            step: 1.0
+                                        )
+                                        .controlSize(.mini)
+                                        .accentColor(.accentColor)
 
-                                    HStack(spacing: 2) {
-                                        Text(L10n.latest)
-                                            .font(.system(size: 8, weight: .semibold))
-                                        Image(systemName: "sparkles")
-                                            .font(.system(size: 8))
+                                        HStack(spacing: 2) {
+                                            Text(L10n.latest)
+                                                .font(.system(size: 8, weight: .semibold))
+                                            Image(systemName: "sparkles")
+                                                .font(.system(size: 8))
+                                        }
+                                        .foregroundColor(scrubberIndex >= Double(appState.snapshots.count - 1) ? .accentColor : .secondary)
                                     }
-                                    .foregroundColor(scrubberIndex >= Double(appState.snapshots.count - 1) ? .accentColor : .secondary)
+                                    .padding(.horizontal, 12)
                                 }
-                                .padding(.horizontal, 12)
 
                                 // Selected Snapshot Preview & Quick Restore Card
                                 if let selectedSnap = selectedScrubberSnapshot {
