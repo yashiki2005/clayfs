@@ -70,39 +70,87 @@ public final class ClayFSAppState: ObservableObject {
         }
     }
 
-    public func refreshDrives() {
-        var list = DriveRegistry.shared.loadDrives(cleanMissing: true)
-        for i in 0..<list.count {
-            if let mount = StorageManager.shared.findMountPoint(for: list[i].bundleURL) {
-                list[i].isMounted = true
-                list[i].mountURL = mount
-                if let values = try? mount.resourceValues(forKeys: [.volumeAvailableCapacityKey, .volumeTotalCapacityKey]) {
-                    list[i].freeBytes = Int64(values.volumeAvailableCapacity ?? 0)
-                    list[i].totalBytes = Int64(values.volumeTotalCapacity ?? 0)
-                }
-            } else {
-                list[i].isMounted = false
-                list[i].mountURL = nil
-            }
-        }
-        self.drives = list
+    private var isScanning: Bool = false
 
-        if selectedDrive == nil || !list.contains(where: { $0.name == selectedDrive?.name }) {
-            if let mounted = list.first(where: { $0.isMounted }) {
-                self.selectedDrive = mounted
-            } else {
-                self.selectedDrive = list.first
+    private struct ScanResult: Sendable {
+        let drives: [VolumeInfo]
+        let selectedMountURL: URL?
+        let snapshots: [Snapshot]
+    }
+
+    public func refreshDrives() {
+        guard !isScanning else { return }
+        isScanning = true
+
+        let currentSelectedName = selectedDrive?.name
+
+        Task.detached(priority: .utility) { [weak self] in
+            var list = DriveRegistry.shared.loadDrives(cleanMissing: true)
+            var currentMountURL: URL?
+
+            for i in 0..<list.count {
+                if let mount = StorageManager.shared.findMountPoint(for: list[i].bundleURL) {
+                    list[i].isMounted = true
+                    list[i].mountURL = mount
+                    if let values = try? mount.resourceValues(forKeys: [.volumeAvailableCapacityKey, .volumeTotalCapacityKey]) {
+                        list[i].freeBytes = Int64(values.volumeAvailableCapacity ?? 0)
+                        list[i].totalBytes = Int64(values.volumeTotalCapacity ?? 0)
+                    }
+                } else {
+                    list[i].isMounted = false
+                    list[i].mountURL = nil
+                }
             }
-        } else if let sel = selectedDrive, let updated = list.first(where: { $0.name == sel.name }) {
-            self.selectedDrive = updated
+
+            let selDrive = (currentSelectedName != nil ? list.first(where: { $0.name == currentSelectedName }) : nil)
+                ?? list.first(where: { $0.isMounted })
+                ?? list.first
+
+            if let sel = selDrive, sel.isMounted, let m = sel.mountURL {
+                currentMountURL = m
+            }
+
+            var snaps: [Snapshot] = []
+            if let m = currentMountURL {
+                snaps = (try? SnapshotManager.shared.listSnapshots(volumeMountURL: m, limit: 30)) ?? []
+            }
+
+            let result = ScanResult(drives: list, selectedMountURL: currentMountURL, snapshots: snaps)
+
+            await MainActor.run {
+                guard let self = self else { return }
+                self.isScanning = false
+                self.drives = result.drives
+
+                if self.selectedDrive == nil || !result.drives.contains(where: { $0.name == self.selectedDrive?.name }) {
+                    if let mounted = result.drives.first(where: { $0.isMounted }) {
+                        self.selectedDrive = mounted
+                    } else {
+                        self.selectedDrive = result.drives.first
+                    }
+                } else if let sel = self.selectedDrive, let updated = result.drives.first(where: { $0.name == sel.name }) {
+                    self.selectedDrive = updated
+                }
+
+                self.activeMountURL = result.selectedMountURL
+                self.isMounted = result.selectedMountURL != nil
+                self.snapshots = result.snapshots
+
+                if let mount = result.selectedMountURL, let drive = self.selectedDrive, drive.autoSnapshot {
+                    if self.monitor == nil || self.monitor?.watchURL != mount {
+                        self.startWatching(mountURL: mount, drive: drive)
+                    }
+                } else {
+                    self.stopWatching()
+                }
+            }
         }
-        checkMountStatus()
     }
 
     public func selectDrive(_ drive: VolumeInfo) {
         self.selectedDrive = drive
         self.statusMessage = nil
-        checkMountStatus()
+        refreshDrives()
     }
 
     public func removeDrive(_ drive: VolumeInfo) {
@@ -110,30 +158,12 @@ public final class ClayFSAppState: ObservableObject {
         refreshDrives()
     }
 
-    public func checkMountStatus() {
-        guard let drive = selectedDrive else {
-            self.activeMountURL = nil
-            self.isMounted = false
-            self.snapshots = []
-            return
-        }
-
-        if let mount = StorageManager.shared.findMountPoint(for: drive.bundleURL) {
-            self.activeMountURL = mount
-            self.isMounted = true
-            loadSnapshots(mountURL: mount)
-        } else {
-            self.activeMountURL = nil
-            self.isMounted = false
-            self.snapshots = []
-        }
-    }
-
     public func loadSnapshots(mountURL: URL) {
-        do {
-            self.snapshots = try SnapshotManager.shared.listSnapshots(volumeMountURL: mountURL, limit: 30)
-        } catch {
-            self.snapshots = []
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let snaps = (try? SnapshotManager.shared.listSnapshots(volumeMountURL: mountURL, limit: 30)) ?? []
+            await MainActor.run {
+                self?.snapshots = snaps
+            }
         }
     }
 
@@ -153,7 +183,7 @@ public final class ClayFSAppState: ObservableObject {
                     self.refreshDrives()
                     if let m = info.mountURL {
                         self.loadSnapshots(mountURL: m)
-                        self.startWatching(mountURL: m)
+                        self.startWatching(mountURL: m, drive: drive)
                     }
                 }
             } catch {
@@ -329,15 +359,20 @@ public final class ClayFSAppState: ObservableObject {
             }
     }
 
-    private func startWatching(mountURL: URL) {
+    private func startWatching(mountURL: URL, drive: VolumeInfo) {
         stopWatching()
+        let policy = drive.retentionPolicy
         monitor = FSEventsMonitor(watchURL: mountURL, debounceSeconds: 5.0) { [weak self] in
             Task.detached(priority: .utility) { [weak self] in
                 guard let self = self else { return }
                 do {
+                    let diffs = try SnapshotManager.shared.diff(volumeMountURL: mountURL)
+                    guard !diffs.isEmpty else { return }
+                    let message = L10n.autoSaveMessage(diffs.count)
                     _ = try SnapshotManager.shared.createSnapshot(
                         volumeMountURL: mountURL,
-                        message: L10n.autoSaveMessage(1)
+                        message: message,
+                        policy: policy
                     )
                     await MainActor.run {
                         self.loadSnapshots(mountURL: mountURL)

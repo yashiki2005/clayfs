@@ -200,8 +200,20 @@ public final class SnapshotManager: Sendable {
             )
         }
 
-        // Take a safety snapshot first if volume has content
-        _ = try? createSnapshot(volumeMountURL: volumeMountURL, message: "Safety snapshot before restoring to \(snapshotID)")
+        // Take a safety snapshot first if volume has user content
+        do {
+            _ = try createSnapshot(volumeMountURL: volumeMountURL, message: "Safety snapshot before restoring to \(snapshotID)")
+        } catch {
+            let hasUserFiles = ((try? FileManager.default.contentsOfDirectory(at: volumeMountURL, includingPropertiesForKeys: nil, options: [])) ?? [])
+                .contains { !Self.ignoredRootNames.contains($0.lastPathComponent) }
+            if hasUserFiles {
+                throw NSError(
+                    domain: "ClayFSSnapshot",
+                    code: 26,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to create safety snapshot before restore: \(error.localizedDescription)"]
+                )
+            }
+        }
 
         if let subpath = subpath, !subpath.isEmpty {
             let sourceItem = snapshotSourceURL.appendingPathComponent(subpath)
@@ -215,26 +227,38 @@ public final class SnapshotManager: Sendable {
                 )
             }
 
+            let destBackup = volumeMountURL.appendingPathComponent(".clayfs/temp_subpath_\(UUID().uuidString)")
+            var movedToBackup = false
             if FileManager.default.fileExists(atPath: destItem.path) {
-                try FileManager.default.removeItem(at: destItem)
+                try? FileManager.default.createDirectory(at: destBackup.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: destItem, to: destBackup)
+                movedToBackup = true
             }
             try FileManager.default.createDirectory(at: destItem.deletingLastPathComponent(), withIntermediateDirectories: true)
 
             let rc = clonefile(sourceItem.path, destItem.path, 0)
-            guard rc == 0 else {
+            if rc != 0 {
                 let err = errno
+                // Rollback destItem from backup
+                if movedToBackup {
+                    try? FileManager.default.removeItem(at: destItem)
+                    try? FileManager.default.moveItem(at: destBackup, to: destItem)
+                }
                 throw NSError(
                     domain: "ClayFSSnapshot",
                     code: 24,
                     userInfo: [NSLocalizedDescriptionKey: "APFS clonefile restore failed: \(String(cString: strerror(err)))"]
                 )
             }
+            if movedToBackup {
+                try? FileManager.default.removeItem(at: destBackup)
+            }
         } else {
-            // Full restore:
+            // Full restore with atomic rollback:
             let tempBackup = volumeMountURL.appendingPathComponent(".clayfs/temp_restore_\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: tempBackup, withIntermediateDirectories: true)
 
-            // Move current top-level user items into tempBackup
+            var movedItems: [String] = []
             let currentItems = (try? FileManager.default.contentsOfDirectory(at: volumeMountURL, includingPropertiesForKeys: nil, options: [])) ?? []
             for item in currentItems {
                 let name = item.lastPathComponent
@@ -242,25 +266,51 @@ public final class SnapshotManager: Sendable {
                     continue
                 }
                 let targetURL = tempBackup.appendingPathComponent(name)
-                try? FileManager.default.moveItem(at: item, to: targetURL)
+                do {
+                    try FileManager.default.moveItem(at: item, to: targetURL)
+                    movedItems.append(name)
+                } catch {
+                    // Rollback already moved items
+                    for movedName in movedItems {
+                        let from = tempBackup.appendingPathComponent(movedName)
+                        let to = volumeMountURL.appendingPathComponent(movedName)
+                        try? FileManager.default.moveItem(at: from, to: to)
+                    }
+                    try? FileManager.default.removeItem(at: tempBackup)
+                    throw error
+                }
             }
 
             // Clone all items from snapshotSourceURL to volumeMountURL
+            var clonedItems: [String] = []
             let snapItems = (try? FileManager.default.contentsOfDirectory(at: snapshotSourceURL, includingPropertiesForKeys: nil, options: [])) ?? []
             for item in snapItems {
                 let destItem = volumeMountURL.appendingPathComponent(item.lastPathComponent)
                 let rc = clonefile(item.path, destItem.path, 0)
                 if rc != 0 {
                     let err = errno
+                    // Rollback: delete cloned items
+                    for clonedName in clonedItems {
+                        let toDelete = volumeMountURL.appendingPathComponent(clonedName)
+                        try? FileManager.default.removeItem(at: toDelete)
+                    }
+                    // Move original items back from tempBackup
+                    for movedName in movedItems {
+                        let from = tempBackup.appendingPathComponent(movedName)
+                        let to = volumeMountURL.appendingPathComponent(movedName)
+                        try? FileManager.default.moveItem(at: from, to: to)
+                    }
+                    try? FileManager.default.removeItem(at: tempBackup)
                     throw NSError(
                         domain: "ClayFSSnapshot",
                         code: 25,
                         userInfo: [NSLocalizedDescriptionKey: "APFS clonefile restore failed for \(item.lastPathComponent): \(String(cString: strerror(err)))"]
                     )
                 }
+                clonedItems.append(item.lastPathComponent)
             }
 
-            // Clean up old temporary directory in background so restore finishes instantly
+            // Clean up old temporary directory in background
             DispatchQueue.global(qos: .utility).async {
                 try? FileManager.default.removeItem(at: tempBackup)
             }
@@ -381,10 +431,13 @@ public final class SnapshotManager: Sendable {
         }
 
         let rootPath = rootURL.path
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
         var map: [String: FileMeta] = [:]
 
         for case let fileURL as URL in enumerator {
-            let rel = fileURL.path.replacingOccurrences(of: rootPath + "/", with: "")
+            let fullPath = fileURL.path
+            guard fullPath.hasPrefix(prefix) else { continue }
+            let rel = String(fullPath.dropFirst(prefix.count))
             let rootComp = rel.split(separator: "/").first.map(String.init) ?? rel
             if Self.ignoredRootNames.contains(rootComp) {
                 continue

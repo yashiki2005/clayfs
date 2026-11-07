@@ -39,6 +39,64 @@ import Foundation
     #expect(list.first?.fileCount == 42)
 }
 
+@Test func testTimelineDBStringBindingLifetime() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_binding_test_\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let dbURL = tempDir.appendingPathComponent("timeline.sqlite3")
+    let db = try TimelineDB(fileURL: dbURL)
+
+    // Insert 50 snapshots with temporary dynamically formatted strings
+    for i in 1...50 {
+        let dynamicId = "snap_\(UUID().uuidString.prefix(8))_\(i)"
+        let dynamicMsg = "Dynamic commit message with unicode: 🚀 リファクタリング #\(i)"
+        let dynamicAuthor = "Author_\(UUID().uuidString.prefix(4))"
+        let snap = Snapshot(id: dynamicId, message: dynamicMsg, author: dynamicAuthor, fileCount: i, totalBytes: Int64(i * 100))
+        try db.insertSnapshot(snap)
+    }
+
+    let all = db.getSnapshots(limit: 100)
+    #expect(all.count == 50)
+    for s in all {
+        #expect(s.message.contains("🚀 リファクタリング"))
+        #expect(!s.id.isEmpty)
+    }
+}
+
+@Test func testDriveRegistryCorruptionProtection() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_corrupt_test_\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let configURL = tempDir.appendingPathComponent("drives.json")
+    let registry = DriveRegistry(configURL: configURL)
+
+    // 1. Register a valid drive
+    let drive1 = VolumeInfo(name: "ValidDrive", bundleURL: tempDir.appendingPathComponent("Valid.sparsebundle"))
+    try registry.registerDrive(drive1)
+    #expect(registry.loadDrives().count == 1)
+
+    // 2. Corrupt the file with invalid JSON content
+    let invalidJSON = "{ this is completely corrupted json !!! }}}"
+    try invalidJSON.write(to: configURL, atomically: true, encoding: .utf8)
+
+    // 3. Attempting to register another drive should throw an error and back up corrupted file
+    let drive2 = VolumeInfo(name: "AnotherDrive", bundleURL: tempDir.appendingPathComponent("Another.sparsebundle"))
+    var didThrow = false
+    do {
+        try registry.registerDrive(drive2)
+    } catch {
+        didThrow = true
+    }
+    #expect(didThrow)
+
+    // Verify backup file exists
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: tempDir.path)) ?? []
+    let hasCorruptedBackup = files.contains { $0.contains("drives.json.corrupted") }
+    #expect(hasCorruptedBackup)
+}
+
 @Test func testEndToEndVirtualDriveWorkflow() throws {
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_e2e_\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)

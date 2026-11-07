@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # clayfsctl: 作業ディレクトリ (既定 ~/src) の実体をディスクイメージに入れて使うための管理コマンド (macOS)。
 #            使い方は git に合わせてある。イメージの中身は 2 つ:
 #              work/   作業ツリー。CLAYFS_DIR (~/src) は、ここへのシンボリックリンク
@@ -374,14 +374,14 @@ cmd_scrub() {
   offline=0
   do_fsck=0
   fsck_repair=0
-  tool_args=""
+  tool_args=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --offline) offline=1; shift ;;
       --fsck) do_fsck=1; shift ;;
       --repair) fsck_repair=1; do_fsck=1; shift ;;
-      *) tool_args="$tool_args \"$1\""; shift ;;
+      *) tool_args+=("$1"); shift ;;
     esac
   done
 
@@ -400,7 +400,7 @@ cmd_scrub() {
         fsck_apfs -n -l "/dev/r$dev" 2>&1 | grep -v "warning:" || true
       fi
     fi
-    eval "tool scrub $tool_args"
+    tool scrub "${tool_args[@]}"
     return $?
   fi
 
@@ -450,7 +450,7 @@ cmd_scrub() {
   }
 
   echo "オフライン検査を実行中 ($scrub_tmp)..."
-  eval "\"$CLAYFS_TOOL\" -s \"$scrub_tmp/store\" -C \"$scrub_tmp/work\" scrub $tool_args"
+  "$CLAYFS_TOOL" -s "$scrub_tmp/store" -C "$scrub_tmp/work" scrub "${tool_args[@]}"
   rc=$?
 
   cleanup_scrub

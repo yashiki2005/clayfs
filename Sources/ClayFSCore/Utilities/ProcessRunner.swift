@@ -27,10 +27,31 @@ public enum ProcessRunner {
         process.standardError = errPipe
 
         try process.run()
-        process.waitUntilExit()
 
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        final class PipeDataBox: @unchecked Sendable {
+            var data = Data()
+        }
+        let outBox = PipeDataBox()
+        let errBox = PipeDataBox()
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            outBox.data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            errBox.data = errPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        process.waitUntilExit()
+        group.wait()
+
+        let outData = outBox.data
+        let errData = errBox.data
 
         let stdout = String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let stderr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

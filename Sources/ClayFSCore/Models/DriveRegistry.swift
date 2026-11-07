@@ -15,37 +15,52 @@ public final class DriveRegistry: @unchecked Sendable {
         }
     }
 
-    public func loadDrives(cleanMissing: Bool = false) -> [VolumeInfo] {
+    private func withFileLock<T>(_ work: () throws -> T) rethrows -> T {
         lock.lock()
         defer { lock.unlock() }
 
+        let lockURL = configURL.deletingLastPathComponent().appendingPathComponent("drives.lock")
+        try? FileManager.default.createDirectory(at: lockURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o600)
+        if fd >= 0 {
+            flock(fd, LOCK_EX)
+            defer {
+                flock(fd, LOCK_UN)
+                close(fd)
+            }
+            return try work()
+        }
+        return try work()
+    }
+
+    private func loadDrivesInternal(cleanMissing: Bool) throws -> [VolumeInfo] {
         guard FileManager.default.fileExists(atPath: configURL.path) else {
             return []
         }
+        let data = try Data(contentsOf: configURL)
+        guard !data.isEmpty else { return [] }
         do {
-            let data = try Data(contentsOf: configURL)
             var drives = try JSONDecoder().decode([VolumeInfo].self, from: data)
             if cleanMissing {
                 let existing = drives.filter { FileManager.default.fileExists(atPath: $0.bundleURL.path) }
                 if existing.count != drives.count {
                     drives = existing
-                    let encoder = JSONEncoder()
-                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                    if let savedData = try? encoder.encode(existing) {
-                        try? savedData.write(to: configURL, options: .atomic)
-                    }
+                    try saveDrivesInternal(existing)
                 }
             }
             return drives
         } catch {
-            return []
+            let backupURL = configURL.appendingPathExtension("corrupted.\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.copyItem(at: configURL, to: backupURL)
+            throw NSError(
+                domain: "ClayFSDriveRegistry",
+                code: 101,
+                userInfo: [NSLocalizedDescriptionKey: "drives.json is corrupted (backed up to \(backupURL.lastPathComponent)): \(error.localizedDescription)"]
+            )
         }
     }
 
-    public func saveDrives(_ drives: [VolumeInfo]) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
+    private func saveDrivesInternal(_ drives: [VolumeInfo]) throws {
         let dir = configURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
@@ -54,20 +69,36 @@ public final class DriveRegistry: @unchecked Sendable {
         try data.write(to: configURL, options: .atomic)
     }
 
-    public func registerDrive(_ drive: VolumeInfo) throws {
-        var drives = loadDrives()
-        if let idx = drives.firstIndex(where: { $0.name == drive.name }) {
-            drives[idx] = drive
-        } else {
-            drives.append(drive)
+    public func loadDrives(cleanMissing: Bool = false) -> [VolumeInfo] {
+        withFileLock {
+            (try? loadDrivesInternal(cleanMissing: cleanMissing)) ?? []
         }
-        try saveDrives(drives)
+    }
+
+    public func saveDrives(_ drives: [VolumeInfo]) throws {
+        try withFileLock {
+            try saveDrivesInternal(drives)
+        }
+    }
+
+    public func registerDrive(_ drive: VolumeInfo) throws {
+        try withFileLock {
+            var drives = try loadDrivesInternal(cleanMissing: false)
+            if let idx = drives.firstIndex(where: { $0.name == drive.name }) {
+                drives[idx] = drive
+            } else {
+                drives.append(drive)
+            }
+            try saveDrivesInternal(drives)
+        }
     }
 
     public func unregisterDrive(named name: String) throws {
-        var drives = loadDrives()
-        drives.removeAll(where: { $0.name == name })
-        try saveDrives(drives)
+        try withFileLock {
+            var drives = try loadDrivesInternal(cleanMissing: false)
+            drives.removeAll(where: { $0.name == name })
+            try saveDrivesInternal(drives)
+        }
     }
 
     public func findDrive(named name: String) -> VolumeInfo? {

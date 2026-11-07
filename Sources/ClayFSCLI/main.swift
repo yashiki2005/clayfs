@@ -280,15 +280,17 @@ struct ClayFSCLIApp {
         }
 
         let drives = DriveRegistry.shared.loadDrives()
-        let nonOptions = args.filter { !$0.starts(with: "-") }
-        let remaining = nonOptions.filter { arg in !drives.contains(where: { $0.name == arg }) }
+        var nonOptions = args.filter { !$0.starts(with: "-") }
+        if let first = nonOptions.first, drives.contains(where: { $0.name == first }) || first.hasPrefix("/Volumes/") {
+            nonOptions.removeFirst()
+        }
 
-        guard let snapshotID = remaining.first else {
+        guard let snapshotID = nonOptions.first else {
             print("使い方: clayfs restore [DRIVE_NAME] <SNAPSHOT_ID> [FILE_PATH]")
             exit(1)
         }
 
-        let subpath = remaining.count > 1 ? remaining[1] : nil
+        let subpath = nonOptions.count > 1 ? nonOptions[1] : nil
         if let subpath = subpath {
             print("復元中: [\(snapshotID)] から '\(subpath)' を復元します...")
         } else {
@@ -321,21 +323,43 @@ struct ClayFSCLIApp {
         var maxSnapshots: Int? = 50
         var maxAgeDays: Int? = 30
 
-        for (i, arg) in args.enumerated() {
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
             if (arg == "--keep" || arg == "--count" || arg == "-k") && i + 1 < args.count {
-                maxSnapshots = Int(args[i + 1])
+                guard let val = Int(args[i + 1]), val >= 0 else {
+                    print("エラー: --keep には 0 以上の整数を指定してください。'\(args[i + 1])'")
+                    exit(1)
+                }
+                maxSnapshots = val
+                i += 1
+            } else if arg.starts(with: "--keep=") {
+                let raw = String(arg.dropFirst(7))
+                guard let val = Int(raw), val >= 0 else {
+                    print("エラー: --keep には 0 以上の整数を指定してください。'\(raw)'")
+                    exit(1)
+                }
+                maxSnapshots = val
+            } else if (arg == "--days" || arg == "-d") && i + 1 < args.count {
+                guard let val = Int(args[i + 1]), val >= 0 else {
+                    print("エラー: --days には 0 以上の整数を指定してください。'\(args[i + 1])'")
+                    exit(1)
+                }
+                maxAgeDays = val
+                i += 1
+            } else if arg.starts(with: "--days=") {
+                let raw = String(arg.dropFirst(7))
+                guard let val = Int(raw), val >= 0 else {
+                    print("エラー: --days には 0 以上の整数を指定してください。'\(raw)'")
+                    exit(1)
+                }
+                maxAgeDays = val
+            } else if arg == "--unlimited-count" {
+                maxSnapshots = nil
+            } else if arg == "--unlimited-days" {
+                maxAgeDays = nil
             }
-            if arg.starts(with: "--keep=") {
-                maxSnapshots = Int(arg.dropFirst(7))
-            }
-            if (arg == "--days" || arg == "-d") && i + 1 < args.count {
-                maxAgeDays = Int(args[i + 1])
-            }
-            if arg.starts(with: "--days=") {
-                maxAgeDays = Int(arg.dropFirst(7))
-            }
-            if arg == "--unlimited-count" { maxSnapshots = nil }
-            if arg == "--unlimited-days" { maxAgeDays = nil }
+            i += 1
         }
 
         let policy = RetentionPolicy(maxSnapshots: maxSnapshots, maxAgeDays: maxAgeDays)
@@ -419,6 +443,15 @@ struct ClayFSCLIApp {
             exit(1)
         }
 
+        let drives = DriveRegistry.shared.loadDrives()
+        let targetDrive = drives.first(where: {
+            if let m = StorageManager.shared.findMountPoint(for: $0.bundleURL) {
+                return m.standardizedFileURL == mountURL.standardizedFileURL
+            }
+            return false
+        })
+        let policy = targetDrive?.retentionPolicy ?? .default
+
         print("=== ClayFS 自動監視デーモン ===")
         print("監視フォルダ: \(mountURL.path)")
         print("変更後 5 秒間静穏が続くと、自動スナップショットを作成します。(Ctrl+C で停止)")
@@ -429,7 +462,8 @@ struct ClayFSCLIApp {
                 guard !diffs.isEmpty else { return }
                 let snap = try SnapshotManager.shared.createSnapshot(
                     volumeMountURL: mountURL,
-                    message: "Auto snapshot (\(diffs.count) files modified)"
+                    message: "Auto snapshot (\(diffs.count) files modified)",
+                    policy: policy
                 )
                 print("[\(snap.id)] 自動スナップショット作成: \(snap.message)")
             } catch {

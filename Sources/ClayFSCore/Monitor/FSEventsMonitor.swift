@@ -2,7 +2,7 @@ import Foundation
 import CoreServices
 
 public final class FSEventsMonitor: @unchecked Sendable {
-    private let watchURL: URL
+    public let watchURL: URL
     private let debounceSeconds: TimeInterval
     private let onDebouncedChange: @Sendable () -> Void
 
@@ -10,6 +10,16 @@ public final class FSEventsMonitor: @unchecked Sendable {
     private var debounceTimer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "top.yashiki.clayfs.fsevents", qos: .utility)
     private var isRunning = false
+
+    private static func isIgnoredPath(_ path: String) -> Bool {
+        let components = path.split(separator: "/")
+        for comp in components {
+            if comp == ".clayfs" || comp == ".fseventsd" || comp == ".Trashes" || comp == ".Spotlight-V100" || comp == ".TemporaryItems" {
+                return true
+            }
+        }
+        return false
+    }
 
     public init(
         watchURL: URL,
@@ -26,71 +36,70 @@ public final class FSEventsMonitor: @unchecked Sendable {
     }
 
     public func start() {
-        guard !isRunning else { return }
-        isRunning = true
+        queue.sync {
+            guard !isRunning else { return }
+            isRunning = true
 
-        var context = FSEventStreamContext(
-            version: 0,
-            info: Unmanaged.passUnretained(self).toOpaque(),
-            retain: nil,
-            release: nil,
-            copyDescription: nil
-        )
+            var context = FSEventStreamContext(
+                version: 0,
+                info: Unmanaged.passUnretained(self).toOpaque(),
+                retain: nil,
+                release: nil,
+                copyDescription: nil
+            )
 
-        let pathsToWatch = [watchURL.path] as CFArray
+            let pathsToWatch = [watchURL.path] as CFArray
 
-        let flags: FSEventStreamCreateFlags = UInt32(
-            kFSEventStreamCreateFlagUseCFTypes |
-            kFSEventStreamCreateFlagFileEvents |
-            kFSEventStreamCreateFlagNoDefer
-        )
+            let flags: FSEventStreamCreateFlags = UInt32(
+                kFSEventStreamCreateFlagUseCFTypes |
+                kFSEventStreamCreateFlagFileEvents |
+                kFSEventStreamCreateFlagNoDefer
+            )
 
-        streamRef = FSEventStreamCreate(
-            kCFAllocatorDefault,
-            { (_, clientCallBackInfo, numEvents, eventPaths, _, _) in
-                guard let info = clientCallBackInfo else { return }
-                let monitor = Unmanaged<FSEventsMonitor>.fromOpaque(info).takeUnretainedValue()
-                if let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] {
-                    let hasUserChange = paths.contains {
-                        !$0.contains("/.clayfs") &&
-                        !$0.contains("/.fseventsd") &&
-                        !$0.contains("/.Trashes") &&
-                        !$0.contains("/.Spotlight-V100")
-                    }
-                    if hasUserChange {
+            streamRef = FSEventStreamCreate(
+                kCFAllocatorDefault,
+                { (_, clientCallBackInfo, numEvents, eventPaths, _, _) in
+                    guard let info = clientCallBackInfo else { return }
+                    let monitor = Unmanaged<FSEventsMonitor>.fromOpaque(info).takeUnretainedValue()
+                    if let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] {
+                        let hasUserChange = paths.contains { !FSEventsMonitor.isIgnoredPath($0) }
+                        if hasUserChange {
+                            monitor.handleChangeDetected()
+                        }
+                    } else {
                         monitor.handleChangeDetected()
                     }
-                } else {
-                    monitor.handleChangeDetected()
-                }
-            },
-            &context,
-            pathsToWatch,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            1.0,
-            flags
-        )
+                },
+                &context,
+                pathsToWatch,
+                FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+                1.0,
+                flags
+            )
 
-        if let stream = streamRef {
-            FSEventStreamSetDispatchQueue(stream, queue)
-            FSEventStreamStart(stream)
+            if let stream = streamRef {
+                FSEventStreamSetDispatchQueue(stream, queue)
+                FSEventStreamStart(stream)
+            }
         }
     }
 
     public func stop() {
-        guard isRunning else { return }
-        isRunning = false
+        queue.sync {
+            guard isRunning else { return }
+            isRunning = false
 
-        if let timer = debounceTimer {
-            timer.cancel()
-            debounceTimer = nil
-        }
+            if let timer = debounceTimer {
+                timer.cancel()
+                debounceTimer = nil
+            }
 
-        if let stream = streamRef {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            streamRef = nil
+            if let stream = streamRef {
+                FSEventStreamStop(stream)
+                FSEventStreamInvalidate(stream)
+                FSEventStreamRelease(stream)
+                streamRef = nil
+            }
         }
     }
 

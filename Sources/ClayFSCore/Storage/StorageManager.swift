@@ -153,7 +153,7 @@ public final class StorageManager: Sendable {
 
         defer {
             if wasMounted {
-                _ = try? mountDrive(bundleURL: finalBundleURL, showInFinder: false)
+                _ = try? mountDrive(bundleURL: finalBundleURL, showInFinder: true)
             }
         }
 

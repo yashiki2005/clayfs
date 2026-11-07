@@ -1,6 +1,8 @@
 import Foundation
 import SQLite3
 
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 public final class TimelineDB: @unchecked Sendable {
     private var db: OpaquePointer?
     private let dbPath: String
@@ -65,10 +67,10 @@ public final class TimelineDB: @unchecked Sendable {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (snapshot.id as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (snapshot.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_double(stmt, 2, snapshot.timestamp.timeIntervalSince1970)
-        sqlite3_bind_text(stmt, 3, (snapshot.message as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 4, (snapshot.author as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 3, (snapshot.message as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, (snapshot.author as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 5, Int64(snapshot.fileCount))
         sqlite3_bind_int64(stmt, 6, snapshot.totalBytes)
 
@@ -90,7 +92,7 @@ public final class TimelineDB: @unchecked Sendable {
 
         sqlite3_bind_int64(stmt, 1, Int64(fileCount))
         sqlite3_bind_int64(stmt, 2, totalBytes)
-        sqlite3_bind_text(stmt, 3, (id as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 3, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
 
         if sqlite3_step(stmt) != SQLITE_DONE {
             throw NSError(domain: "ClayFSTimelineDB", code: 8, userInfo: [NSLocalizedDescriptionKey: "Failed to update snapshot metrics row"])
@@ -142,7 +144,7 @@ public final class TimelineDB: @unchecked Sendable {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
 
         if sqlite3_step(stmt) == SQLITE_ROW {
             let sid = String(cString: sqlite3_column_text(stmt, 0))
@@ -175,7 +177,7 @@ public final class TimelineDB: @unchecked Sendable {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
         if sqlite3_step(stmt) != SQLITE_DONE {
             throw NSError(domain: "ClayFSTimelineDB", code: 6, userInfo: [NSLocalizedDescriptionKey: "Failed to delete snapshot row"])
         }
