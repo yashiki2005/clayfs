@@ -52,6 +52,7 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 ## 実装の状況
 
 実装: `linux/clayfs_btrfs`（Python、btrfs の CLI を使う）。試験: `linux/test_btrfs.sh`（Pi の特権コンテナで 75 件合格）。
+btrfs が要らない試験: `linux/test_parse_dump.py`（差分の読み取り）、`linux/test_btrfs_logic.py`（鍵、commit/run/gc/restore の流れ）。
 
 - 済み: init / commit / status / show / log / restore / gc / scrub / dedup / compress / keep / unkeep / run / adopt / rebuild
 - 自動実行: `linux/systemd/`（毎時の `run`、毎日の `gc`、毎週の `scrub`）。構文は `systemd-analyze verify` で確認。
@@ -70,6 +71,30 @@ macOS 版（APFS）の仕組みを、btrfs に置き換える。目的は、macO
 - 変更の検出: send --dump の名前は、空白とバックスラッシュが \ でエスケープされている。名前の変更は link と unlink の組で出るので、link を新しい名前の追加として扱う。
 - 変更の検出: スナップショットの前に sync する。時刻だけの変化（atime など、読むだけでも起きる）は変更にしない（mtime が変わったものだけ）。書き出しの時期のずれや同じ中身の書き直しは、extent が付け替わるが、中身（大きさと sha256）が同じなら変更にしない。
 - 未実施: 定時の実行 (01:00 など) の自動の確認、gc と scrub の定時実行の確認、Pi の再起動後のマウント (fstab)。
+- 変更の検出の読み取り (`parse_dump`): 実出力 (btrfs-progs 6.17、Pi 5) で確かめた形は次のとおり。
+  `btrfs send -p PARENT NEW` の親は「親 subvolume」として付くだけで、**親のファイルの mkfile は並ばない**。
+  dump に出るのは、その名前に触れた差分だけ。
+  - 新規ディレクトリ: `mkdir ./c/oN-G-N` → `rename ... dest=./c/実名` → `chown/chmod/utimes ./c/実名`
+    (メタデータは**実名**で来る。一時名だけを見て捨てると新規を取りこぼし、実名のメタデータで
+    上書きすると新規が「変更」になる)
+  - 中身の変更（実測）: `update_extent ./c/実名 offset=0 len=N` → `utimes ./c/実名`。
+    **一時名を使わず、実名で来る**（`mkfile` も `mkdir` も出ない）。中身が変わったかは、名前から
+    親と現状を照合して決める（extent は書き出しの時期でも付け替わるので、変えただけでは判定できない）
+  - 中身を持つ項目を作り直す形（この形で来ることもある）:
+    `mkfile ./c/name.oN-G-N` → `write ...` → `rename ... dest=./c/name` → `utimes ./c/name`
+  - 名前の変更: `link` + `unlink`。削除: `unlink` / `rmdir`
+  したがって、一時名で起きたことは rename の宛先に付け、実名のメタデータは新規 (A) なら無視、
+  既存なら M (utimes は mtime が変わったときだけ)。rename で付いた名前が新規かは、親にその名前があるかで
+  決める。検証は `linux/test_parse_dump.py`（実機で取った 2 種類の出力そのものを含む。btrfs なしで動く）。
+- 排他: commit / status / run / gc / restore / keep / exclude は、すべて `store/lock` (flock) を取る。
+  gc は「一覧を読んでから消すまで」を 1 つずつ行い、HEAD は残す。一時スナップショットの名前にも乱数を付ける。
+- run の空回り: HEAD と作業ツリーの btrfs の Generation が同じなら、何も書いていないとみなして
+  差分を作らない (1 時間ごとの送信を省く)。判定できないときは従来どおり調べる。
+- rebuild: `btrfs send -p` の親が gc で消えているときは、単独で送る (移せるが容量は出る)。
+- restore: 戻すパスは `safe_rel` で確かめる (`..` を含む名前や絶対パスを拒む)。
+- keep: `chattr +c` は inode ごとの属性で、ディレクトリに付けても中身へは広がらない。
+  既存の中身は defragment で圧縮し、keep の下に新しく現れたファイルはコミットの直前に圧縮する。
+  keep 済みのパスは、何度も圧縮し直さない (共有が外れて容量が増えるのを避ける)。
 
 試験で分かったこと（設計に反映済み）:
 

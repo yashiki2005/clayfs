@@ -215,6 +215,26 @@ Run comprehensive unit and integration tests (virtual drive creation, mounting, 
 swift test
 ```
 
+> - Integration tests that create disk images require `hdiutil` on macOS. On Linux only those are
+>   skipped; unit tests (registry, SQLite, CoW cloning, path checks) still run.
+> - Tests for the Linux tool (`linux/clayfs_btrfs`, btrfs based) live in `linux/`:
+>   `linux/test_btrfs.sh` (needs root and btrfs), plus `python3 linux/test_parse_dump.py` and
+>   `python3 linux/test_btrfs_logic.py`, which run without btrfs.
+
+---
+
+## 🐧 Linux tool (btrfs)
+
+`linux/` contains a separate CLI that uses btrfs subvolumes directly instead of a disk image
+(design: [docs/SPEC-linux-btrfs.md](docs/SPEC-linux-btrfs.md)).
+
+| File | Purpose |
+|---|---|
+| `linux/clayfs_btrfs` | CLI that keeps history with a `work/` subvolume and read-only snapshots (Python) |
+| `linux/install.sh` / `uninstall.sh` | Install / remove the scheduled jobs (hourly `run`, daily `gc`, weekly `scrub`) |
+| `linux/migrate_from_dir.sh` | Copy a normal folder into `work/` and create the first commit |
+| `clayfs_tool` / `clayfsctl` | The earlier macOS implementation (`make install-legacy`) |
+
 ---
 
 ## 📄 License

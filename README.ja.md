@@ -214,6 +214,26 @@ open ~/Applications/ClayFS.app
 swift test
 ```
 
+> - 仮想ドライブを作る統合テストは macOS の `hdiutil` が前提です。Linux ではその試験だけを飛ばし、
+>   ユニットテスト（レジストリ、SQLite、CoW クローン、パス検査など）は実行します。
+> - Linux 版（btrfs を使う `linux/clayfs_btrfs`）の試験は `linux/` にあります。
+>   `linux/test_btrfs.sh`（root と btrfs が要る）に加え、btrfs なしで動く
+>   `python3 linux/test_parse_dump.py` と `python3 linux/test_btrfs_logic.py` があります。
+
+---
+
+## 🐧 Linux 版ツール (btrfs)
+
+リポジトリの `linux/` には、Swift 版とは別に、btrfs の subvolume を直接使う CLI があります
+（設計は [docs/SPEC-linux-btrfs.md](docs/SPEC-linux-btrfs.md)）。
+
+| ファイル | 役割 |
+|---|---|
+| `linux/clayfs_btrfs` | `work/` の subvolume と読み取り専用スナップショットで履歴を持つ CLI（Python） |
+| `linux/install.sh` / `uninstall.sh` | 自動実行（毎時の `run`、毎日の `gc`、毎週の `scrub`）の導入と除去 |
+| `linux/migrate_from_dir.sh` | 普通のフォルダの中身を `work/` へ移し、最初のコミットにする |
+| `clayfs_tool` / `clayfsctl` | 以前の macOS 版（`make install-legacy` で旧 CLI として入る） |
+
 ---
 
 ## 📄 ライセンス (License)

@@ -1,6 +1,26 @@
 import Testing
 import Foundation
 @testable import ClayFSCore
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+// ディスクイメージを作る統合テスト (createDrive → mountDrive → snapshot → restore) は、
+// hdiutil (macOS) と sparsebundle を前提にしている。Linux では走らせない。
+// Linux 側の試験は linux/test_btrfs.sh (要 root / btrfs) と linux/test_parse_dump.py
+// (btrfs なしで動く) が受け持つ。
+#if os(macOS)
+private let canCreateImages = true
+#else
+private let canCreateImages = false
+#endif
+
+/// イメージを作れない環境では、理由を添えて飛ばす (失敗にしない)。
+private func requiresDiskImages() throws {
+    try #require(canCreateImages, "ディスクイメージを作る試験は macOS の hdiutil が要ります (Linux では linux/ の試験を使う)")
+}
 
 @Test func testDriveRegistry() throws {
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_test_\(UUID().uuidString)")
@@ -98,6 +118,7 @@ import Foundation
 }
 
 @Test func testEndToEndVirtualDriveWorkflow() throws {
+    try requiresDiskImages()
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_e2e_\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     defer {
@@ -177,6 +198,7 @@ import Foundation
 }
 
 @Test func testRestoreSubpathTraversalSecurity() throws {
+    try requiresDiskImages()
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_sec_test_\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -221,6 +243,7 @@ import Foundation
 }
 
 @Test func testDotfileDetectionInDiff() throws {
+    try requiresDiskImages()
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_dot_test_\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -265,4 +288,95 @@ import Foundation
     // 4. Create snapshot with dotfiles and verify fileCount
     let snap1 = try SnapshotManager.shared.createSnapshot(volumeMountURL: mountURL, message: "Added dotfiles")
     #expect(snap1.fileCount == 3)
+}
+
+// MARK: - ディスクイメージを作らない試験 (Linux でも動く)
+
+@Test func testCoWCloneKeepsSymlink() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_cow_\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    // リンク先のディレクトリ (スナップショットには含めたくない)
+    let realDir = tempDir.appendingPathComponent("real")
+    try FileManager.default.createDirectory(at: realDir, withIntermediateDirectories: true)
+    try "v1".write(to: realDir.appendingPathComponent("file.txt"), atomically: true, encoding: .utf8)
+
+    let link = tempDir.appendingPathComponent("mylink")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: realDir)
+
+    let dest = tempDir.appendingPathComponent("mylink_copy")
+    try CoWCloner.clone(from: link, to: dest)
+
+    // clonefile はリンクを辿るので、そのまま使うと「ディレクトリの複製」になる。
+    // clone はリンクをリンクとして作り直す (辿らない) ことを確かめる
+    let target = try FileManager.default.destinationOfSymbolicLink(atPath: dest.path)
+    #expect(target == realDir.path)
+    // 複製も「リンク」であること (fileExists はリンクを辿るので、lstat で型を見る)
+    var st = stat()
+    #expect(lstat(dest.path, &st) == 0)
+    #expect((st.st_mode & S_IFMT) == S_IFLNK)
+}
+
+@Test func testCoWCloneSkipsFifoWithoutFailing() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_fifo_\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let fifo = tempDir.appendingPathComponent("pipe")
+    guard mkfifo(fifo.path, 0o644) == 0 else { return }
+
+    let dest = tempDir.appendingPathComponent("pipe_copy")
+    var skipped = false
+    do {
+        try CoWCloner.clone(from: fifo, to: dest)
+    } catch is CoWSkipError {
+        skipped = true
+    }
+    // クローンできない項目は、スナップショット全体を止めずに「飛ばす」として返す
+    #expect(skipped)
+    #expect(!FileManager.default.fileExists(atPath: dest.path))
+}
+
+@Test func testMountFieldUnescaping() {
+    // /proc/mounts は空白を \040 で書く。空白を含むマウント先と、登録済みのパスを一致させるために解く
+    #expect(StorageManager.unescapeMountField("/media/u/my\\040drive") == "/media/u/my drive")
+    #expect(StorageManager.unescapeMountField("/media/u/plain") == "/media/u/plain")
+    #expect(StorageManager.unescapeMountField("/mnt/a\\040b/c\\011d") == "/mnt/a b/c\td")
+}
+
+@Test func testSnapshotSkipsFifoAndKeepsSymlink() throws {
+    // hdiutil を使わない: 普通のディレクトリを「ボリューム」としてスナップショットの振る舞いだけを確かめる
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent("clayfs_snap_\(UUID().uuidString)")
+    let volURL = base.appendingPathComponent("vol")
+    try FileManager.default.createDirectory(at: volURL, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: base) }
+
+    try "doc".write(to: volURL.appendingPathComponent("doc.txt"), atomically: true, encoding: .utf8)
+    let outside = base.appendingPathComponent("outside")
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try "secret".write(to: outside.appendingPathComponent("big.txt"), atomically: true, encoding: .utf8)
+    try FileManager.default.createSymbolicLink(at: volURL.appendingPathComponent("link"), withDestinationURL: outside)
+    let fifoCreated = mkfifo(volURL.appendingPathComponent("pipe").path, 0o644) == 0
+
+    let sm = SnapshotManager()
+    let snap = try sm.createSnapshot(volumeMountURL: volURL, message: "link and fifo", sync: true)
+    let snapDir = volURL.appendingPathComponent(".clayfs/snapshots").appendingPathComponent(snap.id)
+
+    var st = stat()
+    #expect(lstat(snapDir.appendingPathComponent("link").path, &st) == 0)
+    #expect((st.st_mode & S_IFMT) == S_IFLNK)          // リンクはリンクとして残す (辿った複製にしない)
+    #expect(FileManager.default.fileExists(atPath: snapDir.appendingPathComponent("doc.txt").path))
+    if fifoCreated {
+        // クローンできない FIFO は、スナップショット全体を止めずに飛ばす
+        #expect(lstat(snapDir.appendingPathComponent("pipe").path, &st) != 0)
+    }
+
+    // 復元してもリンクのまま戻る
+    try "changed".write(to: volURL.appendingPathComponent("doc.txt"), atomically: true, encoding: .utf8)
+    try sm.restore(volumeMountURL: volURL, snapshotID: snap.id, sync: true)
+    let restored = try String(contentsOf: volURL.appendingPathComponent("doc.txt"), encoding: .utf8)
+    #expect(restored == "doc")
+    #expect(lstat(volURL.appendingPathComponent("link").path, &st) == 0)
+    #expect((st.st_mode & S_IFMT) == S_IFLNK)
 }
