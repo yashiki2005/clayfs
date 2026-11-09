@@ -30,17 +30,18 @@
   clayfs_btrfs create [SIZE] [--image P] [--mnt D] [--dry-run]   イメージを作り、フォーマットし、マウントし、init する (既定 20G、/var/lib/clayfs/clayfs.img、/srv/clayfs)
 """
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import time
+import uuid
 
 WORK = 'work'
 STORE = 'store'
@@ -91,15 +92,98 @@ def atomic_write(path, text):
     os.replace(tmp, path)
 
 
-def lock(vol):
-    """コミットや dedup などを 1 つずつ行う。カーネルが持ち主の終了で鍵を外すので、残骸が残らない。"""
-    os.makedirs(vol.store, exist_ok=True)
-    fd = os.open(os.path.join(vol.store, 'lock'), os.O_RDWR | os.O_CREAT, 0o644)
+def _open_lock(vol):
+    try:
+        os.makedirs(vol.store, exist_ok=True)
+        return os.open(os.path.join(vol.store, 'lock'), os.O_RDWR | os.O_CREAT, 0o644)
+    except PermissionError:
+        die(f'履歴の場所 ({vol.store}) に書けません。root で実行してください (sudo clayfs_btrfs {vol.mnt} ...)')
+
+
+def try_lock(vol):
+    """鍵を取れれば fd、ほかの clayfs_btrfs が動いていれば None を返す (待たない)。
+
+    コミット・gc・status・restore などは、互いの一時スナップショットや、消した世代を見分けられないため、
+    ここを通して 1 つずつ行う。鍵を取らない側があると、その側は「入っている」ことを検知できない。"""
+    fd = _open_lock(vol)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def lock(vol):
+    """鍵を取る。取れなければ die (ユーザーが実行したコマンド向け)。"""
+    fd = try_lock(vol)
+    if fd is None:
         die('ほかの clayfs_btrfs が実行中です')
     return fd
+
+
+@contextlib.contextmanager
+def locked(vol):
+    """with locked(vol): ... の形で、鍵を取って実行する (途中で落ちても鍵は外れる)。"""
+    fd = lock(vol)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def keep_file(vol):
+    return os.path.join(vol.store, 'keep.json')
+
+
+def load_keep(vol):
+    p = keep_file(vol)
+    if not os.path.exists(p):
+        return set()
+    with open(p, encoding='utf-8') as f:
+        return set(json.load(f))
+
+
+def save_keep(vol, keeps):
+    atomic_write(keep_file(vol), json.dumps(sorted(keeps), ensure_ascii=False, indent=2))
+
+
+def _under(rel, keeps):
+    """rel が、keep されているパス自身か、その下か (パスは '/' 区切りで比べる)。"""
+    rel = rel.replace(os.sep, '/')
+    return any(rel == k or rel.startswith(k.rstrip('/') + '/') for k in keeps)
+
+
+def apply_keep(vol, rels):
+    """keep されているディレクトリの下に、新しく現れたファイルを圧縮する (commit の前)。
+
+    btrfs の ``chattr +c`` は inode ごとの属性で、ディレクトリに付けたものは「その直下に新しく作る
+    ファイル」だけに効く。既存のディレクトリの中や、深い階層に作られたファイルは効かないので、
+    コミットの直前に、keep の対象の下に新しく現れたファイルを圧縮し直す (中身は変えない)。"""
+    keeps = load_keep(vol)
+    if not keeps:
+        return
+    for rel in rels:
+        if not _under(rel, keeps):
+            continue
+        full = os.path.join(vol.work, rel)
+        if os.path.islink(full):
+            continue
+        os.sync()
+        if os.path.isdir(full):
+            run(['btrfs', 'filesystem', 'defragment', '-r', '-czstd', full], check=False)
+        else:
+            run(['btrfs', 'filesystem', 'defragment', '-czstd', full], check=False)
+
+
+def mk_tmp(vol, prefix):
+    """一時スナップショットの名前を作る (場所はまだ作らない。snapshot が作る)。
+    pid だけの名前だと、前に落ちた実行の名前や、同じ pid の別の実行と当たることがあるので、乱数も付ける。"""
+    os.makedirs(vol.store, exist_ok=True)
+    while True:
+        path = os.path.join(vol.store, f'{prefix}.{os.getpid()}.{uuid.uuid4().hex[:8]}')
+        if not os.path.lexists(path):
+            return path
 
 
 def load_log(vol):
@@ -142,60 +226,151 @@ def dump_path(tok):
     return PATH_PREFIX.sub('', unescape(tok)).rstrip('/')
 
 
-def parse_dump(text, mtime_changed=lambda rel: True, content_changed=lambda rel: True):
-    """btrfs receive --dump の出力を、(A/M/D, 相対パス) の一覧にする。
-    新しいファイルは mkfile/mkdir の後の rename (または link) で名前が付く。名前の変更は link と unlink の組。"""
-    state = {}   # path -> 'A' | 'M' | 'D'
+# 一時名 (oNNN-G-N) は、receive が作る途中の名前。mkfile/mkdir の後に rename で名前が付く。
+# 「dir/o1-2-0」の形と、「name.o1-2-0」の形の両方がある
+TMP_SUFFIX = re.compile(r'(^|/)o\d+-\d+-\d+$|\.o\d+-\d+-\d+$')
+# 一時名から、元の名前 (``name.oNNN-G-N`` の ``name``) を取り出す
+TMP_BASE = re.compile(r'(?:^|(?<=/))o\d+-\d+-\d+$|\.o\d+-\d+-\d+$')
+
+
+def _no_name(p):
+    """名前の付いていない項目 (スナップショット自身、.、一時名)。"""
+    return not p or p == '.' or p.startswith(TMP_DIR) or bool(TMP_SUFFIX.search(p))
+
+
+def parse_dump(text, mtime_changed=lambda rel: True, content_changed=lambda rel: True,
+               existed=None):
+    """``btrfs send --no-data [-p PARENT] SNAP | btrfs receive --dump`` の出力を、(A/M/D, 相対パス) の一覧にする。
+
+    実出力 (btrfs-progs 6.17、Pi 5) で確かめた形。同じ 1 行が、状況によって形が変わる:
+
+        At subvol ./c-...                       ← 送る対象
+        snapshot ./c-... parent_uuid=...        ← -p が付いていたとき (親は「親 subvolume」として付く)
+
+      (a) 新規のディレクトリ:
+        mkdir    ./c/o25045-2057-0              ← 一時名で作り
+        rename   ./c/o25045-2057-0 dest=./c/revtest
+        chown / chmod / utimes ./c/revtest      ← メタデータは「実名」で来る
+
+      (b) 既存ファイルの中身の変更 (実測):
+        update_extent ./c/f.txt offset=0 len=2  ← 実名で来る (一時名を使わない)
+        utimes        ./c/f.txt
+
+      (c) 一時名で作り直す形 (中身を持つ項目の作り直し。この形で来ることもある):
+        mkfile   ./c/name.o1-2-0
+        write    ./c/name.o1-2-0
+        rename   ./c/name.o1-2-0 dest=./c/name
+        utimes   ./c/name
+
+    大事な点:
+      * 親スナップショットのファイルは、**mkfile として並ばない** (親は subvolume の親として付くだけ)。
+        出力に出てくる項目は、その名前に触れた差分だけ。
+      * 一時名で起きたこと (write など) は、その後の rename の宛先の名前に付ける。
+      * 実名で来るメタデータ (chmod/chown/utimes) は、その名前が新規 (A) なら何もしない
+        (新規は A のまま)。既存の名前なら M。utimes は、mtime が変わったときだけ M
+        (atime は読んだだけでも変わる)。
+      * rename で付いた名前が新規かどうかは、名前だけでは決まらない (新規ファイルも
+        ``name.oN-G-N`` で作られるので、中身ごとの作り直しと形が同じ)。引数の existed(rel) で
+        「親にその名前があるか」を渡す。existed を省くと、すべて「親にある」とみなす。
+    照合関数 (mtime_changed / content_changed) は、名前から親と現状を比べるものとして渡す。"""
+    state = {}    # path -> 'A' | 'M' | 'D'
+    tmp_base = {} # 一時名 -> 元の名前 (``dir/o1-2-0`` や ``name.o1-2-0`` の ``name``)
+    coming = {}   # 一時名 -> rename で付いた名前
+    deferred = [] # (名前, kind)。一時名で起きた変化。名前が付いてから付ける
 
     def mark(p, k):
         cur = state.get(p)
         if cur is None:
             state[p] = k
-        elif cur == 'D' and k == 'A':
+        elif cur == 'D' and k in ('A', 'M'):
             state[p] = 'M'          # 消して作り直した
         elif cur == 'A' and k == 'D':
             del state[p]           # 作ってから消した
         elif k == 'M' and cur in ('A', 'M'):
-            pass
+            pass                   # 新規は A のまま
         else:
             state[p] = k
 
+    def change(p, kind):
+        """名前 p に差分を付ける。新規 (A) はそのまま。削除済み (D) は作り直された物として M。"""
+        cur = state.get(p)
+        if cur == 'A':
+            return
+        if cur == 'D':
+            mark(p, 'M')
+            return
+        if kind == 'content' and not content_changed(p):
+            return
+        if kind == 'mtime' and not mtime_changed(p):
+            return
+        mark(p, 'M')
+
     for line in text.splitlines():
-        if not line or line.startswith(('At ', 'snapshot', 'subvol')):
+        if not line or line.startswith('At '):
             continue
         m = re.match(r'^(\S+)\s+' + PATH_TOKEN + r'(.*)$', line)
         if not m:
             continue
         op, tok, rest = m.group(1), m.group(2), m.group(3)
+        if op in ('fileattr', 'subvol', 'snapshot'):
+            continue
         p = dump_path(tok)
-        # 一時名 (oNNN-G-0) は、mkfile/mkdir で作られ、rename で名前が付く。rename の移動元は、一時名のままでよい
-        if not p or p == '.' or p.startswith(TMP_DIR):
+        if TMP_SUFFIX.search(p):
+            tmp_base[p] = TMP_BASE.sub('', p).rstrip('/') or None
+            if op == 'rename':
+                d = re.search(r'dest=' + PATH_TOKEN, rest)
+                if d:
+                    dest = dump_path(d.group(1))
+                    if not _no_name(dest):
+                        coming[p] = dest
+                        # 親に無い名前で付いた = 新規。親にある名前 = 中身ごとの作り直し (M 候補)
+                        if existed is not None and not existed(dest):
+                            mark(dest, 'A')
+            elif op in ('mkfile', 'mkdir', 'symlink', 'mknod'):
+                # ``dir/oN-G-N`` (名前が一時名だけ) は、新しい項目。``name.oN-G-N`` は、
+                # 既にある名前を中身ごと作り直している物 (rename で名前が戻る)
+                if re.search(r'(^|/)o\d+-\d+-\d+$', p):
+                    deferred.append((p, 'new'))
+            elif op in ('write', 'update_extent', 'truncate', 'clone', 'fallocate'):
+                # 一時名に書いた中身。rename で付いた名前に付ける (実測では実名で来ることもある)
+                deferred.append((p, 'content'))
+            elif op == 'utimes':
+                deferred.append((p, 'mtime'))
             continue
-        if op != 'rename' and re.search(r'(^|/)o\d+-\d+-\d+$', p):
+        if _no_name(p):
             continue
-        if op in ('unlink', 'rmdir'):
+        if op in ('mkfile', 'mkdir', 'symlink', 'mknod'):
+            mark(p, 'A')              # 親の項目は送られてこないので、出てきた物は新規
+        elif op in ('unlink', 'rmdir'):
             mark(p, 'D')
-        elif op in ('rename', 'link'):
-            # rename: path が移動元 (一時名)、dest が宛先。link: path が新しい名前、dest が元
+        elif op == 'rename':
+            # 実名への rename (名前の変更は link + unlink で出ることが多い)
             d = re.search(r'dest=' + PATH_TOKEN, rest)
-            if op == 'link':
-                mark(p, 'A')
-            elif d:
+            if d:
                 dest = dump_path(d.group(1))
-                if dest and not dest.startswith(TMP_DIR):
+                if not _no_name(dest):
                     mark(dest, 'A')
-        elif op == 'symlink':
+        elif op == 'link':
+            # 移動 (rename) の新しい名前。古い名前は unlink で D になる
             mark(p, 'A')
-        elif op == 'update_extent' or op == 'write' or op == 'truncate':
-            # 同じ中身の書き直し、書き出しの時期のずれでも、extent は付け替わる。中身が本当に変わったものだけ数える
-            if content_changed(p):
-                mark(p, 'M')
+        elif op in ('write', 'update_extent', 'truncate', 'clone', 'fallocate'):
+            change(p, 'content')
         elif op == 'utimes':
-            # 時刻だけの変化 (主に atime: 読んだだけでも変わる) は変更ではない。mtime が変わったものだけ数える
-            if mtime_changed(p):
-                mark(p, 'M')
+            change(p, 'mtime')
         elif op in ('chmod', 'chown', 'set_xattr', 'remove_xattr'):
-            mark(p, 'M')
+            change(p, 'meta')
+    # 一時名で起きた変化は、元の名前と、rename で付いた名前の両方に反映する
+    for tmp, kind in deferred:
+        dest = coming.get(tmp)
+        base = tmp_base.get(tmp)
+        targets = [dest] if dest else []
+        if base and (dest is None or dest == base):
+            targets.append(base)
+        for name in targets:
+            if kind == 'new':
+                mark(name, 'A')        # 一時名で作られた = 新規 (以後のメタデータでは A のまま)
+            else:
+                change(name, kind)
     return sorted((k, p) for p, k in state.items())
 
 
@@ -206,14 +381,18 @@ def diff_snapshots(vol, old, new):
 
 
 def diff_snapshots_raw(vol, old, new):
-    """2 つのスナップショット (ro) の差分。send の差分だけを読み、中身は読まない。"""
-    # btrfs send の出力 (バイナリ) を receive --dump に通す
+    """2 つのスナップショット (ro) の差分。send --no-data の差分だけを読み、中身は必要になるまで読まない。
+
+    親スナップショットのファイルは送られてこないので、dump に出てくるのは本当の差分だけ。
+    中身が変わったかは、名前から親と現状を照合して決める (extent は書き出しの時期でも付け替わるため)。"""
     p1 = subprocess.run(['btrfs', 'send', '--no-data', '-p', old, new], capture_output=True)
     if p1.returncode != 0:
         die(f'差分を取れません: {p1.stderr.decode(errors="replace").strip()[:300]}')
     p2 = subprocess.run(['btrfs', 'receive', '--dump'], input=p1.stdout, capture_output=True)
     if p2.returncode != 0:
         die(f'差分を読めません: {p2.stderr.decode(errors="replace").strip()[:300]}')
+    dump = decode_dump(p2.stdout)
+    # 名前が無いもの (一時名) は、親スナップショットの内容と照合する。中身が変わったかは、名前が付いてから判定する
     def mtime_changed(rel):
         try:
             return os.lstat(os.path.join(old, rel)).st_mtime_ns != os.lstat(os.path.join(new, rel)).st_mtime_ns
@@ -221,6 +400,9 @@ def diff_snapshots_raw(vol, old, new):
             return True
 
     def content_changed(rel):
+        if TMP_SUFFIX.search(rel):
+            # 一時名は、receive が「中身を持つ新しい項目」を作るための名前なので、中身は違う
+            return True
         a, b = os.path.join(old, rel), os.path.join(new, rel)
         try:
             sa, sb = os.lstat(a), os.lstat(b)
@@ -231,7 +413,16 @@ def diff_snapshots_raw(vol, old, new):
         if sa.st_size != sb.st_size:
             return True
         return digest(a) != digest(b)
-    return parse_dump(p2.stdout.decode('utf-8', errors='replace'), mtime_changed, content_changed)
+
+    # 親スナップショットに、その名前があるか (rename で付いた名前が新規かどうかの判定に使う)
+    def existed(rel):
+        return os.path.lexists(os.path.join(old, rel))
+    return parse_dump(dump, mtime_changed, content_changed, existed)
+
+
+def decode_dump(data):
+    """receive --dump の出力を文字列にする。名前が UTF-8 でない場合も、項目は捨てない。"""
+    return data.decode('utf-8', errors='surrogateescape')
 
 
 def snapshot_ro(src, dst):
@@ -244,14 +435,20 @@ def delete_subvol(path):
     run(['btrfs', 'subvolume', 'delete', path], check=False)
 
 
+def used_names(vol):
+    """log.jsonl に載っている名前 (gc で中身を消したものも含む)。名前は履歴の中で一意にする。"""
+    return {e['name'] for e in load_log(vol)} | (set(os.listdir(vol.layers)) if os.path.isdir(vol.layers) else set())
+
+
 def new_name(vol, explicit=None):
+    used = used_names(vol)
     if explicit:
-        if os.path.exists(vol.layer(explicit)):
+        if explicit in used or os.path.exists(vol.layer(explicit)):
             die(f'同じ名前のコミットがあります: {explicit}')
         return explicit
     base = time.strftime('c-%Y%m%d-%H%M%S')
     name, n = base, 1
-    while os.path.exists(vol.layer(name)):
+    while name in used or os.path.exists(vol.layer(name)):
         n += 1
         name = f'{base}-{n}'
     return name
@@ -271,43 +468,57 @@ def record(vol, name, msg, notes, when=None):
 # ---------- コマンド ----------
 
 def cmd_init(vol, a):
-    if os.path.exists(vol.work):
-        die(f'すでにあります: {vol.work}')
     if not os.path.ismount(vol.mnt):
         die(f'btrfs がマウントされていません: {vol.mnt}')
-    run(['btrfs', 'subvolume', 'create', vol.work])
     os.makedirs(vol.layers, exist_ok=True)
+    with locked(vol):
+        if os.path.exists(vol.work):
+            die(f'すでにあります: {vol.work}')
+        run(['btrfs', 'subvolume', 'create', vol.work])
     print(f'作りました: {vol.work} (subvolume)')
 
 
 def cmd_commit(vol, a):
     fd = lock(vol)
     try:
-        base = head(vol)
-        name = new_name(vol, a.name)
-        tmp = os.path.join(vol.layers, f'.tmp.{os.getpid()}')
-        snapshot_ro(vol.work, tmp)
-        os.rename(tmp, vol.layer(name))
-        if base is None:
-            notes = []
-        else:
-            notes = diff_snapshots(vol, vol.layer(base), vol.layer(name))
-        if base is not None and not notes and not a.allow_empty:
-            delete_subvol(vol.layer(name))
-            print('変更はありません (コミットしません)')
-            return
-        record(vol, name, a.message, notes)
-        set_head(vol, name)
-        print(f'[{name}] {a.message or ""}\n {len(notes)} 件の変更')
+        cmd_commit_locked(vol, a)
     finally:
         os.close(fd)
 
 
+def cmd_commit_locked(vol, a):
+    """commit の中身。呼ぶ側が鍵を取ってあること (cmd_commit / cmd_run / cmd_adopt)。"""
+    base = head(vol)
+    name = new_name(vol, a.name)
+    # 一時スナップショットは layers/ の中に作る (見えない名前)。名前は、既存と重ならないように作る
+    tmp = os.path.join(vol.layers, f'.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}')
+    try:
+        snapshot_ro(vol.work, tmp)
+        os.rename(tmp, vol.layer(name))
+    finally:
+        if os.path.exists(tmp):
+            delete_subvol(tmp)
+    if base is None:
+        notes = []
+    else:
+        notes = diff_snapshots(vol, vol.layer(base), vol.layer(name))
+        # keep の対象の下に新しく現れたファイルは、次のコミットの前に圧縮しておく
+        apply_keep(vol, [p for k, p in notes if k == 'A'])
+    if base is not None and not notes and not a.allow_empty:
+        delete_subvol(vol.layer(name))
+        print('変更はありません (コミットしません)')
+        return
+    record(vol, name, a.message, notes)
+    set_head(vol, name)
+    print(f'[{name}] {a.message or ""}\n {len(notes)} 件の変更')
+
+
 def current_changes(vol):
+    """HEAD との差分。一時スナップショットを作るので、呼ぶ側は鍵を取ってから呼ぶ。"""
     base = head(vol)
     if base is None:
         return None, []
-    tmp = os.path.join(vol.store, f'status.{os.getpid()}')
+    tmp = mk_tmp(vol, 'status')
     snapshot_ro(vol.work, tmp)
     try:
         return base, diff_snapshots(vol, vol.layer(base), tmp)
@@ -319,7 +530,8 @@ LABEL = {'A': '追加', 'M': '変更', 'D': '削除'}
 
 
 def cmd_status(vol, a):
-    base, notes = current_changes(vol)
+    with locked(vol):
+        base, notes = current_changes(vol)
     if base is None:
         print('まだコミットがありません (commit で最初のコミットを作ります)')
         return
@@ -365,87 +577,127 @@ def cmd_link(vol, a):
     make_link(vol, a.path, a.owner)
 
 
+def _copy_into(src, dst):
+    """中身を dst へ移す。途中で失敗したら、ここで作った物を消す (半端な work/ を残さない)。"""
+    made = []
+    try:
+        for n in sorted(os.listdir(src)):
+            run(['cp', '-a', '--reflink=never', os.path.join(src, n), os.path.join(dst, n)])
+            made.append(os.path.join(dst, n))
+    except BaseException:
+        for m in made:
+            try:
+                remove_tree(m)
+            except OSError:
+                pass
+        raise
+
+
 def cmd_adopt(vol, a):
     """普通のフォルダ SRC を、この btrfs の work/ へ移す。SRC は SRC.orig に残し、SRC は work/ へのリンクにする。
-    中身は reflink で複製し、同じであることを diff で確かめてから切り替える (macOS 版の switch に当たる)。"""
+    中身は実体のコピーで作り、同じであることを diff で確かめてから切り替える (macOS 版の switch に当たる)。
+
+    読めないものがあると、ここでは切り替えない (元のフォルダはそのまま、work/ も元通り)。
+    SRC の名前を変えられない場合 (別のマウントの根、親に書く権限が無い) は、切り替え前に確かめて止める。"""
     src = os.path.realpath(os.path.expanduser(a.src))
     if os.path.islink(a.src):
         die(f'すでにリンクです: {a.src}')
     if not os.path.isdir(src):
         die(f'ディレクトリではありません: {src}')
+    if os.path.ismount(src) or os.path.dirname(src) == src:
+        die(f'マウント先や根は切り替えられません: {src} (普通のフォルダを指定してください)')
     orig = src + '.orig'
     if os.path.exists(orig):
         die(f'すでにあります: {orig} (前回の退避が残っています)')
-    if os.listdir(vol.work):
-        die(f'work/ が空ではありません: {vol.work}')
-    fd = lock(vol)
-    try:
-        for n in os.listdir(src):
-            run(['cp', '-a', '--reflink=never', os.path.join(src, n), os.path.join(vol.work, n)])
+    if not os.access(os.path.dirname(src), os.W_OK):
+        die(f'切り替えには、{os.path.dirname(src)} に書く権限が要ります')
+    with locked(vol):
+        if os.listdir(vol.work):
+            die(f'work/ が空ではありません: {vol.work}')
+        _copy_into(src, vol.work)
         r = subprocess.run(['diff', '-rq', src, vol.work], capture_output=True, text=True)
         if r.returncode != 0:
+            # 元のフォルダも work/ も、切り替え前の状態に戻す
+            for n in os.listdir(vol.work):
+                try:
+                    remove_tree(os.path.join(vol.work, n))
+                except OSError:
+                    pass
             die(f'複製が一致しません。元のフォルダは変えていません:\n{r.stdout[:500]}')
-    finally:
-        os.close(fd)
-    # 鍵を外してから、コミットする (commit は自分で鍵を取る)
-    if head(vol) is None:
-        cmd_commit(vol, argparse.Namespace(name=None, message='initial', allow_empty=True))
-    os.rename(src, orig)
+        if head(vol) is None:
+            cmd_commit_locked(vol, argparse.Namespace(name=None, message='initial', allow_empty=True))
+    # 鍵を外してから、名前を切り替える (中身の切り替えは、ここで 1 回だけ行う)
+    try:
+        os.rename(src, orig)
+    except OSError as e:
+        die(f'元のフォルダの名前を変えられません ({e.strerror})。work/ に複製した分は残っています: {vol.work}')
     os.symlink(vol.work, src)
     print(f'切り替えました: {src} -> {vol.work}')
     print(f'元の中身: {orig} (確かめたら消して構いません)')
 
 
 def cmd_rebuild(vol, a):
-    """履歴を、別の btrfs (DEST の MNT) へ移す。send | receive で、各コミットを順に送る。元は読むだけ。"""
+    """履歴を、別の btrfs (DEST の MNT) へ移す。send | receive で、各コミットを順に送る。元は読むだけ。
+
+    btrfs send -p PARENT CHILD は、CHILD が使う PARENT を送り手が持っている必要がある。gc で
+    古い世代を消していると「親が無い」と断られるので、そのときは単独で送る (容量は出るが、移せる)。
+    単独で送った世代は、受信先でも親を持たない。"""
     dest = Vol(a.dest)
     if os.path.exists(dest.work) or os.path.exists(dest.store):
         die(f'移し先が空ではありません: {dest.mnt}')
     if not os.path.ismount(dest.mnt):
         die(f'移し先の btrfs がマウントされていません: {dest.mnt}')
-    fd = lock(vol)
-    try:
+    with locked(vol):
         os.makedirs(dest.layers)
         names = [e['name'] for e in load_log(vol) if os.path.isdir(vol.layer(e['name']))]
         if not names:
             die('移す履歴がありません')
         prev = None
         for n in names:
-            if prev is None:
-                cmd = f'btrfs send {shlex.quote(vol.layer(n))} | btrfs receive {shlex.quote(dest.layers)}'
-            else:
-                cmd = (f'btrfs send -p {shlex.quote(vol.layer(prev))} {shlex.quote(vol.layer(n))} | '
-                       f'btrfs receive {shlex.quote(dest.layers)}')
-            r = subprocess.run(['sh', '-c', cmd], capture_output=True, text=True)
-            if r.returncode != 0:
-                die(f'{n} を送れません: {r.stderr.strip()[:300]}')
+            r = send_receive(vol.layer(n), vol.layer(prev) if prev else None, dest.layers)
+            if r is None and prev:
+                print(f'注意: {n} の親 ({prev}) が無いので、単独で送ります (容量が増えます)', file=sys.stderr)
+                r = send_receive(vol.layer(n), None, dest.layers)
+            if r is None:
+                die(f'{n} を送れません')
             prev = n
             print(f'移しました: {n}')
         # 作業ツリーの未コミット分: HEAD からの差分を送り、それを rw の work/ にする
-        tmp = os.path.join(vol.store, f'rebuild.{os.getpid()}')
+        tmp = mk_tmp(vol, 'rebuild')
         snapshot_ro(vol.work, tmp)
         try:
-            base = head(vol)
-            cmd = (f'btrfs send -p {shlex.quote(vol.layer(base))} {shlex.quote(tmp)} | '
-                   f'btrfs receive {shlex.quote(dest.store)}') if base else \
-                  f'btrfs send {shlex.quote(tmp)} | btrfs receive {shlex.quote(dest.store)}'
-            r = subprocess.run(['sh', '-c', cmd], capture_output=True, text=True)
-            if r.returncode != 0:
-                die(f'未コミット分を送れません: {r.stderr.strip()[:300]}')
+            base = head(vol) if head(vol) in names else None
+            r = send_receive(tmp, vol.layer(base) if base else None, dest.store)
+            if r is None and base:
+                r = send_receive(tmp, None, dest.store)
+            if r is None:
+                die('未コミット分を送れません')
             pending = os.path.join(dest.store, os.path.basename(tmp))
             run(['btrfs', 'subvolume', 'snapshot', pending, dest.work])
             delete_subvol(pending)
         finally:
             delete_subvol(tmp)
-        for name in ('log.jsonl', 'work.json', 'keep.json'):
+        for name in ('log.jsonl', 'work.json', 'keep.json', 'exclude.json'):
             src = os.path.join(vol.store, name)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest.store, name))
         if os.path.isdir(vol.changes):
             shutil.copytree(vol.changes, dest.changes)
         print(f'できました: {len(names)} 個のコミットと、未コミット分を {dest.mnt} に移しました')
-    finally:
-        os.close(fd)
+
+
+def send_receive(src, parent, to):
+    """btrfs send [ -p parent ] src | btrfs receive to。失敗したら None (理由を出す)。"""
+    args = ['btrfs', 'send'] + (['-p', parent] if parent else []) + [src]
+    send = subprocess.run(args, capture_output=True)
+    if send.returncode != 0:
+        print(f'送れません: {" ".join(args)}: {send.stderr.decode(errors="replace").strip()[:300]}', file=sys.stderr)
+        return None
+    recv = subprocess.run(['btrfs', 'receive', to], input=send.stdout, capture_output=True)
+    if recv.returncode != 0:
+        print(f'受け取れません: {to}: {recv.stderr.decode(errors="replace").strip()[:300]}', file=sys.stderr)
+        return None
+    return True
 
 
 def describe(vol):
@@ -467,15 +719,55 @@ def cmd_info(vol, a):
 
 
 def cmd_run(vol, a):
-    """自動実行用 (systemd タイマー): 変更があればコミットする。無ければ何もしない。"""
-    if head(vol) is None:
-        # 最初の実行は、変更の有無にかかわらず最初のコミットを作る
-        cmd_commit(vol, argparse.Namespace(name=None, message='initial', allow_empty=True))
-        return
-    _, notes = current_changes(vol)
-    if not notes:
-        return
-    cmd_commit(vol, argparse.Namespace(name=None, message='auto', allow_empty=False))
+    """自動実行用 (systemd タイマー): 変更があればコミットする。無ければ何もしない。
+
+    「調べる」と「コミットする」の間でほかの実行が入らないよう、鍵を取ってから両方を行う。
+    前の実行が走っているときは、二重にコミットしないよう、今回は何もせずに戻る。"""
+    fd = try_lock(vol)
+    if fd is None:
+        return                       # 前の実行が走っている。次のタイマーでまた調べる
+    try:
+        if head(vol) is None:
+            # 最初の実行は、変更の有無にかかわらず最初のコミットを作る
+            cmd_commit_locked(vol, argparse.Namespace(name=None, message='initial', allow_empty=True))
+            return
+        if same_generation(vol):
+            return                   # 前のコミットの後に、btrfs のトランザクションが進んでいない
+        _, notes = current_changes(vol)
+        if not notes:
+            return
+        cmd_commit_locked(vol, argparse.Namespace(name=None, message='auto', allow_empty=False))
+    finally:
+        os.close(fd)
+
+
+def _generation(path):
+    """``btrfs subvolume show`` の Generation。取れなければ None。"""
+    r = subprocess.run(['btrfs', 'subvolume', 'show', '--raw', path],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition(':')
+        if key.strip() == 'Generation':
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def same_generation(vol):
+    """HEAD のスナップショットと作業ツリーが、同じ btrfs のトランザクションで止まっているか。
+
+    作業ツリーに何も書き込まなければ、トランザクションは進まない (Generation も変わらない)。
+    1 時間ごとの run で、何も変えていないときに ``btrfs send --no-data`` を作らないための、
+    安い判定。判定できないときは False を返し、従来どおり差分を作る (取りこぼさない)。"""
+    base = head(vol)
+    if base is None:
+        return False
+    a, b = _generation(vol.layer(base)), _generation(vol.work)
+    return a is not None and a == b
 
 
 def cmd_log(vol, a):
@@ -510,32 +802,52 @@ def cmd_show(vol, a):
         print('中身: (gc で消されています)')
 
 
+def work_rel(vol, p):
+    """引数を、作業ツリーの中の相対パスにする。作業ツリーの外 (シンボリックリンクの先も) は受け付けない。"""
+    full = os.path.realpath(p if os.path.isabs(p) else os.path.join(vol.work, p))
+    if full != vol.work and not full.startswith(vol.work + os.sep):
+        die(f'作業ツリーの中のパスを指定してください: {p}')
+    return os.path.relpath(full, vol.work)
+
+
+def safe_rel(rel):
+    """戻すパス (work/ の中の相対パス) が、work/ の外を指さないことを確かめる。
+    ``..`` で始まるものだけでなく、名前の中の ``..`` も受け付けない (os.path.join で外に出るため)。"""
+    rel = os.path.normpath(rel)
+    parts = rel.split(os.sep)
+    if rel in ('.', '') or os.path.isabs(rel) or '..' in parts:
+        die(f'戻せるのは work/ の中のものだけです: {rel}')
+    return rel
+
+
 def cmd_restore(vol, a):
-    gen = resolve_gen(vol, a.source)
-    if not os.path.isdir(vol.layer(gen)):
-        die(f'{gen} の中身は gc で消されています')
+    gen = resolve_gen(vol, getattr(a, 'source', None))
     if a.all == bool(a.paths):
         die('戻すパスを指定してください (全体を戻すなら --all)')
-    rels = sorted(set(os.listdir(vol.work)) | set(os.listdir(vol.layer(gen)))) if a.all else [os.path.normpath(p) for p in a.paths]
-    stamp = time.strftime('%Y%m%d-%H%M%S')
-    keep = os.path.join(vol.trash, stamp)
-    for rel in rels:
-        if rel.startswith('..') or rel in ('.', '') or os.path.isabs(rel):
-            die(f'戻せるのは work/ の中のものだけです: {rel}')
-        cur, src = os.path.join(vol.work, rel), os.path.join(vol.layer(gen), rel)
-        if os.path.lexists(cur):
-            # rename は subvolume をまたげないので、reflink で退避してから元を消す (中身は共有されたまま)
-            os.makedirs(os.path.dirname(os.path.join(keep, rel)), exist_ok=True)
-            run(['cp', '-a', '--reflink=always', cur, os.path.join(keep, rel)])
-            remove_tree(cur)
-        if os.path.lexists(src):
-            os.makedirs(os.path.dirname(cur), exist_ok=True)
-            run(['cp', '-a', '--reflink=always', src, cur])
-            print(f'戻しました: {rel} ({gen})')
+    with locked(vol):
+        if not os.path.isdir(vol.layer(gen)):
+            die(f'{gen} の中身は gc で消されています')
+        if a.all:
+            rels = sorted(set(os.listdir(vol.work)) | set(os.listdir(vol.layer(gen))))
         else:
-            print(f'{gen} の時点にはありません: {rel}')
-    if os.path.isdir(keep):
-        print(f'戻す前の内容は、ここに退避してあります: {keep}')
+            rels = [safe_rel(p) for p in a.paths]
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        keep = os.path.join(vol.trash, stamp)
+        for rel in rels:
+            cur, src = os.path.join(vol.work, rel), os.path.join(vol.layer(gen), rel)
+            if os.path.lexists(cur):
+                # rename は subvolume をまたげないので、reflink で退避してから元を消す (中身は共有されたまま)
+                os.makedirs(os.path.dirname(os.path.join(keep, rel)), exist_ok=True)
+                run(['cp', '-a', '--reflink=always', cur, os.path.join(keep, rel)])
+                remove_tree(cur)
+            if os.path.lexists(src):
+                os.makedirs(os.path.dirname(cur), exist_ok=True)
+                run(['cp', '-a', '--reflink=always', src, cur])
+                print(f'戻しました: {rel} ({gen})')
+            else:
+                print(f'{gen} の時点にはありません: {rel}')
+        if os.path.isdir(keep):
+            print(f'戻す前の内容は、ここに退避してあります: {keep}')
 
 
 def remove_tree(path):
@@ -548,8 +860,9 @@ def remove_tree(path):
 def cmd_gc(vol, a):
     if a.keep < 1:
         die('--keep は 1 以上にしてください (HEAD は消せません)')
-    fd = lock(vol)
-    try:
+    # 一覧を読んでから消すまでを 1 つずつ行う (commit が増やす世代を、消してしまわないように)。
+    # HEAD は --keep の範囲に入っていなくても残す (戻り先が無くなるため)
+    with locked(vol):
         base = head(vol)
         names = [e['name'] for e in load_log(vol) if os.path.isdir(vol.layer(e['name']))]
         for old in names[:-a.keep]:
@@ -558,8 +871,6 @@ def cmd_gc(vol, a):
             delete_subvol(vol.layer(old))
             print(f'消しました: {old}')
         run(['btrfs', 'subvolume', 'sync', vol.mnt], check=False)
-    finally:
-        os.close(fd)
 
 
 def cmd_scrub(vol, a):
@@ -606,8 +917,7 @@ def cmd_exclude(vol, a):
     for n in a.names + a.remove:
         if not n or '/' in n or n in ('.', '..'):
             die(f'フォルダ名を指定してください (パスは不可): {n!r}')
-    fd = lock(vol)
-    try:
+    with locked(vol):
         names = load_exclude(vol)
         for n in a.names:
             names.add(n)
@@ -617,42 +927,20 @@ def cmd_exclude(vol, a):
             print(f'除外から外す: {n}')
         atomic_write(exclude_file(vol), json.dumps(sorted(names), ensure_ascii=False, indent=2))
         print('注意: 除外したフォルダの中身は、以前のコミットに残ったままです (コミットの中身は作業ツリーの丸ごとのスナップショット)。')
-    finally:
-        os.close(fd)
-
-
-def keep_file(vol):
-    return os.path.join(vol.store, 'keep.json')
-
-
-def load_keep(vol):
-    p = keep_file(vol)
-    if not os.path.exists(p):
-        return set()
-    with open(p, encoding='utf-8') as f:
-        return set(json.load(f))
-
-
-def save_keep(vol, keeps):
-    atomic_write(keep_file(vol), json.dumps(sorted(keeps), ensure_ascii=False, indent=2))
-
-
-def work_rel(vol, p):
-    """引数を、作業ツリーの中の相対パスにする。作業ツリーの外は受け付けない。"""
-    full = os.path.realpath(p if os.path.isabs(p) else os.path.join(vol.work, p))
-    if full != vol.work and not full.startswith(vol.work + os.sep):
-        die(f'作業ツリーの中のパスを指定してください: {p}')
-    return os.path.relpath(full, vol.work)
 
 
 def cmd_keep(vol, a):
-    """圧縮を保つパスにする: 新しく作るファイルは btrfs の圧縮 (zstd) で作られ、既存のものは圧縮し直す。"""
+    """圧縮を保つパスにする: 新しく作るファイルは btrfs の圧縮 (zstd) で作られ、既存のものは圧縮し直す。
+
+    btrfs の ``chattr +c`` は、ディレクトリに付けても中身へは広がらない (inode ごとの属性)。
+    ディレクトリに付けた ``+c`` が効くのは、そのディレクトリの中に「新しく作ったファイル」だけ
+    (と、その後で作り直したファイル) なので、既存の中身は ``defragment -c`` でここで圧縮し直す。
+    既に keep 済みのパスは、何度も圧縮し直さない (共有が外れて容量が増えるのを避ける)。"""
     if not a.paths:
         keeps = sorted(load_keep(vol))
         print('\n'.join(keeps) if keeps else '(なし)')
         return
-    fd = lock(vol)
-    try:
+    with locked(vol):
         keeps = load_keep(vol)
         # 書き出しの済んでいないデータ (delalloc) は、圧縮し直せない。先に書き出す
         os.sync()
@@ -661,7 +949,10 @@ def cmd_keep(vol, a):
             full = os.path.join(vol.work, rel)
             if not os.path.lexists(full):
                 die(f'ありません: {rel}')
-            # 属性は、ディレクトリに付ければ新しく作るものへ継承される
+            if _under(rel, keeps):
+                print(f'すでに圧縮を保つ対象です: {rel}')
+                continue
+            # 属性: 以後に作るファイルを圧縮する (ディレクトリなら、その直下の新規と作り直し)
             run(['chattr', '+c', full], check=False)
             if os.path.isdir(full) and not os.path.islink(full):
                 run(['btrfs', 'filesystem', 'defragment', '-r', '-czstd', full], check=False)
@@ -671,13 +962,10 @@ def cmd_keep(vol, a):
             print(f'圧縮を保つ: {rel}')
         save_keep(vol, keeps)
         print('注意: reflink で共有しているものは、圧縮し直すと共有が外れて容量が増えることがあります (dedup の後に keep しないこと)')
-    finally:
-        os.close(fd)
 
 
 def cmd_unkeep(vol, a):
-    fd = lock(vol)
-    try:
+    with locked(vol):
         keeps = load_keep(vol)
         for p in a.paths:
             rel = work_rel(vol, p)
@@ -690,8 +978,6 @@ def cmd_unkeep(vol, a):
                 run(['chattr', '-c', full], check=False)
             print(f'対象から外しました: {rel} (今の圧縮は、書き直すまで残ります)')
         save_keep(vol, keeps)
-    finally:
-        os.close(fd)
 
 
 def open_paths(vol):
@@ -748,7 +1034,7 @@ def cmd_dedup(vol, a):
             shutil.rmtree(tmpdir)                       # 前回の途中で止まった残り
         os.makedirs(tmpdir)
         opened = open_paths(vol)
-        groups = files = skipped = changed = 0
+        groups = files = skipped = changed = failures = 0
         free_before = os.statvfs(vol.mnt).f_bavail * os.statvfs(vol.mnt).f_frsize
         for size, paths in by_size.items():
             if len(paths) < 2:
@@ -758,38 +1044,52 @@ def cmd_dedup(vol, a):
                 try:
                     by_hash.setdefault(digest(p), []).append(p)
                 except OSError:
-                    skipped += 1
+                    skipped += 1            # 読めない (権限、消された)
             for h, same in by_hash.items():
                 if len(same) < 2:
                     continue
                 canon = same[0]
-                cs = os.lstat(canon)
+                try:
+                    cs = os.lstat(canon)
+                except OSError:
+                    skipped += 1
+                    continue
                 groups += 1
                 for target in same[1:]:
-                    ts = os.lstat(target)
+                    try:
+                        ts = os.lstat(target)
+                    except OSError:
+                        skipped += 1        # 走査の後に消された
+                        continue
                     if (ts.st_dev, ts.st_ino) in opened or ts.st_nlink > 1 or ts.st_ino == cs.st_ino:
                         skipped += 1
                         continue
                     if a.dry_run:
                         files += 1
                         continue
-                    tmp = os.path.join(tmpdir, f'{groups}.{files}.{skipped}')
+                    # 一時ファイルの名前は、run の失敗 (die) を握りつぶさないように、こちらで一意にする
+                    tmp = os.path.join(tmpdir, f'{groups}.{files}.{uuid.uuid4().hex[:8]}')
                     try:
-                        run(['cp', '-a', '--reflink=always', canon, tmp])
+                        cp = subprocess.run(['cp', '-a', '--reflink=always', canon, tmp],
+                                            capture_output=True, text=True)
+                        if cp.returncode != 0:
+                            failures += 1
+                            continue
                         if digest(target) != h:          # 置き換える直前に、対象の中身を確かめる
                             os.unlink(tmp)
                             changed += 1
                             continue
                         os.replace(tmp, target)
                         files += 1
-                    except (OSError, SystemExit):
+                    except OSError:
+                        failures += 1
+                    finally:
                         if os.path.lexists(tmp):
                             os.unlink(tmp)
-                        skipped += 1
         shutil.rmtree(tmpdir, ignore_errors=True)
         free_after = os.statvfs(vol.mnt).f_bavail * os.statvfs(vol.mnt).f_frsize
         verb = '見つけた' if a.dry_run else '共有した'
-        print(f'{verb}: {groups} 組、{files} ファイル (飛ばした {skipped}、置き換え中に変わった {changed})')
+        print(f'{verb}: {groups} 組、{files} ファイル (飛ばした {skipped}、置き換え中に変わった {changed}、失敗 {failures})')
         if not a.dry_run:
             print(f'空き容量の増加: {(free_after - free_before) / (1 << 20):.1f} MB')
             print('注意: スナップショットが古い実体を掴んでいる間は、容量は戻りません (gc の後に戻ります)')
@@ -833,8 +1133,13 @@ def cmd_create(argv):
         for st in steps:
             run(st)
     except SystemExit:
-        # 作りかけを残さない (マウントできていれば外す)
-        subprocess.run(['umount', mnt], capture_output=True)
+        # 作りかけを残さない。マウントを外せないままイメージを消すと、マウントされたままの
+        # ファイルシステム (busy) が残るので、外れたことを確かめてから消す
+        if os.path.ismount(mnt):
+            un = subprocess.run(['umount', mnt], capture_output=True, text=True)
+            if un.returncode != 0:
+                print(f'警告: マウントを外せませんでした ({mnt})。作りかけのイメージは残します: {img}', file=sys.stderr)
+                raise
         if os.path.exists(img):
             os.unlink(img)
         raise
