@@ -56,7 +56,11 @@ public enum LaunchAtLogin {
                 }
             }
 
-            if !registeredViaSM {
+            if registeredViaSM {
+                // SMAppService で入れたら、LaunchAgent も残っていれば外す。
+                // 両方入っていると、ログイン時に 2 つ起動することになる
+                try? removeLaunchAgent()
+            } else {
                 try installLaunchAgent()
             }
         } else {
@@ -109,6 +113,8 @@ public enum LaunchAtLogin {
     }
 
     #elseif os(Linux)
+    /// Linux では「ログイン時」に自動マウントする systemd のユーザーユニットを入れる。
+    /// CLI は GUI アプリではないので、ログイン時の起動は「各ドライブの自動マウント」を指す。
     public static var systemdServiceURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/systemd/user/clayfs-automount.service")
@@ -126,9 +132,25 @@ public enum LaunchAtLogin {
         }
     }
 
+    /// 実行中の clayfs の場所 (ユニットの ExecStart に書き込む)。
+    /// /usr/local/bin に固定しない (build_linux.sh は ~/bin や ~/.local/bin にも入れる)。
+    static var clayfsExecutable: String {
+        let candidates = [
+            "/usr/local/bin/clayfs",
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/clayfs").path,
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("bin/clayfs").path,
+        ]
+        if let own = Bundle.main.executablePath, FileManager.default.isExecutableFile(atPath: own),
+           URL(fileURLWithPath: own).lastPathComponent == "clayfs" {
+            return own
+        }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? candidates[0]
+    }
+
     private static func installSystemdService() throws {
         let serviceURL = systemdServiceURL
         let fm = FileManager.default
+        let exec = clayfsExecutable
 
         let content = """
         [Unit]
@@ -137,7 +159,7 @@ public enum LaunchAtLogin {
 
         [Service]
         Type=oneshot
-        ExecStart=/usr/local/bin/clayfs mount --all
+        ExecStart=\(exec) mount --all-mounted
         RemainAfterExit=yes
 
         [Install]
@@ -147,18 +169,20 @@ public enum LaunchAtLogin {
         try fm.createDirectory(at: serviceURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: serviceURL, atomically: true, encoding: .utf8)
 
-        // systemctl --user daemon-reload && systemctl --user enable clayfs-automount.service
-        _ = try? ProcessRunner.run(executable: "/bin/systemctl", arguments: ["--user", "daemon-reload"])
-        _ = try? ProcessRunner.run(executable: "/bin/systemctl", arguments: ["--user", "enable", "clayfs-automount.service"])
+        // systemctl --user daemon-reload && systemctl --user enable --now clayfs-automount.service
+        let systemctl = StorageManager.toolPath("systemctl", candidates: ["/bin/systemctl", "/usr/bin/systemctl"])
+        _ = try? ProcessRunner.run(executable: systemctl, arguments: ["--user", "daemon-reload"])
+        _ = try? ProcessRunner.run(executable: systemctl, arguments: ["--user", "enable", "--now", "clayfs-automount.service"])
     }
 
     private static func removeSystemdService() throws {
         let serviceURL = systemdServiceURL
-        _ = try? ProcessRunner.run(executable: "/bin/systemctl", arguments: ["--user", "disable", "clayfs-automount.service"])
+        let systemctl = StorageManager.toolPath("systemctl", candidates: ["/bin/systemctl", "/usr/bin/systemctl"])
+        _ = try? ProcessRunner.run(executable: systemctl, arguments: ["--user", "disable", "--now", "clayfs-automount.service"])
         if FileManager.default.fileExists(atPath: serviceURL.path) {
             try FileManager.default.removeItem(at: serviceURL)
         }
-        _ = try? ProcessRunner.run(executable: "/bin/systemctl", arguments: ["--user", "daemon-reload"])
+        _ = try? ProcessRunner.run(executable: systemctl, arguments: ["--user", "daemon-reload"])
     }
     #endif
 }

@@ -69,14 +69,22 @@ public final class DriveRegistry: @unchecked Sendable {
         try data.write(to: configURL, options: .atomic)
     }
 
+    /// 登録一覧を読む。壊れていれば空を返す (空の一覧で書き戻すことはしない)。
+    /// 欠けたイメージ (bundle が無い) は、cleanMissing のときだけ取り除く。
     public func loadDrives(cleanMissing: Bool = false) -> [VolumeInfo] {
         withFileLock {
             (try? loadDrivesInternal(cleanMissing: cleanMissing)) ?? []
         }
     }
 
+    /// 一覧を丸ごと書き換える。壊れた drives.json を、空の一覧で上書きしないよう、読めなければ書き込まない。
     public func saveDrives(_ drives: [VolumeInfo]) throws {
         try withFileLock {
+            if FileManager.default.fileExists(atPath: configURL.path),
+               !((try? Data(contentsOf: configURL))?.isEmpty ?? true) {
+                // 既存が読めない (壊れている) ときは、中身を失わないように書かない
+                _ = try loadDrivesInternal(cleanMissing: false)
+            }
             try saveDrivesInternal(drives)
         }
     }

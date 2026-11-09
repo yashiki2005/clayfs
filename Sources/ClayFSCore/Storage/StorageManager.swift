@@ -64,7 +64,10 @@ public final class StorageManager: Sendable {
         }
 
         // 1. Create sparse image file with truncate
-        let truncRes = try ProcessRunner.run(executable: "/usr/bin/truncate", arguments: ["-s", size, finalBundleURL.path])
+        let truncRes = try ProcessRunner.run(
+            executable: Self.toolPath("truncate", candidates: ["/usr/bin/truncate", "/bin/truncate"]),
+            arguments: ["-s", size, finalBundleURL.path]
+        )
         guard truncRes.isSuccess else {
             throw NSError(
                 domain: "ClayFSStorage",
@@ -74,7 +77,10 @@ public final class StorageManager: Sendable {
         }
 
         // 2. Format with Btrfs
-        let mkfsRes = try ProcessRunner.run(executable: "/sbin/mkfs.btrfs", arguments: ["-f", "-K", finalBundleURL.path])
+        let mkfsRes = try ProcessRunner.run(
+            executable: Self.toolPath("mkfs.btrfs", candidates: ["/sbin/mkfs.btrfs", "/usr/sbin/mkfs.btrfs", "/usr/bin/mkfs.btrfs"]),
+            arguments: ["-f", "-K", finalBundleURL.path]
+        )
         guard mkfsRes.isSuccess else {
             try? FileManager.default.removeItem(at: finalBundleURL)
             throw NSError(
@@ -187,21 +193,25 @@ public final class StorageManager: Sendable {
         do {
             try FileManager.default.createDirectory(at: mountURL, withIntermediateDirectories: true)
         } catch {
-            _ = try? ProcessRunner.run(executable: "/usr/bin/sudo", arguments: ["/bin/mkdir", "-p", mountURL.path])
+            _ = try? ProcessRunner.run(
+                executable: Self.toolPath("sudo", candidates: ["/usr/bin/sudo", "/bin/sudo"]),
+                arguments: [Self.toolPath("mkdir", candidates: ["/bin/mkdir", "/usr/bin/mkdir"]), "-p", mountURL.path]
+            )
         }
         ClayFSPaths.ensureUserOwnership(at: mountBase)
         ClayFSPaths.ensureUserOwnership(at: mountURL)
 
+        let mountBin = Self.toolPath("mount", candidates: ["/bin/mount", "/usr/bin/mount", "/sbin/mount"])
         var mountRes = try ProcessRunner.run(
-            executable: "/bin/mount",
+            executable: mountBin,
             arguments: ["-o", "loop,compress-force=zstd:3", finalBundleURL.path, mountURL.path]
         )
         #if os(Linux)
         if !mountRes.isSuccess && geteuid() != 0 {
             // Try fallback to sudo mount if unprivileged
             if let sudoRes = try? ProcessRunner.run(
-                executable: "/usr/bin/sudo",
-                arguments: ["/bin/mount", "-o", "loop,compress-force=zstd:3", finalBundleURL.path, mountURL.path]
+                executable: Self.toolPath("sudo", candidates: ["/usr/bin/sudo", "/bin/sudo"]),
+                arguments: [mountBin, "-o", "loop,compress-force=zstd:3", finalBundleURL.path, mountURL.path]
             ), sudoRes.isSuccess {
                 mountRes = sudoRes
             }
@@ -254,11 +264,15 @@ public final class StorageManager: Sendable {
         if force {
             args.insert("-l", at: 0)
         }
-        var res = try ProcessRunner.run(executable: "/bin/umount", arguments: args)
+        let umountBin = Self.toolPath("umount", candidates: ["/bin/umount", "/usr/bin/umount", "/sbin/umount"])
+        var res = try ProcessRunner.run(executable: umountBin, arguments: args)
         if !res.isSuccess && geteuid() != 0 {
-            var sudoArgs = ["/bin/umount"]
+            var sudoArgs = [umountBin]
             sudoArgs.append(contentsOf: args)
-            if let sudoRes = try? ProcessRunner.run(executable: "/usr/bin/sudo", arguments: sudoArgs), sudoRes.isSuccess {
+            if let sudoRes = try? ProcessRunner.run(
+                executable: Self.toolPath("sudo", candidates: ["/usr/bin/sudo", "/bin/sudo"]),
+                arguments: sudoArgs
+            ), sudoRes.isSuccess {
                 res = sudoRes
             }
         }
@@ -310,8 +324,14 @@ public final class StorageManager: Sendable {
         if let mp = findMountPoint(for: finalBundleURL) {
             Glibc.sync()
             // Btrfs defragmentation with zstd compression and fstrim to discard unused blocks
-            _ = try? ProcessRunner.run(executable: "/bin/btrfs", arguments: ["filesystem", "defragment", "-r", "-czstd", mp.path])
-            _ = try? ProcessRunner.run(executable: "/sbin/fstrim", arguments: ["-v", mp.path])
+            _ = try? ProcessRunner.run(
+                executable: Self.toolPath("btrfs", candidates: ["/bin/btrfs", "/usr/bin/btrfs", "/sbin/btrfs", "/usr/sbin/btrfs"]),
+                arguments: ["filesystem", "defragment", "-r", "-czstd", mp.path]
+            )
+            _ = try? ProcessRunner.run(
+                executable: Self.toolPath("fstrim", candidates: ["/sbin/fstrim", "/usr/sbin/fstrim", "/usr/bin/fstrim"]),
+                arguments: ["-v", mp.path]
+            )
         }
         #endif
     }
@@ -367,7 +387,8 @@ public final class StorageManager: Sendable {
         if let loopDirs = try? FileManager.default.contentsOfDirectory(atPath: "/sys/block") {
             for loopName in loopDirs where loopName.hasPrefix("loop") {
                 let backingPath = "/sys/block/\(loopName)/loop/backing_file"
-                if let realFile = try? String(contentsOfFile: backingPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
+                if let realFile = try? String(contentsOfFile: backingPath, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines) {
                     let standardFile = URL(fileURLWithPath: realFile).resolvingSymlinksInPath().path
                     loopMap["/dev/\(loopName)"] = standardFile
                 }
@@ -378,14 +399,44 @@ public final class StorageManager: Sendable {
         for line in lines {
             let parts = line.split(separator: " ")
             guard parts.count >= 2 else { continue }
-            let dev = String(parts[0])
-            let mountPath = String(parts[1])
+            let dev = Self.unescapeMountField(String(parts[0]))
+            // /proc/mounts は、空白 ('\040') や改行、タブを 8 進数でエスケープして書く。
+            // 空白を含むマウント先 (試験で扱う名前も含む) は、解かないと登録済みのパスと一致しない
+            let mountPath = Self.unescapeMountField(String(parts[1]))
             if let backingFile = loopMap[dev] {
                 map[backingFile] = URL(fileURLWithPath: mountPath)
             }
         }
         return map
         #endif
+    }
+
+    /// ツールの場所を決める。/bin と /usr/bin が分かれているディストリビューション (Arch、Alpine など)
+    /// もあるので、決め打ちにせず、あるものを探す。
+    static func toolPath(_ name: String, candidates: [String]) -> String {
+        for p in candidates where FileManager.default.isExecutableFile(atPath: p) {
+            return p
+        }
+        return candidates[0]
+    }
+
+    /// /proc/mounts のフィールドの 8 進数エスケープ (\040 など) を解く。
+    static func unescapeMountField(_ field: String) -> String {
+        guard field.contains("\\") else { return field }
+        var out = ""
+        let chars = Array(field)
+        var i = 0
+        while i < chars.count {
+            if chars[i] == "\\", i + 3 < chars.count,
+               let v = Int(String(chars[(i + 1)...(i + 3)]), radix: 8), v > 0, v < 0x80 {
+                out.append(Character(UnicodeScalar(UInt8(v))))
+                i += 4
+                continue
+            }
+            out.append(chars[i])
+            i += 1
+        }
+        return out
     }
 
     public func findMountPoint(for bundleURL: URL) -> URL? {

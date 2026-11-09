@@ -108,10 +108,14 @@ public final class FSEventsMonitor: @unchecked Sendable {
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + debounceSeconds)
-        timer.setEventHandler { [weak self] in
-            guard let self = self else { return }
-            self.onDebouncedChange()
+        // 発火したのが「今のタイマー」のときだけ、変更を通知して手放す。
+        // 古いタイマーがキャンセル前に発火していた場合に、新しいタイマーを握ったままの
+        // debounceTimer を nil にしてしまい、次の cancel() が空振りして二重に発火していた。
+        timer.setEventHandler { [weak self, weak timer] in
+            guard let self = self, let timer = timer else { return }
+            guard self.debounceTimer === timer else { return }   // 古いタイマーの発火は捨てる
             self.debounceTimer = nil
+            self.onDebouncedChange()
         }
         timer.resume()
         debounceTimer = timer

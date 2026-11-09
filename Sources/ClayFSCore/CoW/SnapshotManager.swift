@@ -21,6 +21,8 @@ public final class SnapshotManager: Sendable {
 
     public init() {}
 
+    /// 中断された復元や prune の残骸を消す。復元は数秒で終わるので、古いものだけを対象にする。
+    /// 一時ディレクトリ名は UUID を含むので、実行中の復元と衝突しない。
     public func sweepStaleTempFiles(volumeMountURL: URL) {
         let clayfsDir = volumeMountURL.appendingPathComponent(".clayfs")
         guard let items = try? FileManager.default.contentsOfDirectory(at: clayfsDir, includingPropertiesForKeys: [.contentModificationDateKey], options: []) else { return }
@@ -76,7 +78,10 @@ public final class SnapshotManager: Sendable {
 
         try FileManager.default.createDirectory(at: snapshotDestURL, withIntermediateDirectories: true)
 
-        // Clone all user items at the volume root into the snapshot directory
+        // Clone all user items at the volume root into the snapshot directory.
+        // クローンできない項目 (FIFO、ソケットなど) は、スナップショット全体を止めずに飛ばして報告する
+        // (古い macOS 版 clayfs_tool は読めない項目を警告して続けており、そちらに合わせる)
+        var skipped: [String] = []
         let items = try FileManager.default.contentsOfDirectory(at: volumeMountURL, includingPropertiesForKeys: nil, options: [])
         for item in items {
             let name = item.lastPathComponent
@@ -86,6 +91,8 @@ public final class SnapshotManager: Sendable {
             let destItem = snapshotDestURL.appendingPathComponent(name)
             do {
                 try CoWCloner.clone(from: item, to: destItem)
+            } catch let skip as CoWSkipError {
+                skipped.append(skip.path)
             } catch {
                 try? FileManager.default.removeItem(at: snapshotDestURL)
                 throw NSError(
@@ -94,6 +101,11 @@ public final class SnapshotManager: Sendable {
                     userInfo: [NSLocalizedDescriptionKey: "CoW clone failed for \(name): \(error.localizedDescription)"]
                 )
             }
+        }
+        if !skipped.isEmpty {
+            FileHandle.standardError.write(
+                ("警告: スナップショットに含められない項目を飛ばしました: " + skipped.joined(separator: ", ") + "\n").data(using: .utf8) ?? Data()
+            )
         }
 
         // Count files and compute logical size (quick limit so large directories never block)
@@ -374,12 +386,17 @@ public final class SnapshotManager: Sendable {
                 clonedItems.append(item.lastPathComponent)
             }
 
-            // Clean up old temporary directory
-            if sync {
-                try? FileManager.default.removeItem(at: tempBackup)
-            } else {
-                DispatchQueue.global(qos: .utility).async {
-                    try? FileManager.default.removeItem(at: tempBackup)
+            // Clean up the temporary backup. 同期でも、残すと次の復元まで数 GB を抱えたままになるので、
+            // 消したかを確かめ、消せなければ sweepStaleTempFiles が後で拾えるようにする (名前に UUID を含む)
+            do {
+                try FileManager.default.removeItem(at: tempBackup)
+            } catch {
+                if sync {
+                    FileHandle.standardError.write(("警告: 復元前の退避を消せませんでした: " + tempBackup.path + "\n").data(using: .utf8) ?? Data())
+                } else {
+                    DispatchQueue.global(qos: .utility).async {
+                        try? FileManager.default.removeItem(at: tempBackup)
+                    }
                 }
             }
         }
