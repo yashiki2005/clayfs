@@ -124,6 +124,32 @@ struct ClayFSCLIApp {
 
     static func handleMount(_ args: [String]) throws {
         let drives = DriveRegistry.shared.loadDrives()
+
+        // 自動マウント (systemd のログイン時ユニット) 用: 自動マウントが有効なドライブをすべてマウントする
+        if args.contains("--all-mounted") || args.contains("--all") {
+            let targets = drives.filter { $0.autoMount }
+            if targets.isEmpty {
+                print("自動マウントが有効なドライブはありません。")
+                return
+            }
+            var failed = 0
+            for drive in targets {
+                if let already = StorageManager.shared.findMountPoint(for: drive.bundleURL) {
+                    print("既にマウント済み: \(drive.name) (\(already.path))")
+                    continue
+                }
+                do {
+                    let mounted = try StorageManager.shared.mountDrive(bundleURL: drive.bundleURL, showInFinder: false)
+                    print("マウント完了: \(drive.name) (\(mounted.mountURL?.path ?? ""))")
+                } catch {
+                    failed += 1
+                    print("マウント失敗: \(drive.name): \(error.localizedDescription)")
+                }
+            }
+            if failed > 0 { exit(1) }
+            return
+        }
+
         let targetName = args.first(where: { !$0.starts(with: "-") })
 
         let targetDrive: VolumeInfo
@@ -206,21 +232,18 @@ struct ClayFSCLIApp {
             exit(1)
         }
 
+        // -m を付けた場合、残りの位置引数はドライブ名 (省略可) とメッセージ。
+        // これまでは「オプションでない最初の語」をドライブ名としていたため、メッセージの語が
+        // ドライブ名と衝突し、別のドライブの保持方針で枝刈りされることがあった。
         let drives = DriveRegistry.shared.loadDrives()
-        var message = "Manual snapshot"
-        if let mIdx = args.firstIndex(of: "-m"), mIdx + 1 < args.count {
-            message = args[mIdx + 1]
-        } else {
-            let nonOptions = args.filter { !$0.starts(with: "-") }
-            let remaining = nonOptions.filter { arg in !drives.contains(where: { $0.name == arg }) }
-            if let first = remaining.first {
-                message = first
-            }
-        }
+        let parsed = parseMessageArgs(args)
+        let (namedDrive, rest) = takeDriveName(from: parsed.positionals, drives: drives)
+        let message = parsed.message ?? (rest.first ?? "Manual snapshot")
+
+        // 保持方針は、実際にスナップショットを取るマウント先のドライブから取る
+        let targetDrive = namedDrive ?? drive(forMount: mountURL)
 
         print("スナップショット作成中...")
-        let targetName = args.first(where: { !$0.starts(with: "-") && $0 != message })
-        let targetDrive = targetName != nil ? drives.first(where: { $0.name == targetName }) : drives.first
         let snap = try SnapshotManager.shared.createSnapshot(
             volumeMountURL: mountURL,
             message: message,
@@ -263,8 +286,14 @@ struct ClayFSCLIApp {
 
         let drives = DriveRegistry.shared.loadDrives()
         let nonOptions = args.filter { !$0.starts(with: "-") }
-        let remaining = nonOptions.filter { arg in !drives.contains(where: { $0.name == arg }) }
+        let (_, remaining) = takeDriveName(from: nonOptions, drives: drives)
         let snapshotID = remaining.first
+
+        // スナップショットが見つからない (ID の打ち間違い) ときは、黙って「変更なし」にせず、明示する
+        if let id = snapshotID, !FileManager.default.fileExists(atPath: mountURL.appendingPathComponent(".clayfs/snapshots").appendingPathComponent(id).path) {
+            print("エラー: スナップショット '\(id)' が見つかりません。'clayfs timeline' で ID を確認してください。")
+            exit(1)
+        }
 
         let diffs = try SnapshotManager.shared.diff(volumeMountURL: mountURL, snapshotID: snapshotID)
 
@@ -377,7 +406,8 @@ struct ClayFSCLIApp {
         let policy = RetentionPolicy(maxSnapshots: maxSnapshots, maxAgeDays: maxAgeDays)
         let drives = DriveRegistry.shared.loadDrives()
         let targetName = args.first(where: { !$0.starts(with: "-") })
-        if let target = (targetName != nil ? drives.first(where: { $0.name == targetName }) : drives.first) {
+        // 保持方針は、枝刈りするマウント先のドライブに保存する (別のドライブに書かない)
+        if let target = (targetName.flatMap { name in drives.first(where: { $0.name == name }) } ?? drive(forMount: mountURL)) {
             var updated = target
             updated.retentionPolicy = policy
             try? DriveRegistry.shared.registerDrive(updated)
@@ -505,6 +535,56 @@ struct ClayFSCLIApp {
     }
 
     // MARK: - Helpers
+
+    /// `-m MSG` / `--message MSG` / `--message=MSG` を取り出し、残りの位置引数を返す。
+    struct ParsedMessageArgs {
+        var message: String?
+        var positionals: [String]
+    }
+
+    static func parseMessageArgs(_ args: [String]) -> ParsedMessageArgs {
+        var message: String?
+        var positionals: [String] = []
+        var i = 0
+        while i < args.count {
+            let a = args[i]
+            if a == "-m" || a == "--message" {
+                if i + 1 < args.count {
+                    message = args[i + 1]
+                    i += 2
+                    continue
+                }
+            } else if a.starts(with: "--message=") {
+                message = String(a.dropFirst("--message=".count))
+                i += 1
+                continue
+            }
+            positionals.append(a)
+            i += 1
+        }
+        return ParsedMessageArgs(message: message, positionals: positionals)
+    }
+
+    /// そのマウント先が、どのドライブのものか。
+    /// `resolveActiveMount` はカレントディレクトリなどからマウント先を決めるので、ドライブの設定
+    /// (保持方針など) は、選ばれたマウント先から引き直す (別のドライブの設定を使わない)。
+    static func drive(forMount mountURL: URL) -> VolumeInfo? {
+        let standardized = mountURL.standardizedFileURL
+        return DriveRegistry.shared.loadDrives().first { drive in
+            guard let m = StorageManager.shared.findMountPoint(for: drive.bundleURL) else { return false }
+            return m.standardizedFileURL == standardized
+        }
+    }
+
+    /// 位置引数からドライブ名を 1 つ取り出す (残りはメッセージなどに使う)。
+    static func takeDriveName(from positionals: [String], drives: [VolumeInfo]) -> (VolumeInfo?, [String]) {
+        var rest = positionals
+        if let first = rest.first, let d = drives.first(where: { $0.name == first }) {
+            rest.removeFirst()
+            return (d, rest)
+        }
+        return (nil, rest)
+    }
 
     static func resolveActiveMount(args: [String]) -> URL? {
         let drives = DriveRegistry.shared.loadDrives()

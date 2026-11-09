@@ -783,15 +783,23 @@ public struct ClayFSMenuView: View {
             bundleURL = home.appendingPathComponent("\(name).dmg.sparsebundle")
         }
 
-        do {
-            let drive = try StorageManager.shared.createDrive(name: name, size: newDriveSize, bundleURL: bundleURL)
-            appState.refreshDrives()
-            appState.selectDrive(drive)
-            appState.mountSelectedDrive()
-            newDriveName = ""
-            newDrivePath = ""
-        } catch {
-            appState.statusMessage = L10n.createError(error.localizedDescription)
+        // イメージの作成 (hdiutil) は数秒かかる。メインスレッドで待つとメニューが固まるので、
+        // 背景で作ってから、画面を更新する
+        appState.statusMessage = L10n.creatingDrive
+        let size = newDriveSize
+        newDriveName = ""
+        newDrivePath = ""
+        Task {
+            do {
+                let drive = try await Task.detached(priority: .userInitiated) {
+                    try StorageManager.shared.createDrive(name: name, size: size, bundleURL: bundleURL)
+                }.value
+                appState.refreshNow()
+                appState.selectDrive(drive)
+                appState.mountSelectedDrive()
+            } catch {
+                appState.statusMessage = L10n.createError(error.localizedDescription)
+            }
         }
     }
 

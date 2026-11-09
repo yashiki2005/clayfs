@@ -462,6 +462,19 @@ public enum L10n {
         }
     }
 
+    public static var creatingDrive: String {
+        switch currentLanguage {
+        case .japanese: return "仮想ドライブを作成中..."
+        case .simplifiedChinese: return "正在创建虚拟驱动器..."
+        case .traditionalChinese: return "正在建立虛擬磁碟..."
+        case .spanish: return "Creando unidad virtual..."
+        case .french: return "Création du disque virtuel..."
+        case .german: return "Virtuelles Laufwerk wird erstellt..."
+        case .korean: return "가상 드라이브 생성 중..."
+        case .english: return "Creating virtual drive..."
+        }
+    }
+
     public static func createError(_ msg: String) -> String {
         switch currentLanguage {
         case .japanese: return "作成エラー: \(msg)"

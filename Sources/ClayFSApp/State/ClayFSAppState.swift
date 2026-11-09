@@ -1,6 +1,5 @@
 import SwiftUI
 import ClayFSCore
-import Combine
 
 @MainActor
 public final class ClayFSAppState: ObservableObject {
@@ -30,8 +29,8 @@ public final class ClayFSAppState: ObservableObject {
     @Published public var launchAtLogin: Bool = LaunchAtLogin.isEnabled
     @Published public var showStartupSheet: Bool = false
 
-    private var pollTimer: AnyCancellable?
     private var monitor: FSEventsMonitor?
+    private var snapshotSignature: String = ""
 
     public init() {
         self.launchAtLogin = LaunchAtLogin.isEnabled
@@ -53,7 +52,7 @@ public final class ClayFSAppState: ObservableObject {
         var updated = drive
         updated.autoMount.toggle()
         try? DriveRegistry.shared.registerDrive(updated)
-        refreshDrives()
+        refreshNow()
     }
 
     public func autoMountDrivesIfNeeded() {
@@ -71,16 +70,22 @@ public final class ClayFSAppState: ObservableObject {
     }
 
     private var isScanning: Bool = false
+    /// スキャンの世代。操作直後の refreshNow で前のスキャンを無効にし、
+    /// 古い結果が後から状態を上書きしないようにする。
+    private var scanGeneration: Int = 0
 
     private struct ScanResult: Sendable {
         let drives: [VolumeInfo]
         let selectedMountURL: URL?
         let snapshots: [Snapshot]
+        let snapshotSignature: String
     }
 
     public func refreshDrives() {
         guard !isScanning else { return }
         isScanning = true
+        scanGeneration &+= 1
+        let generation = scanGeneration
 
         let currentSelectedName = selectedDrive?.name
 
@@ -117,11 +122,19 @@ public final class ClayFSAppState: ObservableObject {
             if let m = currentMountURL {
                 snaps = (try? SnapshotManager.shared.listSnapshots(volumeMountURL: m, limit: 30)) ?? []
             }
+            let signature = (currentMountURL?.path ?? "-") + "|" + snaps.map(\.id).joined(separator: ",")
 
-            let result = ScanResult(drives: list, selectedMountURL: currentMountURL, snapshots: snaps)
+            let result = ScanResult(
+                drives: list,
+                selectedMountURL: currentMountURL,
+                snapshots: snaps,
+                snapshotSignature: signature
+            )
 
             await MainActor.run {
                 guard let self = self else { return }
+                // 操作直後に新しいスキャンが始まっていたら、この結果は古いので捨てる
+                guard generation == self.scanGeneration else { return }
                 self.isScanning = false
                 self.drives = result.drives
 
@@ -137,7 +150,11 @@ public final class ClayFSAppState: ObservableObject {
 
                 self.activeMountURL = result.selectedMountURL
                 self.isMounted = result.selectedMountURL != nil
-                self.snapshots = result.snapshots
+                // 一覧が変わっていなければ、@Published への代入をしない (不要な再描画を避ける)
+                if result.snapshotSignature != self.snapshotSignature {
+                    self.snapshotSignature = result.snapshotSignature
+                    self.snapshots = result.snapshots
+                }
 
                 if let mount = result.selectedMountURL, let drive = self.selectedDrive, drive.autoSnapshot {
                     if self.monitor == nil || self.monitor?.watchURL != mount {
@@ -153,12 +170,12 @@ public final class ClayFSAppState: ObservableObject {
     public func selectDrive(_ drive: VolumeInfo) {
         self.selectedDrive = drive
         self.statusMessage = nil
-        refreshDrives()
+        refreshNow()
     }
 
     public func removeDrive(_ drive: VolumeInfo) {
         try? DriveRegistry.shared.unregisterDrive(named: drive.name)
-        refreshDrives()
+        refreshNow()
     }
 
     public func loadSnapshots(mountURL: URL) {
@@ -183,7 +200,7 @@ public final class ClayFSAppState: ObservableObject {
                     self.activeMountURL = info.mountURL
                     self.isMounted = true
                     self.statusMessage = nil
-                    self.refreshDrives()
+                    self.refreshNow()
                     if let m = info.mountURL {
                         self.loadSnapshots(mountURL: m)
                         self.startWatching(mountURL: m, drive: drive)
@@ -212,7 +229,7 @@ public final class ClayFSAppState: ObservableObject {
                     self.isMounted = false
                     self.snapshots = []
                     self.statusMessage = nil
-                    self.refreshDrives()
+                    self.refreshNow()
                 }
             } catch {
                 await MainActor.run {
@@ -233,7 +250,7 @@ public final class ClayFSAppState: ObservableObject {
 
                 await MainActor.run {
                     self.statusMessage = L10n.compactSuccess
-                    self.refreshDrives()
+                    self.refreshNow()
                 }
             } catch {
                 await MainActor.run {
@@ -354,12 +371,32 @@ public final class ClayFSAppState: ObservableObject {
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: mountURL.path)
     }
 
+    /// マウント状態のポーリング。
+    ///
+    /// 以前は 2 秒ごとに refreshDrives() を呼び、その中で `hdiutil info -plist` と SQLite の
+    /// 読み出しを行っていた。メニューバーに常駐し続けるアプリとしては、2 秒ごとに外部
+    /// プロセスを起こすのが重い。ここでは
+    ///  - 間隔を 5 秒にする
+    ///  - マウント/アンマウントや作成・削除の直後は、待たずに直ちに 1 回更新する (refreshNow)
+    /// として、操作後の見え方の遅れを減らしつつ、定常時の負荷を下げる。
+    private var pollTask: Task<Void, Never>?
+
     private func startPolling() {
-        pollTimer = Timer.publish(every: 2.0, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                self?.refreshDrives()
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { return }
+                await MainActor.run { self?.refreshDrives() }
             }
+        }
+    }
+
+    /// 操作の直後など、待たずに状態を取り直したいときに使う。
+    /// 実行中のスキャンがあっても、新しいスキャンを始める (古いスキャンの結果は世代で捨てる)。
+    public func refreshNow() {
+        isScanning = false
+        refreshDrives()
     }
 
     private func startWatching(mountURL: URL, drive: VolumeInfo) {
@@ -369,12 +406,13 @@ public final class ClayFSAppState: ObservableObject {
             Task.detached(priority: .utility) { [weak self] in
                 guard let self = self else { return }
                 do {
+                    // 変更が無ければスナップショットを作らない。差分の判定は diff() に任せる
+                    // (変更が無い静穏のときは、ここで一度だけ作業ツリーを歩く)
                     let diffs = try SnapshotManager.shared.diff(volumeMountURL: mountURL)
                     guard !diffs.isEmpty else { return }
-                    let message = L10n.autoSaveMessage(diffs.count)
                     _ = try SnapshotManager.shared.createSnapshot(
                         volumeMountURL: mountURL,
-                        message: message,
+                        message: L10n.autoSaveMessage(diffs.count),
                         policy: policy
                     )
                     await MainActor.run {
